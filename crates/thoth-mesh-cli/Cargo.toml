@@ -1,6 +1,6 @@
 [package]
-name = "thoth-cli"
-description = "Command-line client for publishing, subscribing, and administering a thoth mesh."
+name = "thoth-mesh-cli"
+description = "Command-line client for publishing, subscribing, and administering a thoth-mesh node."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,8 +10,8 @@ repository.workspace = true
 homepage.workspace = true
 
 [[bin]]
-name = "thoth"
+name = "thoth-mesh"
 path = "src/main.rs"
 
 [dependencies]
-thoth = { path = "../thoth", version = "0.0.1" }
+thoth-mesh-core = { path = "../thoth-mesh-core", version = "0.0.1" }

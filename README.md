@@ -1,4 +1,4 @@
-# thoth
+# thoth-mesh
 
 A federated publish/subscribe mesh, written in Rust.
 
@@ -17,10 +17,10 @@ This is a Cargo workspace:
 
 | Crate | Kind | Purpose |
 | --- | --- | --- |
-| [`thoth`](crates/thoth) | lib | Core protocol types and wire format shared by everything else. |
+| [`thoth-mesh-core`](crates/thoth-mesh-core) | lib | Core protocol types and wire format shared by everything else. |
 | [`thoth-mesh`](crates/thoth-mesh) | lib | Federation/gossip layer: peer discovery, membership, replication. |
-| [`thoth-node`](crates/thoth-node) | bin | Daemon that runs a mesh node over a network transport. |
-| [`thoth-cli`](crates/thoth-cli) | bin | Command-line client for publishing, subscribing, and admin. |
+| [`thoth-mesh-node`](crates/thoth-mesh-node) | bin | Daemon that runs a mesh node over a network transport. |
+| [`thoth-mesh-cli`](crates/thoth-mesh-cli) | bin | Command-line client (`thoth-mesh` binary) for publishing, subscribing, and admin. |
 
 ## License
 

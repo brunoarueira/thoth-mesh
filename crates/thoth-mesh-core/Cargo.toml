@@ -1,6 +1,6 @@
 [package]
-name = "thoth"
-description = "Core protocol types and wire format for the thoth federated pub/sub mesh."
+name = "thoth-mesh-core"
+description = "Core protocol types and wire format for the thoth-mesh federated pub/sub mesh."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

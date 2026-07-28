@@ -1,10 +1,10 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/thoth",
+    "crates/thoth-mesh-core",
     "crates/thoth-mesh",
-    "crates/thoth-node",
-    "crates/thoth-cli",
+    "crates/thoth-mesh-node",
+    "crates/thoth-mesh-cli",
 ]
 
 [workspace.package]
@@ -13,8 +13,8 @@ edition = "2024"
 rust-version = "1.85"
 authors = ["Bruno Arueira <contato@brunoarueira.com>"]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/brunoarueira/thoth"
-homepage = "https://github.com/brunoarueira/thoth"
+repository = "https://github.com/brunoarueira/thoth-mesh"
+homepage = "https://github.com/brunoarueira/thoth-mesh"
 
 [profile.release]
 lto = true

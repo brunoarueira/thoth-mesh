@@ -1,6 +1,6 @@
 [package]
-name = "thoth-node"
-description = "Daemon that runs a thoth mesh node: wires the federation layer to a network transport."
+name = "thoth-mesh-node"
+description = "Daemon that runs a thoth-mesh node: wires the federation layer to a network transport."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,9 +10,9 @@ repository.workspace = true
 homepage.workspace = true
 
 [[bin]]
-name = "thoth-node"
+name = "thoth-mesh-node"
 path = "src/main.rs"
 
 [dependencies]
-thoth = { path = "../thoth", version = "0.0.1" }
+thoth-mesh-core = { path = "../thoth-mesh-core", version = "0.0.1" }
 thoth-mesh = { path = "../thoth-mesh", version = "0.0.1" }

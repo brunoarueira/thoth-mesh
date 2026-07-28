@@ -1,6 +1,6 @@
 [package]
 name = "thoth-mesh"
-description = "Federation and gossip layer for the thoth pub/sub mesh: peer discovery and replication."
+description = "Federation and gossip layer for the thoth-mesh federated pub/sub system: peer discovery and replication."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,4 +10,4 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
-thoth = { path = "../thoth", version = "0.0.1" }
+thoth-mesh-core = { path = "../thoth-mesh-core", version = "0.0.1" }

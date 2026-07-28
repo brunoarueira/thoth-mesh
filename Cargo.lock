@@ -3,27 +3,27 @@
 version = 4
 
 [[package]]
-name = "thoth"
-version = "0.0.1"
-
-[[package]]
-name = "thoth-cli"
-version = "0.0.1"
-dependencies = [
- "thoth",
-]
-
-[[package]]
 name = "thoth-mesh"
 version = "0.0.1"
 dependencies = [
- "thoth",
+ "thoth-mesh-core",
 ]
 
 [[package]]
-name = "thoth-node"
+name = "thoth-mesh-cli"
 version = "0.0.1"
 dependencies = [
- "thoth",
+ "thoth-mesh-core",
+]
+
+[[package]]
+name = "thoth-mesh-core"
+version = "0.0.1"
+
+[[package]]
+name = "thoth-mesh-node"
+version = "0.0.1"
+dependencies = [
  "thoth-mesh",
+ "thoth-mesh-core",
 ]
