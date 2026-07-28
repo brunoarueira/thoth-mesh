@@ -22,6 +22,11 @@ This is a Cargo workspace:
 | [`thoth-mesh-node`](crates/thoth-mesh-node) | bin | Daemon that runs a mesh node over a network transport. |
 | [`thoth-mesh-cli`](crates/thoth-mesh-cli) | bin | Command-line client (`thoth-mesh` binary) for publishing, subscribing, and admin. |
 
+## Architecture decisions
+
+Significant architecture decisions are recorded as ADRs in
+[`docs/adr/`](docs/adr/).
+
 ## License
 
 Licensed under either of
