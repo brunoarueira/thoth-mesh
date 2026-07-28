@@ -1,0 +1,21 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/thoth",
+    "crates/thoth-mesh",
+    "crates/thoth-node",
+    "crates/thoth-cli",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"
+authors = ["Bruno Arueira <contato@brunoarueira.com>"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/brunoarueira/thoth"
+homepage = "https://github.com/brunoarueira/thoth"
+
+[profile.release]
+lto = true
+codegen-units = 1

@@ -1,0 +1,12 @@
+[package]
+name = "thoth"
+description = "Core protocol types and wire format for the thoth federated pub/sub mesh."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
