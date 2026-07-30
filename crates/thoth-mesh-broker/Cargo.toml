@@ -1,0 +1,17 @@
+[package]
+name = "thoth-mesh-broker"
+description = "In-process pub/sub broker for the thoth-mesh federated pub/sub system: topic registry and subscriber dispatch."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+thoth-mesh-core = { path = "../thoth-mesh-core", version = "0.0.1" }
+tokio = { version = "1", features = ["sync"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["sync", "rt", "macros"] }
