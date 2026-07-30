@@ -12,6 +12,7 @@ thoth-mesh, using the format described in
 | [0004](0004-dual-mit-apache-license.md) | Dual MIT/Apache-2.0 license |
 | [0005](0005-wire-protocol-v1.md) | Wire protocol v1: envelope, framing, and CBOR serialization |
 | [0006](0006-pubsub-broker-crate.md) | In-process pub/sub broker: a new crate, tokio broadcast channels, exact-match topics |
+| [0007](0007-node-v1-tcp-daemon.md) | thoth-mesh-node v1: TCP daemon wiring the broker to sockets |
 
 To add a new one, copy the format of an existing ADR, number it
 sequentially, and set its status to `Accepted` once the decision is

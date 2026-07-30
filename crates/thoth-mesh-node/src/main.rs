@@ -1,8 +1,10 @@
 //! `thoth-mesh-node`: the daemon that runs a thoth-mesh node.
-//!
-//! Placeholder reserving the `thoth-mesh-node` name on crates.io ahead of
-//! the first real release. Implementation in progress.
 
-fn main() {
-    println!("thoth-mesh-node: not yet implemented");
+#[tokio::main]
+async fn main() -> std::io::Result<()> {
+    println!(
+        "thoth-mesh-node listening on {}",
+        thoth_mesh_node::DEFAULT_ADDR
+    );
+    thoth_mesh_node::run(thoth_mesh_node::DEFAULT_ADDR).await
 }
