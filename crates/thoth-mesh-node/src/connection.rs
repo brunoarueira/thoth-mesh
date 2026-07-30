@@ -6,14 +6,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use thoth_mesh_broker::Broker;
+use thoth_mesh_core::async_framing;
 use thoth_mesh_core::{Envelope, MessageKind, PeerId, Topic};
-use tokio::io::AsyncWrite;
 use tokio::net::TcpStream;
+use tokio::net::tcp::OwnedWriteHalf;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-
-use crate::framing;
+use tokio_util::compat::{Compat, TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 const OUTGOING_CHANNEL_CAPACITY: usize = 64;
 
@@ -24,13 +24,15 @@ const OUTGOING_CHANNEL_CAPACITY: usize = 64;
 /// originates (acks). It does not affect envelopes forwarded from
 /// other publishers, which keep their original sender.
 pub async fn handle_connection(socket: TcpStream, broker: Arc<Broker>, node_id: PeerId) {
-    let (mut reader, mut writer) = socket.into_split();
+    let (reader, writer) = socket.into_split();
+    let mut reader = reader.compat();
+    let mut writer = writer.compat_write();
     let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<Arc<Envelope>>(OUTGOING_CHANNEL_CAPACITY);
     let mut forwarders: HashMap<Topic, JoinHandle<()>> = HashMap::new();
 
     loop {
         tokio::select! {
-            frame = framing::read_frame(&mut reader) => {
+            frame = async_framing::read_frame(&mut reader) => {
                 let Ok(bytes) = frame else { break };
                 let Ok(envelope) = Envelope::from_bytes(&bytes) else { break };
 
@@ -76,9 +78,9 @@ pub async fn handle_connection(socket: TcpStream, broker: Arc<Broker>, node_id: 
     }
 }
 
-async fn send_envelope<W: AsyncWrite + Unpin>(writer: &mut W, envelope: &Envelope) -> bool {
+async fn send_envelope(writer: &mut Compat<OwnedWriteHalf>, envelope: &Envelope) -> bool {
     match envelope.to_bytes() {
-        Ok(bytes) => framing::write_frame(writer, &bytes).await.is_ok(),
+        Ok(bytes) => async_framing::write_frame(writer, &bytes).await.is_ok(),
         Err(_) => false,
     }
 }

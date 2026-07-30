@@ -3,6 +3,8 @@
 //! See [ADR-0005](https://github.com/brunoarueira/thoth-mesh/blob/main/docs/adr/0005-wire-protocol-v1.md)
 //! for the design rationale.
 
+#[cfg(feature = "async")]
+pub mod async_framing;
 mod envelope;
 mod error;
 mod framing;

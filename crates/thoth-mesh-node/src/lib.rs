@@ -5,7 +5,6 @@
 //! wired in - it's still an empty placeholder.
 
 pub mod connection;
-pub mod framing;
 
 use std::sync::Arc;
 

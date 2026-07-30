@@ -1,9 +1,11 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use thoth_mesh_core::async_framing;
 use thoth_mesh_core::{Envelope, MessageKind, PeerId, Topic};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
+use tokio_util::compat::{Compat, TokioAsyncReadCompatExt};
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -14,29 +16,27 @@ async fn spawn_test_node() -> SocketAddr {
     addr
 }
 
-async fn connect(addr: SocketAddr) -> TcpStream {
-    TcpStream::connect(addr).await.unwrap()
+async fn connect(addr: SocketAddr) -> Compat<TcpStream> {
+    TcpStream::connect(addr).await.unwrap().compat()
 }
 
-async fn send(stream: &mut TcpStream, envelope: &Envelope) {
+async fn send(stream: &mut Compat<TcpStream>, envelope: &Envelope) {
     let bytes = envelope.to_bytes().unwrap();
-    thoth_mesh_node::framing::write_frame(stream, &bytes)
-        .await
-        .unwrap();
+    async_framing::write_frame(stream, &bytes).await.unwrap();
 }
 
-async fn recv(stream: &mut TcpStream) -> Envelope {
-    let bytes = timeout(TEST_TIMEOUT, thoth_mesh_node::framing::read_frame(stream))
+async fn recv(stream: &mut Compat<TcpStream>) -> Envelope {
+    let bytes = timeout(TEST_TIMEOUT, async_framing::read_frame(stream))
         .await
         .expect("timed out waiting for a frame")
         .unwrap();
     Envelope::from_bytes(&bytes).unwrap()
 }
 
-async fn recv_times_out(stream: &mut TcpStream) -> bool {
+async fn recv_times_out(stream: &mut Compat<TcpStream>) -> bool {
     timeout(
         Duration::from_millis(200),
-        thoth_mesh_node::framing::read_frame(stream),
+        async_framing::read_frame(stream),
     )
     .await
     .is_err()
