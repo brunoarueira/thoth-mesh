@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/thoth-mesh-core",
     "crates/thoth-mesh",
+    "crates/thoth-mesh-broker",
     "crates/thoth-mesh-node",
     "crates/thoth-mesh-cli",
 ]
