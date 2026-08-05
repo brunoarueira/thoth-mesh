@@ -1,0 +1,46 @@
+name: Security audit
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "**/Cargo.toml"
+      - "**/Cargo.lock"
+      - ".github/workflows/audit.yml"
+  pull_request:
+    paths:
+      - "**/Cargo.toml"
+      - "**/Cargo.lock"
+      - ".github/workflows/audit.yml"
+  schedule:
+    # Catches advisories published *after* the fact for dependencies that
+    # didn't change - weekly, Monday 06:00 UTC.
+    - cron: "0 6 * * 1"
+
+concurrency:
+  group: audit-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# rustsec/audit-check needs `checks: write` to post the check-run result
+# on push/PR, and `issues: write` to file an issue when the scheduled
+# run finds a new advisory. No other write access is granted.
+permissions:
+  contents: read
+  checks: write
+  issues: write
+
+jobs:
+  audit:
+    name: cargo audit (RustSec advisory DB)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: cargo audit
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
