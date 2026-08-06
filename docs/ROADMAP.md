@@ -33,7 +33,6 @@ subscribe without writing Rust or hand-crafting CBOR frames.
   flags/env instead of the hardcoded `DEFAULT_ADDR`.
 - Structured logging (`tracing`) in `thoth-mesh-node` — needed before
   federation multiplies the number of moving parts to debug.
-- Fix the README's crate table, which is missing `thoth-mesh-broker`.
 
 ## Phase 2 — Federation groundwork (`thoth-mesh` crate)
 
@@ -68,8 +67,14 @@ without routing any messages between them yet.
 real project, not placeholders.
 
 - Real crates.io publishes of `thoth-mesh-core` and
-  `thoth-mesh-broker` (currently reserved but not buildable for a
-  consumer — see the crates.io publish state note in project memory).
+  `thoth-mesh-broker`. Both names are reserved today, but neither
+  publish is real: `thoth-mesh-core` 0.0.1 is a stale placeholder
+  from before ADR-0005's wire protocol existed, and
+  `thoth-mesh-broker` 0.0.1 was published with `cargo publish
+  --no-verify` to reserve the name — it doesn't actually build for a
+  consumer, since it depends on the real (unreleased)
+  `thoth-mesh-core` API. Fixing this means bumping and republishing
+  `thoth-mesh-core` for real first, then `thoth-mesh-broker`.
 - Decide whether crates keep moving in version lockstep
   (`version.workspace = true`) or decouple.
 - Declare the wire protocol stable (or explicitly mark it unstable).
