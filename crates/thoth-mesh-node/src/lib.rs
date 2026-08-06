@@ -31,9 +31,21 @@ pub async fn run(addr: &str) -> std::io::Result<()> {
 pub async fn serve(listener: TcpListener) -> std::io::Result<()> {
     let broker = Arc::new(Broker::new());
     let node_id = PeerId::new();
+    tracing::info!(
+        ?node_id,
+        addr = ?listener.local_addr().ok(),
+        "node ready, accepting connections"
+    );
 
     loop {
-        let (socket, _) = listener.accept().await?;
+        let (socket, peer_addr) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(err) => {
+                tracing::error!(%err, "listener accept failed, shutting down");
+                return Err(err);
+            }
+        };
+        tracing::debug!(%peer_addr, "accepted connection");
         let broker = Arc::clone(&broker);
         tokio::spawn(async move {
             connection::handle_connection(socket, broker, node_id).await;
