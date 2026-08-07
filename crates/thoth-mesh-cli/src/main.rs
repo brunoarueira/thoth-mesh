@@ -1,9 +1,10 @@
 //! `thoth-mesh`: command-line client for publishing, subscribing, and
 //! administering a thoth-mesh node.
-//!
-//! Placeholder reserving the `thoth-mesh-cli` name on crates.io ahead of
-//! the first real release. Implementation in progress.
 
-fn main() {
-    println!("thoth-mesh-cli: not yet implemented");
+use clap::Parser;
+use thoth_mesh_cli::Cli;
+
+#[tokio::main]
+async fn main() -> std::io::Result<()> {
+    thoth_mesh_cli::run(Cli::parse()).await
 }
