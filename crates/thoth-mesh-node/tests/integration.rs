@@ -221,3 +221,23 @@ async fn distinct_topics_do_not_cross_deliver() {
 
     assert!(recv_times_out(&mut subscriber).await);
 }
+
+#[tokio::test]
+async fn malformed_frame_closes_connection() {
+    let addr = spawn_test_node().await;
+    let mut client = connect(addr).await;
+
+    // A well-formed frame whose payload isn't a valid CBOR-encoded
+    // Envelope at all.
+    async_framing::write_frame(&mut client, b"not an envelope")
+        .await
+        .unwrap();
+
+    // The server should close its side rather than hang or crash;
+    // the next read surfaces an error (EOF) instead of timing out.
+    let result = timeout(TEST_TIMEOUT, async_framing::read_frame(&mut client)).await;
+    assert!(
+        matches!(result, Ok(Err(_))),
+        "expected the server to close the connection, got {result:?}"
+    );
+}

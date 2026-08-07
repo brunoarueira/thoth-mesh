@@ -152,3 +152,26 @@ fn spawn_forwarder(
         .in_current_span(),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unexpected_eof_is_a_clean_disconnect() {
+        let err = FramingError::Io(std::io::Error::from(ErrorKind::UnexpectedEof));
+        assert!(is_clean_disconnect(&err));
+    }
+
+    #[test]
+    fn other_io_errors_are_not_a_clean_disconnect() {
+        let err = FramingError::Io(std::io::Error::from(ErrorKind::ConnectionReset));
+        assert!(!is_clean_disconnect(&err));
+    }
+
+    #[test]
+    fn frame_too_large_is_not_a_clean_disconnect() {
+        let err = FramingError::FrameTooLarge { len: 100, max: 10 };
+        assert!(!is_clean_disconnect(&err));
+    }
+}
