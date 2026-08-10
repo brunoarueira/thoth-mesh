@@ -18,3 +18,10 @@ pub use framing::{MAX_FRAME_LEN, read_frame, write_frame};
 pub use message::{MessageId, MessageKind};
 pub use peer::PeerId;
 pub use topic::{MAX_TOPIC_LEN, Topic};
+
+/// Default node address: a private/dynamic-range port, chosen to avoid
+/// colliding with commonly registered services.
+///
+/// Shared by `thoth-mesh-node` (what it binds to) and `thoth-mesh-cli`
+/// (what it connects to by default) so the two can't drift apart.
+pub const DEFAULT_ADDR: &str = "127.0.0.1:49500";

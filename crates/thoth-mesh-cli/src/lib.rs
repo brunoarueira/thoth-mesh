@@ -11,13 +11,7 @@ use thoth_mesh_core::{Envelope, MessageKind, PeerId, Topic, async_framing};
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncReadCompatExt};
 
-/// Default node address to connect to.
-///
-/// Duplicated from `thoth_mesh_node::DEFAULT_ADDR` rather than
-/// depended on - the CLI is a protocol client and shouldn't need to
-/// pull in the whole daemon crate just for one constant. Keep the two
-/// in sync if the node's default ever changes.
-pub const DEFAULT_ADDR: &str = "127.0.0.1:49500";
+pub use thoth_mesh_core::DEFAULT_ADDR;
 
 #[derive(Parser, Debug)]
 #[command(version, about)]

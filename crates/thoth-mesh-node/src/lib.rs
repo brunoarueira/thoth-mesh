@@ -12,9 +12,7 @@ use thoth_mesh_broker::Broker;
 use thoth_mesh_core::PeerId;
 use tokio::net::TcpListener;
 
-/// Default bind address: a private/dynamic-range port, chosen to avoid
-/// colliding with commonly registered services.
-pub const DEFAULT_ADDR: &str = "127.0.0.1:49500";
+pub use thoth_mesh_core::DEFAULT_ADDR;
 
 /// Binds `addr` and serves connections until an unrecoverable listener
 /// error occurs.
