@@ -12,7 +12,7 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(2);
 async fn spawn_test_node() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(thoth_mesh_node::serve(listener));
+    tokio::spawn(thoth_mesh_node::serve(listener, Vec::new()));
     addr
 }
 
@@ -220,6 +220,28 @@ async fn distinct_topics_do_not_cross_deliver() {
     send(&mut publisher, &publish).await;
 
     assert!(recv_times_out(&mut subscriber).await);
+}
+
+#[tokio::test]
+async fn hello_receives_a_hello_reply_with_our_listen_addr() {
+    let addr = spawn_test_node().await;
+    let mut client = connect(addr).await;
+
+    let hello = Envelope::new(
+        PeerId::new(),
+        MessageKind::Hello {
+            listen_addr: Some("127.0.0.1:49999".to_owned()),
+        },
+    );
+    send(&mut client, &hello).await;
+
+    let reply = recv(&mut client).await;
+    assert_eq!(
+        reply.kind,
+        MessageKind::Hello {
+            listen_addr: Some(addr.to_string())
+        }
+    );
 }
 
 #[tokio::test]

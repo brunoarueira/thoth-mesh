@@ -153,7 +153,7 @@ mod tests {
     async fn spawn_test_node() -> std::net::SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(thoth_mesh_node::serve(listener));
+        tokio::spawn(thoth_mesh_node::serve(listener, Vec::new()));
         addr
     }
 

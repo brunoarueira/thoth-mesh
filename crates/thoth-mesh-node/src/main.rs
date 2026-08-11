@@ -16,6 +16,10 @@ struct Cli {
     /// e.g. `thoth_mesh_node=debug`) to use when `RUST_LOG` isn't set.
     #[arg(long, default_value = "info")]
     log_level: String,
+
+    /// Address of a seed peer to dial on startup. Repeatable.
+    #[arg(long = "peer")]
+    peers: Vec<String>,
 }
 
 #[tokio::main]
@@ -31,5 +35,5 @@ async fn main() -> std::io::Result<()> {
         .unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
-    thoth_mesh_node::run(&cli.addr).await
+    thoth_mesh_node::run(&cli.addr, cli.peers).await
 }

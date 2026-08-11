@@ -48,6 +48,15 @@ pub enum MessageKind {
         in_reply_to: Option<MessageId>,
         message: String,
     },
+    /// Identify this connection as a peer link rather than a client
+    /// connection. Sent as the first message by the dialing side of a
+    /// node-to-node connection; the accepting side replies in kind.
+    /// See ADR-0009.
+    Hello {
+        /// The address other peers should dial to reach the sender,
+        /// if it accepts inbound connections.
+        listen_addr: Option<String>,
+    },
 }
 
 #[cfg(test)]
@@ -91,6 +100,10 @@ mod tests {
                 in_reply_to: None,
                 message: "boom".to_owned(),
             },
+            MessageKind::Hello {
+                listen_addr: Some("127.0.0.1:49500".to_owned()),
+            },
+            MessageKind::Hello { listen_addr: None },
         ];
 
         for kind in kinds {
