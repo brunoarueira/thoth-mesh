@@ -2,9 +2,10 @@
 //! performs the handshake, and keeps each connection open. See
 //! ADR-0009.
 
-use thoth_mesh::dial_handshake;
+use thoth_mesh::{Membership, dial_handshake};
 use thoth_mesh_core::{PeerId, async_framing};
 use tokio::net::TcpStream;
+use tokio::task::JoinHandle;
 use tokio_util::compat::TokioAsyncReadCompatExt;
 use tracing::Instrument;
 
@@ -13,14 +14,33 @@ use tracing::Instrument;
 ///
 /// Connect and handshake failures are logged and not retried -
 /// reconnect/backoff is out of scope here (tracked for a later
-/// phase; see issue #23).
-pub fn spawn_seed_peers(seed_peers: Vec<String>, my_id: PeerId, my_listen_addr: Option<String>) {
-    for peer_addr in seed_peers {
-        tokio::spawn(dial_peer(peer_addr, my_id, my_listen_addr.clone()));
-    }
+/// phase; see issue #23). Returns the tasks' handles so tests can
+/// sever a link on demand; ordinary callers can drop them.
+pub fn spawn_seed_peers(
+    seed_peers: Vec<String>,
+    my_id: PeerId,
+    my_listen_addr: Option<String>,
+    membership: Membership,
+) -> Vec<JoinHandle<()>> {
+    seed_peers
+        .into_iter()
+        .map(|peer_addr| {
+            tokio::spawn(dial_peer(
+                peer_addr,
+                my_id,
+                my_listen_addr.clone(),
+                membership.clone(),
+            ))
+        })
+        .collect()
 }
 
-async fn dial_peer(peer_addr: String, my_id: PeerId, my_listen_addr: Option<String>) {
+async fn dial_peer(
+    peer_addr: String,
+    my_id: PeerId,
+    my_listen_addr: Option<String>,
+    membership: Membership,
+) {
     let span = tracing::info_span!("peer", addr = %peer_addr);
     async move {
         let stream = match TcpStream::connect(&peer_addr).await {
@@ -44,6 +64,7 @@ async fn dial_peer(peer_addr: String, my_id: PeerId, my_listen_addr: Option<Stri
             peer_listen_addr = ?info.listen_addr,
             "connected to seed peer"
         );
+        membership.mark_connected(info.peer_id, info.listen_addr);
 
         // Hold the connection open until the peer disconnects.
         // Nothing routes over peer links yet - that's Phase 3 - so
@@ -57,6 +78,7 @@ async fn dial_peer(peer_addr: String, my_id: PeerId, my_listen_addr: Option<Stri
                 }
             }
         }
+        membership.mark_disconnected(info.peer_id);
     }
     .instrument(span)
     .await
@@ -74,16 +96,33 @@ mod tests {
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(2);
 
+    /// Polls `cond` until it's true, or panics once `TEST_TIMEOUT`
+    /// elapses. `mark_connected`/`mark_disconnected` happen in a task
+    /// this test doesn't otherwise synchronize with, so membership
+    /// assertions need to wait for them rather than check once.
+    async fn eventually(mut cond: impl FnMut() -> bool) {
+        let deadline = tokio::time::Instant::now() + TEST_TIMEOUT;
+        while !cond() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "condition was not met within {TEST_TIMEOUT:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     #[tokio::test]
-    async fn dial_peer_sends_our_hello_with_the_given_listen_addr() {
+    async fn dial_peer_sends_hello_and_tracks_membership() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let my_id = PeerId::new();
+        let membership = Membership::new();
 
         tokio::spawn(dial_peer(
             addr.to_string(),
             my_id,
             Some("127.0.0.1:49500".to_owned()),
+            membership.clone(),
         ));
 
         let (socket, _) = timeout(TEST_TIMEOUT, listener.accept())
@@ -107,10 +146,18 @@ mod tests {
 
         // Reply with our own Hello so dial_handshake completes rather
         // than hanging.
-        let reply = Envelope::new(PeerId::new(), MessageKind::Hello { listen_addr: None });
+        let their_id = PeerId::new();
+        let reply = Envelope::new(their_id, MessageKind::Hello { listen_addr: None });
         async_framing::write_frame(&mut conn, &reply.to_bytes().unwrap())
             .await
             .unwrap();
+
+        eventually(|| membership.is_reachable(their_id)).await;
+
+        // Closing our side should be noticed and reflected in
+        // membership too.
+        drop(conn);
+        eventually(|| !membership.is_reachable(their_id)).await;
     }
 
     #[tokio::test]
@@ -125,7 +172,7 @@ mod tests {
 
         timeout(
             TEST_TIMEOUT,
-            dial_peer(addr.to_string(), PeerId::new(), None),
+            dial_peer(addr.to_string(), PeerId::new(), None, Membership::new()),
         )
         .await
         .expect("dial_peer should return promptly on connection refused");

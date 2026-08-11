@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::sync::Arc;
 
+use thoth_mesh::Membership;
 use thoth_mesh_broker::Broker;
 use thoth_mesh_core::async_framing;
 use thoth_mesh_core::{Envelope, FramingError, MessageKind, PeerId, Topic};
@@ -29,16 +30,21 @@ const OUTGOING_CHANNEL_CAPACITY: usize = 64;
 /// `my_listen_addr` is echoed back in the `Hello` reply if the peer on
 /// the other end opens with its own `Hello` (see ADR-0009) - it plays
 /// no part in ordinary client traffic.
+///
+/// `membership` is updated when a peer's `Hello` is seen and again
+/// when this connection ends, so it plays no part in ordinary client
+/// traffic either (see issue #24).
 pub async fn handle_connection(
     socket: TcpStream,
     broker: Arc<Broker>,
     node_id: PeerId,
     my_listen_addr: Option<String>,
+    membership: Membership,
 ) {
     let peer_addr = socket.peer_addr().ok();
     let span = tracing::info_span!("connection", peer = ?peer_addr);
     async move {
-        run_connection(socket, broker, node_id, my_listen_addr).await;
+        run_connection(socket, broker, node_id, my_listen_addr, membership).await;
     }
     .instrument(span)
     .await
@@ -49,12 +55,16 @@ async fn run_connection(
     broker: Arc<Broker>,
     node_id: PeerId,
     my_listen_addr: Option<String>,
+    membership: Membership,
 ) {
     let (reader, writer) = socket.into_split();
     let mut reader = reader.compat();
     let mut writer = writer.compat_write();
     let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<Arc<Envelope>>(OUTGOING_CHANNEL_CAPACITY);
     let mut forwarders: HashMap<Topic, JoinHandle<()>> = HashMap::new();
+    // Set once this connection identifies itself as a peer link via
+    // Hello, so we know whose membership entry to clear when it ends.
+    let mut peer_identity: Option<PeerId> = None;
 
     loop {
         tokio::select! {
@@ -114,6 +124,8 @@ async fn run_connection(
                             peer_listen_addr = ?listen_addr,
                             "peer said hello"
                         );
+                        peer_identity = Some(envelope.sender);
+                        membership.mark_connected(envelope.sender, listen_addr.clone());
                         let reply = Envelope::new(
                             node_id,
                             MessageKind::Hello {
@@ -138,6 +150,10 @@ async fn run_connection(
     for (topic, handle) in forwarders {
         tracing::debug!(%topic, "stopping forwarder");
         handle.abort();
+    }
+
+    if let Some(peer_id) = peer_identity {
+        membership.mark_disconnected(peer_id);
     }
 }
 

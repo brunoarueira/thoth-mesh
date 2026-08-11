@@ -6,5 +6,7 @@
 //! identifying themselves via a `Hello` handshake. See ADR-0009.
 
 mod handshake;
+mod membership;
 
 pub use handshake::{HandshakeError, PeerInfo, dial_handshake, hello};
+pub use membership::{Membership, PeerStatus};
