@@ -25,17 +25,31 @@ const OUTGOING_CHANNEL_CAPACITY: usize = 64;
 /// `node_id` identifies this node as the sender on any envelope it
 /// originates (acks). It does not affect envelopes forwarded from
 /// other publishers, which keep their original sender.
-pub async fn handle_connection(socket: TcpStream, broker: Arc<Broker>, node_id: PeerId) {
+///
+/// `my_listen_addr` is echoed back in the `Hello` reply if the peer on
+/// the other end opens with its own `Hello` (see ADR-0009) - it plays
+/// no part in ordinary client traffic.
+pub async fn handle_connection(
+    socket: TcpStream,
+    broker: Arc<Broker>,
+    node_id: PeerId,
+    my_listen_addr: Option<String>,
+) {
     let peer_addr = socket.peer_addr().ok();
     let span = tracing::info_span!("connection", peer = ?peer_addr);
     async move {
-        run_connection(socket, broker, node_id).await;
+        run_connection(socket, broker, node_id, my_listen_addr).await;
     }
     .instrument(span)
     .await
 }
 
-async fn run_connection(socket: TcpStream, broker: Arc<Broker>, node_id: PeerId) {
+async fn run_connection(
+    socket: TcpStream,
+    broker: Arc<Broker>,
+    node_id: PeerId,
+    my_listen_addr: Option<String>,
+) {
     let (reader, writer) = socket.into_split();
     let mut reader = reader.compat();
     let mut writer = writer.compat_write();
@@ -93,6 +107,22 @@ async fn run_connection(socket: TcpStream, broker: Arc<Broker>, node_id: PeerId)
                     }
                     MessageKind::Ack { .. } | MessageKind::Error { .. } => {
                         // Not actionable from a client in v1; ignore.
+                    }
+                    MessageKind::Hello { listen_addr } => {
+                        tracing::info!(
+                            sender = ?envelope.sender,
+                            peer_listen_addr = ?listen_addr,
+                            "peer said hello"
+                        );
+                        let reply = Envelope::new(
+                            node_id,
+                            MessageKind::Hello {
+                                listen_addr: my_listen_addr.clone(),
+                            },
+                        );
+                        if !send_envelope(&mut writer, &reply).await {
+                            break;
+                        }
                     }
                 }
             }

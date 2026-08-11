@@ -10,4 +10,9 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
-thoth-mesh-core = { path = "../thoth-mesh-core", version = "0.0.1" }
+thoth-mesh-core = { path = "../thoth-mesh-core", version = "0.0.1", features = ["async"] }
+futures-util = { version = "0.3.33", default-features = false, features = ["std", "io"] }
+thiserror = "2.0.19"
+
+[dev-dependencies]
+futures-executor = "0.3.33"

@@ -503,6 +503,9 @@ dependencies = [
 name = "thoth-mesh"
 version = "0.0.1"
 dependencies = [
+ "futures-executor",
+ "futures-util",
+ "thiserror",
  "thoth-mesh-core",
 ]
 

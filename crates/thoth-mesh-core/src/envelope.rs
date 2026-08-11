@@ -67,6 +67,9 @@ mod tests {
                 in_reply_to: None,
                 message: "boom".to_owned(),
             },
+            MessageKind::Hello {
+                listen_addr: Some("127.0.0.1:49500".to_owned()),
+            },
         ];
 
         for kind in kinds {
