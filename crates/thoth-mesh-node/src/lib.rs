@@ -79,6 +79,30 @@ pub fn spawn(listener: TcpListener, seed_peers: Vec<String>) -> Node {
     }
 }
 
+/// Test-only helpers, shared between this crate's own unit tests and
+/// its integration tests - not needed for ordinary use.
+pub mod test_support {
+    use std::time::Duration;
+
+    /// How long [`eventually`] polls before giving up.
+    const TIMEOUT: Duration = Duration::from_secs(2);
+
+    /// Polls `cond` until it's true, or panics once [`TIMEOUT`]
+    /// elapses. Membership updates happen in a task these tests don't
+    /// otherwise synchronize with, so assertions on it need to wait
+    /// rather than check once.
+    pub async fn eventually(mut cond: impl FnMut() -> bool) {
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        while !cond() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "condition was not met within {TIMEOUT:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+}
+
 async fn accept_loop(
     listener: TcpListener,
     node_id: PeerId,

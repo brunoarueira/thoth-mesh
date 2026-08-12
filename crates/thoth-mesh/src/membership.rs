@@ -52,6 +52,8 @@ impl Membership {
                 listen_addr,
             },
         );
+        // Release the lock before logging - tracing::info! isn't
+        // free, and there's no reason to hold the mutex while it runs.
         drop(peers);
         if !was_connected {
             tracing::info!(?peer_id, "peer up");
@@ -71,6 +73,7 @@ impl Membership {
         };
         let was_connected = status.connected;
         status.connected = false;
+        // Same as in mark_connected: don't hold the lock while logging.
         drop(peers);
         if was_connected {
             tracing::info!(?peer_id, "peer down");

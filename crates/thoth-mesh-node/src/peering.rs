@@ -93,23 +93,9 @@ mod tests {
     use tokio::time::timeout;
 
     use super::*;
+    use crate::test_support::eventually;
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(2);
-
-    /// Polls `cond` until it's true, or panics once `TEST_TIMEOUT`
-    /// elapses. `mark_connected`/`mark_disconnected` happen in a task
-    /// this test doesn't otherwise synchronize with, so membership
-    /// assertions need to wait for them rather than check once.
-    async fn eventually(mut cond: impl FnMut() -> bool) {
-        let deadline = tokio::time::Instant::now() + TEST_TIMEOUT;
-        while !cond() {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "condition was not met within {TEST_TIMEOUT:?}"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    }
 
     #[tokio::test]
     async fn dial_peer_sends_hello_and_tracks_membership() {

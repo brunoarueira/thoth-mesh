@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use thoth_mesh_core::async_framing;
 use thoth_mesh_core::{Envelope, MessageKind, PeerId, Topic};
+use thoth_mesh_node::test_support::eventually;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 use tokio_util::compat::{Compat, TokioAsyncReadCompatExt};
@@ -44,21 +45,6 @@ async fn recv_times_out(stream: &mut Compat<TcpStream>) -> bool {
 
 fn topic(s: &str) -> Topic {
     s.parse::<Topic>().unwrap()
-}
-
-/// Polls `cond` until it's true, or panics once `TEST_TIMEOUT`
-/// elapses. Membership updates happen in a task these tests don't
-/// otherwise synchronize with, so assertions on it need to wait
-/// rather than check once.
-async fn eventually(mut cond: impl FnMut() -> bool) {
-    let deadline = tokio::time::Instant::now() + TEST_TIMEOUT;
-    while !cond() {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "condition was not met within {TEST_TIMEOUT:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
 }
 
 #[tokio::test]
