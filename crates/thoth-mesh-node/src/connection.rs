@@ -34,17 +34,33 @@ const OUTGOING_CHANNEL_CAPACITY: usize = 64;
 /// `membership` is updated when a peer's `Hello` is seen and again
 /// when this connection ends, so it plays no part in ordinary client
 /// traffic either (see issue #24).
+///
+/// `initial_peer_identity` is `Some` when the caller already knows
+/// this connection is a peer link before the loop starts - the dial
+/// side completes its handshake (and its own `membership.mark_connected`
+/// call) before handing off here (see ADR-0010). It's `None` on the
+/// accept side, which only learns the peer's identity if and when it
+/// receives a `Hello` mid-loop, same as any client connection.
 pub async fn handle_connection(
     socket: TcpStream,
     broker: Arc<Broker>,
     node_id: PeerId,
     my_listen_addr: Option<String>,
     membership: Membership,
+    initial_peer_identity: Option<PeerId>,
 ) {
     let peer_addr = socket.peer_addr().ok();
     let span = tracing::info_span!("connection", peer = ?peer_addr);
     async move {
-        run_connection(socket, broker, node_id, my_listen_addr, membership).await;
+        run_connection(
+            socket,
+            broker,
+            node_id,
+            my_listen_addr,
+            membership,
+            initial_peer_identity,
+        )
+        .await;
     }
     .instrument(span)
     .await
@@ -56,15 +72,18 @@ async fn run_connection(
     node_id: PeerId,
     my_listen_addr: Option<String>,
     membership: Membership,
+    initial_peer_identity: Option<PeerId>,
 ) {
     let (reader, writer) = socket.into_split();
     let mut reader = reader.compat();
     let mut writer = writer.compat_write();
     let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<Arc<Envelope>>(OUTGOING_CHANNEL_CAPACITY);
     let mut forwarders: HashMap<Topic, JoinHandle<()>> = HashMap::new();
-    // Set once this connection identifies itself as a peer link via
-    // Hello, so we know whose membership entry to clear when it ends.
-    let mut peer_identity: Option<PeerId> = None;
+    // Set once this connection is known to be a peer link - either
+    // passed in already-known (dial side) or learned from an incoming
+    // Hello (accept side) - so we know whose membership entry to
+    // clear when it ends.
+    let mut peer_identity: Option<PeerId> = initial_peer_identity;
 
     loop {
         tokio::select! {
