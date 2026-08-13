@@ -507,6 +507,7 @@ dependencies = [
  "futures-util",
  "thiserror",
  "thoth-mesh-core",
+ "tracing",
 ]
 
 [[package]]

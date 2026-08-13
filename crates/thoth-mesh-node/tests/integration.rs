@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use thoth_mesh_core::async_framing;
 use thoth_mesh_core::{Envelope, MessageKind, PeerId, Topic};
+use thoth_mesh_node::test_support::eventually;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 use tokio_util::compat::{Compat, TokioAsyncReadCompatExt};
@@ -242,6 +243,64 @@ async fn hello_receives_a_hello_reply_with_our_listen_addr() {
             listen_addr: Some(addr.to_string())
         }
     );
+}
+
+#[tokio::test]
+async fn two_real_nodes_see_each_other_as_reachable() {
+    let listener_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_b = listener_b.local_addr().unwrap();
+    let node_b = thoth_mesh_node::spawn(listener_b, Vec::new());
+
+    let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let node_a = thoth_mesh_node::spawn(listener_a, vec![addr_b.to_string()]);
+
+    eventually(|| node_a.membership.is_reachable(node_b.id)).await;
+    eventually(|| node_b.membership.is_reachable(node_a.id)).await;
+}
+
+#[tokio::test]
+async fn peer_becomes_unreachable_once_its_connection_drops() {
+    let listener_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_b = listener_b.local_addr().unwrap();
+    let node_b = thoth_mesh_node::spawn(listener_b, Vec::new());
+
+    let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let node_a = thoth_mesh_node::spawn(listener_a, vec![addr_b.to_string()]);
+
+    eventually(|| node_a.membership.is_reachable(node_b.id)).await;
+    eventually(|| node_b.membership.is_reachable(node_a.id)).await;
+
+    // Sever node A's dialed connection to node B, as if node A had
+    // disappeared - node B should notice on its next read and mark
+    // it unreachable.
+    for handle in &node_a.peer_dials {
+        handle.abort();
+    }
+
+    eventually(|| !node_b.membership.is_reachable(node_a.id)).await;
+}
+
+#[tokio::test]
+async fn hello_marks_the_sender_reachable_then_unreachable_on_disconnect() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let node = thoth_mesh_node::spawn(listener, Vec::new());
+
+    let mut client = connect(addr).await;
+    let sender = PeerId::new();
+    assert!(!node.membership.is_reachable(sender));
+
+    let hello = Envelope::new(sender, MessageKind::Hello { listen_addr: None });
+    send(&mut client, &hello).await;
+    recv(&mut client).await; // the node's own Hello reply
+
+    // The node applies mark_connected before replying, so this is
+    // already true by the time we get the reply above - no polling
+    // needed.
+    assert!(node.membership.is_reachable(sender));
+
+    drop(client);
+    eventually(|| !node.membership.is_reachable(sender)).await;
 }
 
 #[tokio::test]
