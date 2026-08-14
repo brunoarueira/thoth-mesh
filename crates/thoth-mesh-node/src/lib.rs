@@ -3,8 +3,13 @@
 //! Wires `thoth-mesh-broker` (local pub/sub dispatch) to TCP
 //! connections (see ADR-0007), and `thoth-mesh` (peer handshake and
 //! membership tracking) to outbound and inbound peer links (see
-//! ADR-0009). Routing messages over those peer links is Phase 3 -
-//! not wired in yet.
+//! ADR-0009). Once a peer link's handshake completes, either side of
+//! it is a full participant in local routing - `Subscribe`,
+//! `Unsubscribe`, and `Publish` are handled identically regardless of
+//! whether they came from a client or a peer (see ADR-0010). Nothing
+//! yet causes a node to *originate* interest toward its peers based
+//! on its own local clients, or prevents forwarding loops on a
+//! cyclic mesh - that's the next Phase 3 issue.
 
 pub mod connection;
 mod peering;
@@ -35,14 +40,16 @@ pub async fn run(addr: &str, seed_peers: Vec<String>) -> std::io::Result<()> {
 pub async fn serve(listener: TcpListener, seed_peers: Vec<String>) -> std::io::Result<()> {
     let node_id = PeerId::new();
     let membership = Membership::new();
+    let broker = Arc::new(Broker::new());
     let my_listen_addr = listener.local_addr().ok().map(|addr| addr.to_string());
     peering::spawn_seed_peers(
         seed_peers,
         node_id,
         my_listen_addr.clone(),
         membership.clone(),
+        Arc::clone(&broker),
     );
-    accept_loop(listener, node_id, my_listen_addr, membership).await
+    accept_loop(listener, node_id, my_listen_addr, membership, broker).await
 }
 
 /// A node spawned via [`spawn`], along with the handles tests need to
@@ -62,14 +69,21 @@ pub struct Node {
 pub fn spawn(listener: TcpListener, seed_peers: Vec<String>) -> Node {
     let id = PeerId::new();
     let membership = Membership::new();
+    let broker = Arc::new(Broker::new());
     let my_listen_addr = listener.local_addr().ok().map(|addr| addr.to_string());
-    let peer_dials =
-        peering::spawn_seed_peers(seed_peers, id, my_listen_addr.clone(), membership.clone());
+    let peer_dials = peering::spawn_seed_peers(
+        seed_peers,
+        id,
+        my_listen_addr.clone(),
+        membership.clone(),
+        Arc::clone(&broker),
+    );
     let accept_loop = tokio::spawn(accept_loop(
         listener,
         id,
         my_listen_addr,
         membership.clone(),
+        broker,
     ));
     Node {
         id,
@@ -108,8 +122,8 @@ async fn accept_loop(
     node_id: PeerId,
     my_listen_addr: Option<String>,
     membership: Membership,
+    broker: Arc<Broker>,
 ) -> std::io::Result<()> {
-    let broker = Arc::new(Broker::new());
     tracing::info!(
         ?node_id,
         addr = ?my_listen_addr,
@@ -129,8 +143,15 @@ async fn accept_loop(
         let my_listen_addr = my_listen_addr.clone();
         let membership = membership.clone();
         tokio::spawn(async move {
-            connection::handle_connection(socket, broker, node_id, my_listen_addr, membership)
-                .await;
+            connection::handle_connection(
+                socket,
+                broker,
+                node_id,
+                my_listen_addr,
+                membership,
+                None,
+            )
+            .await;
         });
     }
 }

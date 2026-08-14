@@ -304,6 +304,69 @@ async fn hello_marks_the_sender_reachable_then_unreachable_on_disconnect() {
 }
 
 #[tokio::test]
+async fn dial_side_peer_link_forwards_local_publishes_once_subscribed() {
+    // A raw socket standing in for "peer B" - lets us drive the
+    // handshake and post-handshake traffic by hand, the same way the
+    // other raw-client tests in this file do, but from the far end of
+    // a connection node A dialed rather than one a client dialed into
+    // node A. Exercises the dial side specifically (ADR-0010): before
+    // that decision, only the accept side ran the broker-wired
+    // dispatch loop.
+    let peer_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let peer_addr = peer_listener.local_addr().unwrap();
+
+    let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_a = listener_a.local_addr().unwrap();
+    let _node_a = thoth_mesh_node::spawn(listener_a, vec![peer_addr.to_string()]);
+
+    let (socket, _) = timeout(TEST_TIMEOUT, peer_listener.accept())
+        .await
+        .expect("timed out waiting for node A to dial")
+        .unwrap();
+    let mut peer = socket.compat();
+
+    // Complete the handshake node A initiates.
+    timeout(TEST_TIMEOUT, async_framing::read_frame(&mut peer))
+        .await
+        .expect("timed out waiting for node A's Hello")
+        .unwrap();
+    let peer_id = PeerId::new();
+    let hello_reply = Envelope::new(peer_id, MessageKind::Hello { listen_addr: None });
+    send(&mut peer, &hello_reply).await;
+
+    // "Peer B" subscribes over the link node A dialed.
+    let sub = Envelope::new(
+        peer_id,
+        MessageKind::Subscribe {
+            topic: topic("weather.updates"),
+        },
+    );
+    send(&mut peer, &sub).await;
+    let ack = recv(&mut peer).await;
+    assert_eq!(
+        ack.kind,
+        MessageKind::Ack {
+            in_reply_to: sub.id
+        }
+    );
+
+    // An ordinary client publishes on node A directly.
+    let mut publisher = connect(addr_a).await;
+    let publish = Envelope::new(
+        PeerId::new(),
+        MessageKind::Publish {
+            topic: topic("weather.updates"),
+            payload: b"sunny".to_vec(),
+        },
+    );
+    send(&mut publisher, &publish).await;
+
+    // It should be forwarded down the dialed peer link.
+    let delivered = recv(&mut peer).await;
+    assert_eq!(delivered.id, publish.id);
+}
+
+#[tokio::test]
 async fn malformed_frame_closes_connection() {
     let addr = spawn_test_node().await;
     let mut client = connect(addr).await;

@@ -1,26 +1,34 @@
 //! Outbound connection management: dials configured seed peers,
-//! performs the handshake, and keeps each connection open. See
-//! ADR-0009.
+//! performs the handshake, and hands the connection off to the same
+//! broker-wired dispatch the accept side uses. See ADR-0009 and
+//! ADR-0010.
+
+use std::sync::Arc;
 
 use thoth_mesh::{Membership, dial_handshake};
-use thoth_mesh_core::{PeerId, async_framing};
+use thoth_mesh_broker::Broker;
+use thoth_mesh_core::PeerId;
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 use tokio_util::compat::TokioAsyncReadCompatExt;
 use tracing::Instrument;
 
+use crate::connection;
+
 /// Spawns one background task per entry in `seed_peers`, each dialing
-/// that address, handshaking, and holding the connection open.
+/// that address, handshaking, and then routing messages over the
+/// connection exactly as an accepted one would.
 ///
 /// Connect and handshake failures are logged and not retried -
-/// reconnect/backoff is out of scope here (tracked for a later
-/// phase; see issue #23). Returns the tasks' handles so tests can
-/// sever a link on demand; ordinary callers can drop them.
+/// reconnect/backoff is out of scope here (tracked for Phase 4;
+/// see issue #18). Returns the tasks' handles so tests can sever a
+/// link on demand; ordinary callers can drop them.
 pub fn spawn_seed_peers(
     seed_peers: Vec<String>,
     my_id: PeerId,
     my_listen_addr: Option<String>,
     membership: Membership,
+    broker: Arc<Broker>,
 ) -> Vec<JoinHandle<()>> {
     seed_peers
         .into_iter()
@@ -30,6 +38,7 @@ pub fn spawn_seed_peers(
                 my_id,
                 my_listen_addr.clone(),
                 membership.clone(),
+                Arc::clone(&broker),
             ))
         })
         .collect()
@@ -40,6 +49,7 @@ async fn dial_peer(
     my_id: PeerId,
     my_listen_addr: Option<String>,
     membership: Membership,
+    broker: Arc<Broker>,
 ) {
     let span = tracing::info_span!("peer", addr = %peer_addr);
     async move {
@@ -52,7 +62,7 @@ async fn dial_peer(
         };
         let mut conn = stream.compat();
 
-        let info = match dial_handshake(&mut conn, my_id, my_listen_addr).await {
+        let info = match dial_handshake(&mut conn, my_id, my_listen_addr.clone()).await {
             Ok(info) => info,
             Err(err) => {
                 tracing::warn!(%err, "handshake with seed peer failed");
@@ -66,19 +76,20 @@ async fn dial_peer(
         );
         membership.mark_connected(info.peer_id, info.listen_addr);
 
-        // Hold the connection open until the peer disconnects.
-        // Nothing routes over peer links yet - that's Phase 3 - so
-        // any further frames are just logged and discarded.
-        loop {
-            match async_framing::read_frame(&mut conn).await {
-                Ok(_) => tracing::debug!("received a frame from peer (ignored for now)"),
-                Err(err) => {
-                    tracing::info!(%err, "peer connection closed");
-                    break;
-                }
-            }
-        }
-        membership.mark_disconnected(info.peer_id);
+        // Recover the raw stream (no data loss - Compat adds no
+        // buffering of its own) and hand off to the same dispatch
+        // loop the accept side uses, with the peer identity we
+        // already know from the handshake (see ADR-0010).
+        let stream = conn.into_inner();
+        connection::handle_connection(
+            stream,
+            broker,
+            my_id,
+            my_listen_addr,
+            membership,
+            Some(info.peer_id),
+        )
+        .await;
     }
     .instrument(span)
     .await
@@ -88,7 +99,7 @@ async fn dial_peer(
 mod tests {
     use std::time::Duration;
 
-    use thoth_mesh_core::{Envelope, MessageKind};
+    use thoth_mesh_core::{Envelope, MessageKind, async_framing};
     use tokio::net::TcpListener;
     use tokio::time::timeout;
 
@@ -109,6 +120,7 @@ mod tests {
             my_id,
             Some("127.0.0.1:49500".to_owned()),
             membership.clone(),
+            Arc::new(Broker::new()),
         ));
 
         let (socket, _) = timeout(TEST_TIMEOUT, listener.accept())
@@ -147,6 +159,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dial_peer_forwards_broker_publishes_once_the_peer_subscribes() {
+        // Once the handshake completes, dial_peer hands off to the
+        // same dispatch loop the accept side uses (ADR-0010) - a
+        // Subscribe from the far end should get a working forwarder
+        // against the same broker instance we hand dial_peer here.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let broker = Arc::new(Broker::new());
+
+        tokio::spawn(dial_peer(
+            addr.to_string(),
+            PeerId::new(),
+            None,
+            Membership::new(),
+            Arc::clone(&broker),
+        ));
+
+        let (socket, _) = timeout(TEST_TIMEOUT, listener.accept())
+            .await
+            .expect("timed out waiting for the dial")
+            .unwrap();
+        let mut conn = socket.compat();
+
+        // Complete the handshake.
+        timeout(TEST_TIMEOUT, async_framing::read_frame(&mut conn))
+            .await
+            .expect("timed out waiting for the Hello")
+            .unwrap();
+        let their_id = PeerId::new();
+        let hello_reply = Envelope::new(their_id, MessageKind::Hello { listen_addr: None });
+        async_framing::write_frame(&mut conn, &hello_reply.to_bytes().unwrap())
+            .await
+            .unwrap();
+
+        // Subscribe over the now-established peer link.
+        let topic: thoth_mesh_core::Topic = "weather.updates".parse().unwrap();
+        let sub = Envelope::new(
+            their_id,
+            MessageKind::Subscribe {
+                topic: topic.clone(),
+            },
+        );
+        async_framing::write_frame(&mut conn, &sub.to_bytes().unwrap())
+            .await
+            .unwrap();
+        let ack = timeout(TEST_TIMEOUT, async_framing::read_frame(&mut conn))
+            .await
+            .expect("timed out waiting for the subscribe ack")
+            .unwrap();
+        assert_eq!(
+            Envelope::from_bytes(&ack).unwrap().kind,
+            MessageKind::Ack {
+                in_reply_to: sub.id
+            }
+        );
+
+        // A publish on the broker dial_peer was handed - as if from a
+        // local client - should now be forwarded down the peer link.
+        let publish = Envelope::new(
+            PeerId::new(),
+            MessageKind::Publish {
+                topic: topic.clone(),
+                payload: b"sunny".to_vec(),
+            },
+        );
+        broker.publish(&topic, Arc::new(publish.clone())).await;
+
+        let delivered = timeout(TEST_TIMEOUT, async_framing::read_frame(&mut conn))
+            .await
+            .expect("timed out waiting for the forwarded publish")
+            .unwrap();
+        assert_eq!(Envelope::from_bytes(&delivered).unwrap().id, publish.id);
+    }
+
+    #[tokio::test]
     async fn dial_peer_logs_and_returns_when_the_connection_is_refused() {
         // Nothing is listening on this address - the dial itself
         // should fail fast rather than hang or panic. Exercised
@@ -158,7 +245,13 @@ mod tests {
 
         timeout(
             TEST_TIMEOUT,
-            dial_peer(addr.to_string(), PeerId::new(), None, Membership::new()),
+            dial_peer(
+                addr.to_string(),
+                PeerId::new(),
+                None,
+                Membership::new(),
+                Arc::new(Broker::new()),
+            ),
         )
         .await
         .expect("dial_peer should return promptly on connection refused");
