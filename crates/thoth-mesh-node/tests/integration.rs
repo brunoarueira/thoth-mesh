@@ -8,7 +8,13 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 use tokio_util::compat::{Compat, TokioAsyncReadCompatExt};
 
-const TEST_TIMEOUT: Duration = Duration::from_secs(2);
+// Generous enough to absorb CI scheduling jitter - the multi-node
+// tests spin up several real nodes' worth of background tasks and
+// TCP round trips, which can be noticeably slower on a contended
+// runner than locally. `recv_times_out`'s negative checks use their
+// own, much shorter, independent timeout, so raising this only
+// affects how long we wait for an expected delivery.
+const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 async fn spawn_test_node() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
