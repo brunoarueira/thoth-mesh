@@ -8,7 +8,13 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 use tokio_util::compat::{Compat, TokioAsyncReadCompatExt};
 
-const TEST_TIMEOUT: Duration = Duration::from_secs(2);
+// Generous enough to absorb CI scheduling jitter - the multi-node
+// tests spin up several real nodes' worth of background tasks and
+// TCP round trips, which can be noticeably slower on a contended
+// runner than locally. `recv_times_out`'s negative checks use their
+// own, much shorter, independent timeout, so raising this only
+// affects how long we wait for an expected delivery.
+const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 async fn spawn_test_node() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -45,6 +51,61 @@ async fn recv_times_out(stream: &mut Compat<TcpStream>) -> bool {
 
 fn topic(s: &str) -> Topic {
     s.parse::<Topic>().unwrap()
+}
+
+/// Publishes fresh envelopes against `publish_addr` (a new connection
+/// and a new `MessageId` each attempt) until one shows up on
+/// `subscriber`, or the overall [`TEST_TIMEOUT`] elapses.
+///
+/// Interest propagation across peer links (ADR-0011) happens in
+/// background tasks a caller doesn't otherwise synchronize with, so
+/// tests relying on it need to poll rather than publish once and read
+/// once - the same reasoning `test_support::eventually` documents for
+/// membership updates.
+async fn publish_until_delivered(
+    publish_addr: SocketAddr,
+    subscriber: &mut Compat<TcpStream>,
+    topic: Topic,
+    payload: &[u8],
+) -> Envelope {
+    let expected_kind = MessageKind::Publish {
+        topic: topic.clone(),
+        payload: payload.to_vec(),
+    };
+    let deadline = tokio::time::Instant::now() + TEST_TIMEOUT;
+    loop {
+        let mut publisher = connect(publish_addr).await;
+        let publish = Envelope::new(PeerId::new(), expected_kind.clone());
+        send(&mut publisher, &publish).await;
+
+        // A retry from earlier in this call may have been delivered
+        // late rather than lost - drain and ignore duplicates of the
+        // envelope we're after rather than treating one as fatal.
+        loop {
+            match timeout(
+                Duration::from_millis(100),
+                async_framing::read_frame(subscriber),
+            )
+            .await
+            {
+                Ok(Ok(bytes)) => {
+                    let delivered = Envelope::from_bytes(&bytes).unwrap();
+                    if delivered.kind == expected_kind {
+                        return delivered;
+                    }
+                }
+                _ => break, // nothing queued right now; publish again
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "publish on {topic} never propagated to the subscriber within {TEST_TIMEOUT:?}"
+            );
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "publish on {topic} never propagated to the subscriber within {TEST_TIMEOUT:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -350,6 +411,18 @@ async fn dial_side_peer_link_forwards_local_publishes_once_subscribed() {
         }
     );
 
+    // This was node A's first interest in the topic, so it's echoed
+    // straight back down every peer link, including this one
+    // (ADR-0011) - drain that before looking for the forwarded
+    // publish.
+    let echoed = recv(&mut peer).await;
+    assert_eq!(
+        echoed.kind,
+        MessageKind::Subscribe {
+            topic: topic("weather.updates")
+        }
+    );
+
     // An ordinary client publishes on node A directly.
     let mut publisher = connect(addr_a).await;
     let publish = Envelope::new(
@@ -364,6 +437,122 @@ async fn dial_side_peer_link_forwards_local_publishes_once_subscribed() {
     // It should be forwarded down the dialed peer link.
     let delivered = recv(&mut peer).await;
     assert_eq!(delivered.id, publish.id);
+}
+
+#[tokio::test]
+async fn multi_hop_interest_propagates_across_a_chain_of_peers() {
+    // A - B - C, a chain rather than a full mesh: A and C are never
+    // directly peered. A subscriber on C should still see publishes
+    // sent to A, once C's interest has flood-filled back to A through
+    // B (ADR-0011's whole point - propagation isn't limited to
+    // directly peered nodes).
+    let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_a = listener_a.local_addr().unwrap();
+    let node_a = thoth_mesh_node::spawn(listener_a, Vec::new());
+
+    let listener_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_b = listener_b.local_addr().unwrap();
+    let node_b = thoth_mesh_node::spawn(listener_b, vec![addr_a.to_string()]);
+
+    let listener_c = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_c = listener_c.local_addr().unwrap();
+    let node_c = thoth_mesh_node::spawn(listener_c, vec![addr_b.to_string()]);
+
+    eventually(|| node_a.membership.is_reachable(node_b.id)).await;
+    eventually(|| node_b.membership.is_reachable(node_c.id)).await;
+
+    let mut subscriber = connect(addr_c).await;
+    let sub = Envelope::new(
+        PeerId::new(),
+        MessageKind::Subscribe {
+            topic: topic("weather.updates"),
+        },
+    );
+    send(&mut subscriber, &sub).await;
+    recv(&mut subscriber).await; // subscribe ack
+
+    let delivered =
+        publish_until_delivered(addr_a, &mut subscriber, topic("weather.updates"), b"sunny").await;
+    assert_eq!(
+        delivered.kind,
+        MessageKind::Publish {
+            topic: topic("weather.updates"),
+            payload: b"sunny".to_vec(),
+        }
+    );
+}
+
+#[tokio::test]
+async fn loop_prevention_stops_a_publish_from_bouncing_forever() {
+    // Two nodes with a single peer link between them already forms a
+    // cycle: once both ends are interested, A forwards its publish to
+    // B, and B - not knowing where an envelope came from, just that
+    // it's new to its own broker - rebroadcasts it to every locally
+    // interested connection, including the one pointing right back at
+    // A. Without the MessageId dedup in Broker::publish (ADR-0011),
+    // that publish would bounce forever, and each subscriber would
+    // see it delivered more than once.
+    let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_a = listener_a.local_addr().unwrap();
+    let node_a = thoth_mesh_node::spawn(listener_a, Vec::new());
+
+    let listener_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_b = listener_b.local_addr().unwrap();
+    let node_b = thoth_mesh_node::spawn(listener_b, vec![addr_a.to_string()]);
+
+    eventually(|| node_a.membership.is_reachable(node_b.id)).await;
+    eventually(|| node_b.membership.is_reachable(node_a.id)).await;
+
+    let mut sub_a = connect(addr_a).await;
+    let mut sub_b = connect(addr_b).await;
+    for client in [&mut sub_a, &mut sub_b] {
+        let sub = Envelope::new(
+            PeerId::new(),
+            MessageKind::Subscribe {
+                topic: topic("weather.updates"),
+            },
+        );
+        send(client, &sub).await;
+        recv(client).await; // subscribe ack
+    }
+
+    // Let interest finish settling across the link before the real
+    // assertion below - each of these also proves delivery reaches
+    // that subscriber at all.
+    publish_until_delivered(addr_a, &mut sub_a, topic("weather.updates"), b"settle-a").await;
+    publish_until_delivered(addr_a, &mut sub_b, topic("weather.updates"), b"settle-b").await;
+
+    // A retry above may have landed twice (one attempt genuinely lost
+    // to convergence still in progress, a later one delivered) -
+    // drain any such stragglers so they can't be mistaken for the
+    // real assertion below.
+    for client in [&mut sub_a, &mut sub_b] {
+        while timeout(Duration::from_millis(50), async_framing::read_frame(client))
+            .await
+            .is_ok()
+        {}
+    }
+
+    // The real assertion: one more publish should reach each
+    // subscriber exactly once, not bounce back and forth over the
+    // link and arrive again.
+    let publish = Envelope::new(
+        PeerId::new(),
+        MessageKind::Publish {
+            topic: topic("weather.updates"),
+            payload: b"final".to_vec(),
+        },
+    );
+    send(&mut connect(addr_a).await, &publish).await;
+
+    for client in [&mut sub_a, &mut sub_b] {
+        let delivered = recv(client).await;
+        assert_eq!(delivered.id, publish.id);
+        assert!(
+            recv_times_out(client).await,
+            "subscriber received the same publish more than once - a loop wasn't prevented"
+        );
+    }
 }
 
 #[tokio::test]

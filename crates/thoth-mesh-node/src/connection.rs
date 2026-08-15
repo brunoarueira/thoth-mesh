@@ -1,12 +1,13 @@
 //! Per-connection handling: reads framed envelopes off a socket,
 //! dispatches them to the broker, and forwards broadcast deliveries back
-//! out. See ADR-0007.
+//! out. See ADR-0007. Also propagates local topic-interest changes to
+//! peer links; see ADR-0011.
 
 use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::sync::Arc;
 
-use thoth_mesh::Membership;
+use thoth_mesh::{Interest, PeerInfo};
 use thoth_mesh_broker::Broker;
 use thoth_mesh_core::async_framing;
 use thoth_mesh_core::{Envelope, FramingError, MessageKind, PeerId, Topic};
@@ -18,62 +19,47 @@ use tokio::task::JoinHandle;
 use tokio_util::compat::{Compat, TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tracing::Instrument;
 
+use crate::peer_links::PeerLinks;
+use crate::shared::Shared;
+
 const OUTGOING_CHANNEL_CAPACITY: usize = 64;
 
 /// Handles a single accepted connection until it disconnects or a
 /// framing/decode error closes it.
 ///
-/// `node_id` identifies this node as the sender on any envelope it
-/// originates (acks). It does not affect envelopes forwarded from
-/// other publishers, which keep their original sender.
+/// `initial_peer` is `Some` when the caller already knows this
+/// connection is a peer link before the loop starts - the dial side
+/// completes its handshake before handing off here (see ADR-0010).
+/// It's `None` on the accept side, which only learns the peer's
+/// identity if and when it receives a `Hello` mid-loop, same as any
+/// client connection.
 ///
-/// `my_listen_addr` is echoed back in the `Hello` reply if the peer on
-/// the other end opens with its own `Hello` (see ADR-0009) - it plays
-/// no part in ordinary client traffic.
-///
-/// `membership` is updated when a peer's `Hello` is seen and again
-/// when this connection ends, so it plays no part in ordinary client
-/// traffic either (see issue #24).
-///
-/// `initial_peer_identity` is `Some` when the caller already knows
-/// this connection is a peer link before the loop starts - the dial
-/// side completes its handshake (and its own `membership.mark_connected`
-/// call) before handing off here (see ADR-0010). It's `None` on the
-/// accept side, which only learns the peer's identity if and when it
-/// receives a `Hello` mid-loop, same as any client connection.
-pub async fn handle_connection(
-    socket: TcpStream,
-    broker: Arc<Broker>,
-    node_id: PeerId,
-    my_listen_addr: Option<String>,
-    membership: Membership,
-    initial_peer_identity: Option<PeerId>,
-) {
+/// Either way, `membership.mark_connected` and registering the peer
+/// link happen right next to each other (see `run_connection` and the
+/// `Hello` arm below) rather than the caller doing the former before
+/// handing off - a peer becoming visible as reachable and its link
+/// becoming usable for interest propagation (ADR-0011) are meant to
+/// be one and the same moment, not two that could race apart under
+/// scheduling delay.
+pub async fn handle_connection(socket: TcpStream, shared: Shared, initial_peer: Option<PeerInfo>) {
     let peer_addr = socket.peer_addr().ok();
     let span = tracing::info_span!("connection", peer = ?peer_addr);
     async move {
-        run_connection(
-            socket,
-            broker,
-            node_id,
-            my_listen_addr,
-            membership,
-            initial_peer_identity,
-        )
-        .await;
+        run_connection(socket, shared, initial_peer).await;
     }
     .instrument(span)
     .await
 }
 
-async fn run_connection(
-    socket: TcpStream,
-    broker: Arc<Broker>,
-    node_id: PeerId,
-    my_listen_addr: Option<String>,
-    membership: Membership,
-    initial_peer_identity: Option<PeerId>,
-) {
+async fn run_connection(socket: TcpStream, shared: Shared, initial_peer: Option<PeerInfo>) {
+    let Shared {
+        broker,
+        membership,
+        interest,
+        peer_links,
+        node_id,
+        my_listen_addr,
+    } = shared;
     let (reader, writer) = socket.into_split();
     let mut reader = reader.compat();
     let mut writer = writer.compat_write();
@@ -83,7 +69,17 @@ async fn run_connection(
     // passed in already-known (dial side) or learned from an incoming
     // Hello (accept side) - so we know whose membership entry to
     // clear when it ends.
-    let mut peer_identity: Option<PeerId> = initial_peer_identity;
+    let mut peer_identity: Option<PeerId> = None;
+
+    if let Some(PeerInfo {
+        peer_id,
+        listen_addr,
+    }) = initial_peer
+    {
+        peer_identity = Some(peer_id);
+        membership.mark_connected(peer_id, listen_addr);
+        register_peer_link(&peer_links, &interest, node_id, peer_id, &outgoing_tx);
+    }
 
     loop {
         tokio::select! {
@@ -111,9 +107,13 @@ async fn run_connection(
                     MessageKind::Subscribe { topic } => {
                         let topic = topic.clone();
                         tracing::info!(sender = ?envelope.sender, %topic, "subscribed");
+                        let is_new_forwarder = !forwarders.contains_key(&topic);
                         forwarders
                             .entry(topic.clone())
-                            .or_insert_with(|| spawn_forwarder(&broker, topic, outgoing_tx.clone()));
+                            .or_insert_with(|| spawn_forwarder(&broker, topic.clone(), outgoing_tx.clone()));
+                        if is_new_forwarder && interest.subscribe(topic.clone()) {
+                            propagate_interest(&peer_links, node_id, topic, true);
+                        }
                         let ack = Envelope::new(node_id, MessageKind::Ack { in_reply_to: envelope.id });
                         if !send_envelope(&mut writer, &ack).await {
                             break;
@@ -123,6 +123,9 @@ async fn run_connection(
                         tracing::info!(sender = ?envelope.sender, %topic, "unsubscribed");
                         if let Some(handle) = forwarders.remove(topic) {
                             handle.abort();
+                            if interest.unsubscribe(topic) {
+                                propagate_interest(&peer_links, node_id, topic.clone(), false);
+                            }
                         }
                         let ack = Envelope::new(node_id, MessageKind::Ack { in_reply_to: envelope.id });
                         if !send_envelope(&mut writer, &ack).await {
@@ -145,6 +148,7 @@ async fn run_connection(
                         );
                         peer_identity = Some(envelope.sender);
                         membership.mark_connected(envelope.sender, listen_addr.clone());
+                        register_peer_link(&peer_links, &interest, node_id, envelope.sender, &outgoing_tx);
                         let reply = Envelope::new(
                             node_id,
                             MessageKind::Hello {
@@ -169,11 +173,58 @@ async fn run_connection(
     for (topic, handle) in forwarders {
         tracing::debug!(%topic, "stopping forwarder");
         handle.abort();
+        if interest.unsubscribe(&topic) {
+            propagate_interest(&peer_links, node_id, topic, false);
+        }
     }
 
     if let Some(peer_id) = peer_identity {
+        peer_links.unregister(peer_id, &outgoing_tx);
         membership.mark_disconnected(peer_id);
     }
+}
+
+/// Registers this connection as a peer link and catches it up on
+/// every topic this node is currently interested in - so a peer that
+/// connects after interest was already established still learns about
+/// it, not just future transitions (see ADR-0011).
+///
+/// Best-effort, like [`PeerLinks::broadcast`]: a catch-up `Subscribe`
+/// that doesn't fit in the outgoing queue right now is dropped rather
+/// than blocking the connection on it, on the assumption a channel
+/// this backed up already has bigger problems.
+fn register_peer_link(
+    peer_links: &PeerLinks,
+    interest: &Interest,
+    node_id: PeerId,
+    peer_id: PeerId,
+    outgoing_tx: &mpsc::Sender<Arc<Envelope>>,
+) {
+    peer_links.register(peer_id, outgoing_tx.clone());
+    for topic in interest.snapshot() {
+        let envelope = Arc::new(Envelope::new(
+            node_id,
+            MessageKind::Subscribe {
+                topic: topic.clone(),
+            },
+        ));
+        if outgoing_tx.try_send(envelope).is_err() {
+            tracing::warn!(%topic, "outgoing queue full, dropping interest catch-up for this topic");
+        }
+    }
+}
+
+/// Tells every active peer link about a local topic-interest
+/// transition: `now_interested` selects `Subscribe` (a topic just
+/// gained its first interested connection) or `Unsubscribe` (it just
+/// lost its last). See ADR-0011.
+fn propagate_interest(peer_links: &PeerLinks, node_id: PeerId, topic: Topic, now_interested: bool) {
+    let kind = if now_interested {
+        MessageKind::Subscribe { topic }
+    } else {
+        MessageKind::Unsubscribe { topic }
+    };
+    peer_links.broadcast(Arc::new(Envelope::new(node_id, kind)));
 }
 
 /// A [`FramingError::Io`] whose kind is `UnexpectedEof` is what a

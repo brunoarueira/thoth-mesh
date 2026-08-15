@@ -6,22 +6,25 @@
 //! ADR-0009). Once a peer link's handshake completes, either side of
 //! it is a full participant in local routing - `Subscribe`,
 //! `Unsubscribe`, and `Publish` are handled identically regardless of
-//! whether they came from a client or a peer (see ADR-0010). Nothing
-//! yet causes a node to *originate* interest toward its peers based
-//! on its own local clients, or prevents forwarding loops on a
-//! cyclic mesh - that's the next Phase 3 issue.
+//! whether they came from a client or a peer (see ADR-0010). This
+//! node's own aggregate topic interest is also propagated to every
+//! active peer link as it changes, and duplicate envelopes looping
+//! back around a cyclic mesh are dropped rather than redelivered (see
+//! ADR-0011) - so a publish on one node reaches subscribers connected
+//! to any other node reachable through the mesh, not just directly
+//! peered ones.
 
 pub mod connection;
+mod peer_links;
 mod peering;
+mod shared;
 
-use std::sync::Arc;
-
-use thoth_mesh_broker::Broker;
 use thoth_mesh_core::PeerId;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
-pub use thoth_mesh::Membership;
+pub use shared::Shared;
+pub use thoth_mesh::{Interest, Membership};
 pub use thoth_mesh_core::DEFAULT_ADDR;
 
 /// Binds `addr` and serves connections until an unrecoverable listener
@@ -39,17 +42,10 @@ pub async fn run(addr: &str, seed_peers: Vec<String>) -> std::io::Result<()> {
 /// and read back the actual bound address before serving.
 pub async fn serve(listener: TcpListener, seed_peers: Vec<String>) -> std::io::Result<()> {
     let node_id = PeerId::new();
-    let membership = Membership::new();
-    let broker = Arc::new(Broker::new());
     let my_listen_addr = listener.local_addr().ok().map(|addr| addr.to_string());
-    peering::spawn_seed_peers(
-        seed_peers,
-        node_id,
-        my_listen_addr.clone(),
-        membership.clone(),
-        Arc::clone(&broker),
-    );
-    accept_loop(listener, node_id, my_listen_addr, membership, broker).await
+    let shared = Shared::new(node_id, my_listen_addr);
+    peering::spawn_seed_peers(seed_peers, shared.clone());
+    accept_loop(listener, shared).await
 }
 
 /// A node spawned via [`spawn`], along with the handles tests need to
@@ -67,26 +63,14 @@ pub struct Node {
 /// can query membership, or abort a `peer_dials` entry to simulate
 /// that peer disappearing, while the node keeps running.
 pub fn spawn(listener: TcpListener, seed_peers: Vec<String>) -> Node {
-    let id = PeerId::new();
-    let membership = Membership::new();
-    let broker = Arc::new(Broker::new());
+    let node_id = PeerId::new();
     let my_listen_addr = listener.local_addr().ok().map(|addr| addr.to_string());
-    let peer_dials = peering::spawn_seed_peers(
-        seed_peers,
-        id,
-        my_listen_addr.clone(),
-        membership.clone(),
-        Arc::clone(&broker),
-    );
-    let accept_loop = tokio::spawn(accept_loop(
-        listener,
-        id,
-        my_listen_addr,
-        membership.clone(),
-        broker,
-    ));
+    let shared = Shared::new(node_id, my_listen_addr);
+    let membership = shared.membership.clone();
+    let peer_dials = peering::spawn_seed_peers(seed_peers, shared.clone());
+    let accept_loop = tokio::spawn(accept_loop(listener, shared));
     Node {
-        id,
+        id: node_id,
         membership,
         accept_loop,
         peer_dials,
@@ -117,16 +101,10 @@ pub mod test_support {
     }
 }
 
-async fn accept_loop(
-    listener: TcpListener,
-    node_id: PeerId,
-    my_listen_addr: Option<String>,
-    membership: Membership,
-    broker: Arc<Broker>,
-) -> std::io::Result<()> {
+async fn accept_loop(listener: TcpListener, shared: Shared) -> std::io::Result<()> {
     tracing::info!(
-        ?node_id,
-        addr = ?my_listen_addr,
+        node_id = ?shared.node_id,
+        addr = ?shared.my_listen_addr,
         "node ready, accepting connections"
     );
 
@@ -139,19 +117,9 @@ async fn accept_loop(
             }
         };
         tracing::debug!(%peer_addr, "accepted connection");
-        let broker = Arc::clone(&broker);
-        let my_listen_addr = my_listen_addr.clone();
-        let membership = membership.clone();
+        let shared = shared.clone();
         tokio::spawn(async move {
-            connection::handle_connection(
-                socket,
-                broker,
-                node_id,
-                my_listen_addr,
-                membership,
-                None,
-            )
-            .await;
+            connection::handle_connection(socket, shared, None).await;
         });
     }
 }
