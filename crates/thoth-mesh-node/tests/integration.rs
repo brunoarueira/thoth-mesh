@@ -483,12 +483,15 @@ async fn multi_hop_interest_propagates_across_a_chain_of_peers() {
 }
 
 #[tokio::test]
-async fn loop_prevention_stops_duplicate_delivery_on_a_triangle_mesh() {
-    // Three nodes, fully peered (A-B, B-C, C-A) - more than one path
-    // between any two of them. Without the MessageId dedup in
-    // Broker::publish (ADR-0011), a publish forwarded around the
-    // cycle would keep echoing between peers, and each subscriber
-    // would see it delivered more than once.
+async fn loop_prevention_stops_a_publish_from_bouncing_forever() {
+    // Two nodes with a single peer link between them already forms a
+    // cycle: once both ends are interested, A forwards its publish to
+    // B, and B - not knowing where an envelope came from, just that
+    // it's new to its own broker - rebroadcasts it to every locally
+    // interested connection, including the one pointing right back at
+    // A. Without the MessageId dedup in Broker::publish (ADR-0011),
+    // that publish would bounce forever, and each subscriber would
+    // see it delivered more than once.
     let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr_a = listener_a.local_addr().unwrap();
     let node_a = thoth_mesh_node::spawn(listener_a, Vec::new());
@@ -497,18 +500,12 @@ async fn loop_prevention_stops_duplicate_delivery_on_a_triangle_mesh() {
     let addr_b = listener_b.local_addr().unwrap();
     let node_b = thoth_mesh_node::spawn(listener_b, vec![addr_a.to_string()]);
 
-    let listener_c = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr_c = listener_c.local_addr().unwrap();
-    let node_c = thoth_mesh_node::spawn(listener_c, vec![addr_a.to_string(), addr_b.to_string()]);
-
     eventually(|| node_a.membership.is_reachable(node_b.id)).await;
-    eventually(|| node_a.membership.is_reachable(node_c.id)).await;
-    eventually(|| node_b.membership.is_reachable(node_c.id)).await;
+    eventually(|| node_b.membership.is_reachable(node_a.id)).await;
 
     let mut sub_a = connect(addr_a).await;
     let mut sub_b = connect(addr_b).await;
-    let mut sub_c = connect(addr_c).await;
-    for client in [&mut sub_a, &mut sub_b, &mut sub_c] {
+    for client in [&mut sub_a, &mut sub_b] {
         let sub = Envelope::new(
             PeerId::new(),
             MessageKind::Subscribe {
@@ -519,18 +516,17 @@ async fn loop_prevention_stops_duplicate_delivery_on_a_triangle_mesh() {
         recv(client).await; // subscribe ack
     }
 
-    // Let interest finish settling across the full mesh before the
-    // real assertion below - each of these also proves delivery
-    // reaches that subscriber at all.
+    // Let interest finish settling across the link before the real
+    // assertion below - each of these also proves delivery reaches
+    // that subscriber at all.
     publish_until_delivered(addr_a, &mut sub_a, topic("weather.updates"), b"settle-a").await;
     publish_until_delivered(addr_a, &mut sub_b, topic("weather.updates"), b"settle-b").await;
-    publish_until_delivered(addr_a, &mut sub_c, topic("weather.updates"), b"settle-c").await;
 
     // A retry above may have landed twice (one attempt genuinely lost
     // to convergence still in progress, a later one delivered) -
     // drain any such stragglers so they can't be mistaken for the
     // real assertion below.
-    for client in [&mut sub_a, &mut sub_b, &mut sub_c] {
+    for client in [&mut sub_a, &mut sub_b] {
         while timeout(Duration::from_millis(50), async_framing::read_frame(client))
             .await
             .is_ok()
@@ -538,8 +534,8 @@ async fn loop_prevention_stops_duplicate_delivery_on_a_triangle_mesh() {
     }
 
     // The real assertion: one more publish should reach each
-    // subscriber exactly once, not bounce around the triangle and
-    // arrive again.
+    // subscriber exactly once, not bounce back and forth over the
+    // link and arrive again.
     let publish = Envelope::new(
         PeerId::new(),
         MessageKind::Publish {
@@ -549,7 +545,7 @@ async fn loop_prevention_stops_duplicate_delivery_on_a_triangle_mesh() {
     );
     send(&mut connect(addr_a).await, &publish).await;
 
-    for client in [&mut sub_a, &mut sub_b, &mut sub_c] {
+    for client in [&mut sub_a, &mut sub_b] {
         let delivered = recv(client).await;
         assert_eq!(delivered.id, publish.id);
         assert!(

@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::sync::Arc;
 
-use thoth_mesh::Interest;
+use thoth_mesh::{Interest, PeerInfo};
 use thoth_mesh_broker::Broker;
 use thoth_mesh_core::async_framing;
 use thoth_mesh_core::{Envelope, FramingError, MessageKind, PeerId, Topic};
@@ -27,27 +27,31 @@ const OUTGOING_CHANNEL_CAPACITY: usize = 64;
 /// Handles a single accepted connection until it disconnects or a
 /// framing/decode error closes it.
 ///
-/// `initial_peer_identity` is `Some` when the caller already knows
-/// this connection is a peer link before the loop starts - the dial
-/// side completes its handshake (and its own `membership.mark_connected`
-/// call) before handing off here (see ADR-0010). It's `None` on the
-/// accept side, which only learns the peer's identity if and when it
-/// receives a `Hello` mid-loop, same as any client connection.
-pub async fn handle_connection(
-    socket: TcpStream,
-    shared: Shared,
-    initial_peer_identity: Option<PeerId>,
-) {
+/// `initial_peer` is `Some` when the caller already knows this
+/// connection is a peer link before the loop starts - the dial side
+/// completes its handshake before handing off here (see ADR-0010).
+/// It's `None` on the accept side, which only learns the peer's
+/// identity if and when it receives a `Hello` mid-loop, same as any
+/// client connection.
+///
+/// Either way, `membership.mark_connected` and registering the peer
+/// link happen right next to each other (see `run_connection` and the
+/// `Hello` arm below) rather than the caller doing the former before
+/// handing off - a peer becoming visible as reachable and its link
+/// becoming usable for interest propagation (ADR-0011) are meant to
+/// be one and the same moment, not two that could race apart under
+/// scheduling delay.
+pub async fn handle_connection(socket: TcpStream, shared: Shared, initial_peer: Option<PeerInfo>) {
     let peer_addr = socket.peer_addr().ok();
     let span = tracing::info_span!("connection", peer = ?peer_addr);
     async move {
-        run_connection(socket, shared, initial_peer_identity).await;
+        run_connection(socket, shared, initial_peer).await;
     }
     .instrument(span)
     .await
 }
 
-async fn run_connection(socket: TcpStream, shared: Shared, initial_peer_identity: Option<PeerId>) {
+async fn run_connection(socket: TcpStream, shared: Shared, initial_peer: Option<PeerInfo>) {
     let Shared {
         broker,
         membership,
@@ -65,9 +69,15 @@ async fn run_connection(socket: TcpStream, shared: Shared, initial_peer_identity
     // passed in already-known (dial side) or learned from an incoming
     // Hello (accept side) - so we know whose membership entry to
     // clear when it ends.
-    let mut peer_identity: Option<PeerId> = initial_peer_identity;
+    let mut peer_identity: Option<PeerId> = None;
 
-    if let Some(peer_id) = peer_identity {
+    if let Some(PeerInfo {
+        peer_id,
+        listen_addr,
+    }) = initial_peer
+    {
+        peer_identity = Some(peer_id);
+        membership.mark_connected(peer_id, listen_addr);
         register_peer_link(&peer_links, &interest, node_id, peer_id, &outgoing_tx);
     }
 

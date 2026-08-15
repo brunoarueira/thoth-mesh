@@ -52,16 +52,16 @@ async fn dial_peer(peer_addr: String, shared: Shared) {
             peer_listen_addr = ?info.listen_addr,
             "connected to seed peer"
         );
-        shared
-            .membership
-            .mark_connected(info.peer_id, info.listen_addr);
 
         // Recover the raw stream (no data loss - Compat adds no
         // buffering of its own) and hand off to the same dispatch
         // loop the accept side uses, with the peer identity we
         // already know from the handshake (see ADR-0010).
+        // handle_connection marks the peer connected and registers
+        // its link together, right as the dispatch loop starts (see
+        // ADR-0011) - not here, so the two can't race apart.
         let stream = conn.into_inner();
-        connection::handle_connection(stream, shared, Some(info.peer_id)).await;
+        connection::handle_connection(stream, shared, Some(info)).await;
     }
     .instrument(span)
     .await
