@@ -1,30 +1,80 @@
 //! Outbound connection management: dials configured seed peers,
 //! performs the handshake, and hands the connection off to the same
 //! broker-wired dispatch the accept side uses. See ADR-0009 and
-//! ADR-0010.
+//! ADR-0010. A seed peer that's unreachable, or whose link later
+//! drops, is retried with exponential backoff rather than abandoned;
+//! see ADR-0012.
+
+use std::time::Duration;
 
 use thoth_mesh::dial_handshake;
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use tokio_util::compat::TokioAsyncReadCompatExt;
 use tracing::Instrument;
 
 use crate::connection;
 use crate::shared::Shared;
 
+/// Delay before the first reconnect attempt after a dial fails or a
+/// link drops, and the delay a healthy attempt resets back to.
+const INITIAL_BACKOFF: Duration = Duration::from_millis(500);
+
+/// Upper bound the backoff delay doubles toward but never exceeds.
+const MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+/// How long a dialed connection has to stay up before it counts as
+/// evidence the peer is actually reachable, resetting the backoff
+/// delay instead of doubling it.
+const MIN_HEALTHY_DURATION: Duration = Duration::from_secs(5);
+
 /// Spawns one background task per entry in `seed_peers`, each dialing
-/// that address, handshaking, and then routing messages over the
-/// connection exactly as an accepted one would.
-///
-/// Connect and handshake failures are logged and not retried -
-/// reconnect/backoff is out of scope here (tracked for Phase 4;
-/// see issue #18). Returns the tasks' handles so tests can sever a
-/// link on demand; ordinary callers can drop them.
+/// that address, handshaking, routing messages over the connection
+/// exactly as an accepted one would, and redialing with backoff if
+/// the attempt fails or the link later drops (see ADR-0012). Returns
+/// the tasks' handles so tests can sever a link on demand; ordinary
+/// callers can drop them.
 pub fn spawn_seed_peers(seed_peers: Vec<String>, shared: Shared) -> Vec<JoinHandle<()>> {
     seed_peers
         .into_iter()
-        .map(|peer_addr| tokio::spawn(dial_peer(peer_addr, shared.clone())))
+        .map(|peer_addr| tokio::spawn(dial_peer_with_reconnect(peer_addr, shared.clone())))
         .collect()
+}
+
+/// Wraps [`dial_peer`] in an unending retry loop: a seed peer is
+/// standing configuration, not a one-off dial, so there's no point at
+/// which giving up is more correct than continuing to retry. The
+/// delay between attempts is [`next_backoff`], driven by how long the
+/// previous attempt's connection stayed up. See ADR-0012.
+async fn dial_peer_with_reconnect(peer_addr: String, shared: Shared) {
+    let mut backoff = INITIAL_BACKOFF;
+    loop {
+        let attempt_start = Instant::now();
+        dial_peer(peer_addr.clone(), shared.clone()).await;
+
+        backoff = next_backoff(backoff, attempt_start.elapsed());
+        tracing::info!(addr = %peer_addr, delay = ?backoff, "seed peer link down, will retry");
+        tokio::time::sleep(backoff).await;
+    }
+}
+
+/// The backoff delay to use for the *next* dial attempt, given the
+/// delay used for the attempt that just ended and how long its
+/// connection stayed up.
+///
+/// A connection that stayed up for at least [`MIN_HEALTHY_DURATION`]
+/// is treated as proof the peer is reachable, resetting back to
+/// [`INITIAL_BACKOFF`] rather than compounding a delay that no longer
+/// reflects reality. Anything shorter - including a connect or
+/// handshake failure, which returns near-instantly - doubles the
+/// previous delay, capped at [`MAX_BACKOFF`].
+fn next_backoff(previous: Duration, connection_uptime: Duration) -> Duration {
+    if connection_uptime >= MIN_HEALTHY_DURATION {
+        INITIAL_BACKOFF
+    } else {
+        (previous * 2).min(MAX_BACKOFF)
+    }
 }
 
 async fn dial_peer(peer_addr: String, shared: Shared) {
@@ -69,8 +119,6 @@ async fn dial_peer(peer_addr: String, shared: Shared) {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use thoth_mesh_core::{Envelope, MessageKind, PeerId, async_framing};
     use tokio::net::TcpListener;
     use tokio::time::timeout;
@@ -265,5 +313,69 @@ mod tests {
             Envelope::from_bytes(&bytes).unwrap().kind,
             MessageKind::Subscribe { topic }
         );
+    }
+
+    #[test]
+    fn next_backoff_doubles_after_a_connection_that_dropped_quickly() {
+        assert_eq!(
+            next_backoff(Duration::from_millis(500), Duration::ZERO),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            next_backoff(Duration::from_secs(1), Duration::from_millis(100)),
+            Duration::from_secs(2)
+        );
+    }
+
+    #[test]
+    fn next_backoff_caps_at_the_maximum() {
+        assert_eq!(
+            next_backoff(Duration::from_secs(20), Duration::ZERO),
+            MAX_BACKOFF
+        );
+        assert_eq!(next_backoff(MAX_BACKOFF, Duration::ZERO), MAX_BACKOFF);
+    }
+
+    #[test]
+    fn next_backoff_resets_after_a_connection_that_stayed_up_long_enough() {
+        // A connection that ran for a while before dropping is
+        // evidence the peer is reachable now, not just that the
+        // handshake happened to complete right before an immediate
+        // drop (ADR-0012) - the next delay should start over from
+        // INITIAL_BACKOFF rather than keep compounding.
+        assert_eq!(
+            next_backoff(Duration::from_secs(16), MIN_HEALTHY_DURATION),
+            INITIAL_BACKOFF
+        );
+        assert_eq!(
+            next_backoff(MAX_BACKOFF, MIN_HEALTHY_DURATION + Duration::from_secs(1)),
+            INITIAL_BACKOFF
+        );
+    }
+
+    #[tokio::test]
+    async fn dial_peer_with_reconnect_retries_until_the_seed_peer_comes_up() {
+        // Reserve an address but don't accept on it yet - the first
+        // dial attempt should fail, and the retry loop should try
+        // again once its backoff delay elapses rather than giving up
+        // (ADR-0012).
+        let placeholder = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = placeholder.local_addr().unwrap();
+        drop(placeholder);
+
+        let shared = Shared::new(PeerId::new(), None);
+        let reconnect_task = tokio::spawn(dial_peer_with_reconnect(addr.to_string(), shared));
+
+        // Give the first (failing) attempt and its backoff sleep room
+        // to play out before the peer becomes reachable.
+        tokio::time::sleep(INITIAL_BACKOFF + Duration::from_millis(200)).await;
+        let listener = TcpListener::bind(addr).await.unwrap();
+
+        timeout(TEST_TIMEOUT, listener.accept())
+            .await
+            .expect("retry loop never redialed the seed peer once it came up")
+            .unwrap();
+
+        reconnect_task.abort();
     }
 }

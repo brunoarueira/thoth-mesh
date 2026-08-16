@@ -15,6 +15,9 @@ thoth-mesh, using the format described in
 | [0007](0007-node-v1-tcp-daemon.md) | thoth-mesh-node v1: TCP daemon wiring the broker to sockets |
 | [0008](0008-generic-async-framing.md) | Generic async framing in thoth-mesh-core via futures-util |
 | [0009](0009-peer-handshake-shared-port.md) | Peer handshake over the shared client port |
+| [0010](0010-peer-links-share-client-dispatch.md) | Peer links share the client dispatch loop |
+| [0011](0011-interest-propagation-and-loop-prevention.md) | Topic-interest propagation and loop prevention |
+| [0012](0012-peer-reconnect-backoff.md) | Reconnect with exponential backoff for dropped peer links |
 
 To add a new one, copy the format of an existing ADR, number it
 sequentially, and set its status to `Accepted` once the decision is
