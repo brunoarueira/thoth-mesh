@@ -15,9 +15,13 @@
 //! peered ones.
 
 pub mod connection;
+pub mod metrics;
+mod metrics_server;
 mod peer_links;
 mod peering;
 mod shared;
+
+use std::sync::Arc;
 
 use thoth_mesh_core::PeerId;
 use tokio::net::TcpListener;
@@ -28,10 +32,36 @@ pub use thoth_mesh::{Interest, Membership};
 pub use thoth_mesh_core::DEFAULT_ADDR;
 
 /// Binds `addr` and serves connections until an unrecoverable listener
-/// error occurs, dialing each of `seed_peers` in the background.
-pub async fn run(addr: &str, seed_peers: Vec<String>) -> std::io::Result<()> {
+/// error occurs, dialing each of `seed_peers` in the background. If
+/// `metrics_addr` is given, also binds it and serves a Prometheus
+/// scrape endpoint there in the background (see ADR-0013) - with no
+/// `metrics_addr`, no second port is opened and nothing changes.
+pub async fn run(
+    addr: &str,
+    seed_peers: Vec<String>,
+    metrics_addr: Option<String>,
+) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr).await?;
-    serve(listener, seed_peers).await
+    let node_id = PeerId::new();
+    let my_listen_addr = listener.local_addr().ok().map(|addr| addr.to_string());
+    let shared = Shared::new(node_id, my_listen_addr);
+
+    if let Some(metrics_addr) = metrics_addr {
+        let metrics_listener = TcpListener::bind(&metrics_addr).await?;
+        let membership = shared.membership.clone();
+        let broker = Arc::clone(&shared.broker);
+        let metrics = shared.metrics.clone();
+        tokio::spawn(async move {
+            if let Err(err) =
+                metrics_server::serve_metrics(metrics_listener, membership, broker, metrics).await
+            {
+                tracing::error!(%err, "metrics endpoint failed");
+            }
+        });
+    }
+
+    peering::spawn_seed_peers(seed_peers, shared.clone());
+    accept_loop(listener, shared).await
 }
 
 /// Serves connections on an already-bound listener until an
@@ -39,7 +69,9 @@ pub async fn run(addr: &str, seed_peers: Vec<String>) -> std::io::Result<()> {
 /// in the background.
 ///
 /// Split out from [`run`] so tests can bind an ephemeral port (`:0`)
-/// and read back the actual bound address before serving.
+/// and read back the actual bound address before serving. Doesn't
+/// serve metrics - only [`run`], the daemon binary's entry point,
+/// does that.
 pub async fn serve(listener: TcpListener, seed_peers: Vec<String>) -> std::io::Result<()> {
     let node_id = PeerId::new();
     let my_listen_addr = listener.local_addr().ok().map(|addr| addr.to_string());

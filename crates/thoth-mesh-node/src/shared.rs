@@ -9,6 +9,7 @@ use thoth_mesh::{Interest, Membership};
 use thoth_mesh_broker::Broker;
 use thoth_mesh_core::PeerId;
 
+use crate::metrics::Metrics;
 use crate::peer_links::PeerLinks;
 
 /// Everything a connection task needs beyond its own socket and
@@ -21,6 +22,7 @@ pub struct Shared {
     pub peer_links: PeerLinks,
     pub node_id: PeerId,
     pub my_listen_addr: Option<String>,
+    pub metrics: Metrics,
 }
 
 impl Shared {
@@ -35,6 +37,7 @@ impl Shared {
             peer_links: PeerLinks::new(),
             node_id,
             my_listen_addr,
+            metrics: Metrics::new(),
         }
     }
 }

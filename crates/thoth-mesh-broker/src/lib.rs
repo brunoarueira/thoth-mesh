@@ -4,6 +4,7 @@
 //! duplicate-envelope dedup this crate now also does.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use thoth_mesh_core::{Envelope, MessageId, Topic};
@@ -36,6 +37,7 @@ pub const DEFAULT_DEDUP_CAPACITY: usize = 4096;
 pub struct Broker {
     topics: RwLock<HashMap<Topic, broadcast::Sender<Arc<Envelope>>>>,
     seen: Mutex<SeenIds>,
+    messages_published: AtomicU64,
 }
 
 impl Default for Broker {
@@ -43,6 +45,7 @@ impl Default for Broker {
         Self {
             topics: RwLock::default(),
             seen: Mutex::new(SeenIds::new(DEFAULT_DEDUP_CAPACITY)),
+            messages_published: AtomicU64::new(0),
         }
     }
 }
@@ -78,11 +81,18 @@ impl Broker {
         if !is_new {
             return 0;
         }
+        self.messages_published.fetch_add(1, Ordering::Relaxed);
         let topics = self.topics.read().await;
         match topics.get(topic) {
             Some(sender) => sender.send(envelope).unwrap_or(0),
             None => 0,
         }
+    }
+
+    /// How many distinct (non-duplicate) envelopes have been published
+    /// through this broker since it was created - see ADR-0013.
+    pub fn messages_published(&self) -> u64 {
+        self.messages_published.load(Ordering::Relaxed)
     }
 }
 
@@ -224,6 +234,21 @@ mod tests {
             rx.try_recv().is_err(),
             "the duplicate should not have been redelivered"
         );
+    }
+
+    #[tokio::test]
+    async fn messages_published_counts_only_new_envelopes() {
+        let broker = Broker::new();
+        let topic = Topic::from_str("weather.updates").unwrap();
+
+        let first = publish_envelope(&topic, b"sunny");
+        let second = publish_envelope(&topic, b"cloudy");
+        broker.publish(&topic, first.clone()).await;
+        broker.publish(&topic, second).await;
+        // A duplicate of `first` shouldn't bump the counter again.
+        broker.publish(&topic, first).await;
+
+        assert_eq!(broker.messages_published(), 2);
     }
 
     #[tokio::test]

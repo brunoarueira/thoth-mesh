@@ -94,6 +94,19 @@ impl Membership {
     pub fn snapshot(&self) -> HashMap<PeerId, PeerStatus> {
         self.peers.lock().unwrap().clone()
     }
+
+    /// How many peers are currently connected. Read live rather than
+    /// tracked separately, so it can never drift out of sync with
+    /// [`mark_connected`](Self::mark_connected)/
+    /// [`mark_disconnected`](Self::mark_disconnected) - see ADR-0013.
+    pub fn connected_count(&self) -> usize {
+        self.peers
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|status| status.connected)
+            .count()
+    }
 }
 
 #[cfg(test)]
@@ -138,6 +151,19 @@ mod tests {
 
         assert!(!membership.is_reachable(peer_id));
         assert!(membership.snapshot().is_empty());
+    }
+
+    #[test]
+    fn connected_count_only_counts_currently_connected_peers() {
+        let membership = Membership::new();
+        let still_connected = PeerId::new();
+        let disconnected = PeerId::new();
+
+        membership.mark_connected(still_connected, None);
+        membership.mark_connected(disconnected, None);
+        membership.mark_disconnected(disconnected);
+
+        assert_eq!(membership.connected_count(), 1);
     }
 
     #[test]
