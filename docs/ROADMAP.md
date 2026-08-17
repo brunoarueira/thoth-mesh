@@ -101,6 +101,9 @@ protocol.
 
 - TLS on peer and client connections.
 - Peer authentication / allowlisting.
+- Fine-grained authorization: per-topic publish/subscribe permissions,
+  and access control on the metrics/admin surface (TLS alone doesn't
+  imply this).
 
 ## Phase 8 — Message durability & topic model
 
