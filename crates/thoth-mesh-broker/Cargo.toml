@@ -10,7 +10,7 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
-thoth-mesh-core = { path = "../thoth-mesh-core", version = "0.0.1" }
+thoth-mesh-core = { path = "../thoth-mesh-core", version = "0.1.0" }
 tokio = { version = "1", features = ["sync"] }
 
 [dev-dependencies]

@@ -18,11 +18,11 @@ name = "thoth-mesh"
 path = "src/main.rs"
 
 [dependencies]
-thoth-mesh-core = { path = "../thoth-mesh-core", version = "0.0.1", features = ["async"] }
+thoth-mesh-core = { path = "../thoth-mesh-core", version = "0.1.0", features = ["async"] }
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "signal"] }
 tokio-util = { version = "0.7.19", features = ["compat"] }
 
 [dev-dependencies]
-thoth-mesh-node = { path = "../thoth-mesh-node", version = "0.0.1" }
+thoth-mesh-node = { path = "../thoth-mesh-node", version = "0.1.0" }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "signal", "time"] }

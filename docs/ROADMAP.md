@@ -61,23 +61,27 @@ without routing any messages between them yet.
 - Reconnect/backoff for dropped peer links.
 - Metrics (connected peers, messages/sec, broadcast lag).
 
-## Phase 5 — Release readiness
+## Phase 5 — Release readiness (see ADR-0014)
 
 **Goal:** the crates are actually publishable and versioned like a
 real project, not placeholders.
 
-- Real crates.io publishes of `thoth-mesh-core` and
-  `thoth-mesh-broker`. Both names are reserved today, but neither
-  publish is real: `thoth-mesh-core` 0.0.1 is a stale placeholder
-  from before ADR-0005's wire protocol existed, and
-  `thoth-mesh-broker` 0.0.1 was published with `cargo publish
-  --no-verify` to reserve the name — it doesn't actually build for a
-  consumer, since it depends on the real (unreleased)
-  `thoth-mesh-core` API. Fixing this means bumping and republishing
-  `thoth-mesh-core` for real first, then `thoth-mesh-broker`.
-- Decide whether crates keep moving in version lockstep
-  (`version.workspace = true`) or decouple.
-- Declare the wire protocol stable (or explicitly mark it unstable).
+All 5 crate names are reserved on crates.io, but every one of them is
+a stale `0.0.1` placeholder — `thoth-mesh-core`, `thoth-mesh`,
+`thoth-mesh-node`, and `thoth-mesh-cli` predate ADR-0005's wire
+protocol, and `thoth-mesh-broker` 0.0.1 was published with `cargo
+publish --no-verify` just to reserve the name. None of them build for
+a consumer today.
+
+- Versioning stays in lockstep (`version.workspace = true`) — the
+  crates already move together and aren't independently useful.
+- The wire protocol, and every crate's public API, stay explicitly
+  unstable (0.x) — there are no external consumers yet and it's
+  changed in nearly every phase so far.
+- All 5 crates get a real `0.1.0` publish, in dependency order
+  (`thoth-mesh-core` → `thoth-mesh`/`thoth-mesh-broker` →
+  `thoth-mesh-node` → `thoth-mesh-cli`), verified for real this time
+  instead of `--no-verify`.
 
 ## Non-goals (for now)
 

@@ -501,7 +501,7 @@ dependencies = [
 
 [[package]]
 name = "thoth-mesh"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "futures-executor",
  "futures-util",
@@ -512,7 +512,7 @@ dependencies = [
 
 [[package]]
 name = "thoth-mesh-broker"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "thoth-mesh-core",
  "tokio",
@@ -520,7 +520,7 @@ dependencies = [
 
 [[package]]
 name = "thoth-mesh-cli"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "clap",
  "thoth-mesh-core",
@@ -531,7 +531,7 @@ dependencies = [
 
 [[package]]
 name = "thoth-mesh-core"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "ciborium",
  "futures-executor",
@@ -543,7 +543,7 @@ dependencies = [
 
 [[package]]
 name = "thoth-mesh-node"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "clap",
  "thoth-mesh",
