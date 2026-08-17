@@ -20,6 +20,12 @@ struct Cli {
     /// Address of a seed peer to dial on startup. Repeatable.
     #[arg(long = "peer")]
     peers: Vec<String>,
+
+    /// Address to serve Prometheus-format metrics on (e.g.
+    /// `127.0.0.1:9090`). Off by default - no metrics port is opened
+    /// unless this is given.
+    #[arg(long)]
+    metrics_addr: Option<String>,
 }
 
 #[tokio::main]
@@ -35,5 +41,5 @@ async fn main() -> std::io::Result<()> {
         .unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
-    thoth_mesh_node::run(&cli.addr, cli.peers).await
+    thoth_mesh_node::run(&cli.addr, cli.peers, cli.metrics_addr).await
 }

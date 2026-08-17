@@ -19,6 +19,7 @@ use tokio::task::JoinHandle;
 use tokio_util::compat::{Compat, TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tracing::Instrument;
 
+use crate::metrics::Metrics;
 use crate::peer_links::PeerLinks;
 use crate::shared::Shared;
 
@@ -59,6 +60,7 @@ async fn run_connection(socket: TcpStream, shared: Shared, initial_peer: Option<
         peer_links,
         node_id,
         my_listen_addr,
+        metrics,
     } = shared;
     let (reader, writer) = socket.into_split();
     let mut reader = reader.compat();
@@ -108,9 +110,9 @@ async fn run_connection(socket: TcpStream, shared: Shared, initial_peer: Option<
                         let topic = topic.clone();
                         tracing::info!(sender = ?envelope.sender, %topic, "subscribed");
                         let is_new_forwarder = !forwarders.contains_key(&topic);
-                        forwarders
-                            .entry(topic.clone())
-                            .or_insert_with(|| spawn_forwarder(&broker, topic.clone(), outgoing_tx.clone()));
+                        forwarders.entry(topic.clone()).or_insert_with(|| {
+                            spawn_forwarder(&broker, topic.clone(), outgoing_tx.clone(), metrics.clone())
+                        });
                         if is_new_forwarder && interest.subscribe(topic.clone()) {
                             propagate_interest(&peer_links, node_id, topic, true);
                         }
@@ -245,6 +247,7 @@ fn spawn_forwarder(
     broker: &Arc<Broker>,
     topic: Topic,
     outgoing_tx: mpsc::Sender<Arc<Envelope>>,
+    metrics: Metrics,
 ) -> JoinHandle<()> {
     let broker = Arc::clone(broker);
     tokio::spawn(
@@ -259,6 +262,7 @@ fn spawn_forwarder(
                     }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
                         tracing::warn!(skipped, "forwarder lagged, dropped messages");
+                        metrics.record_forwarder_lag(skipped);
                         continue;
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
