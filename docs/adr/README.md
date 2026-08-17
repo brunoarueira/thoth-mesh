@@ -19,6 +19,7 @@ thoth-mesh, using the format described in
 | [0011](0011-interest-propagation-and-loop-prevention.md) | Topic-interest propagation and loop prevention |
 | [0012](0012-peer-reconnect-backoff.md) | Reconnect with exponential backoff for dropped peer links |
 | [0013](0013-metrics-hand-rolled-prometheus-exposition.md) | Metrics: hand-rolled Prometheus text exposition, opt-in port |
+| [0014](0014-release-readiness-versioning-and-republish.md) | Release readiness: lockstep versioning, unstable protocol, republish all five crates |
 
 To add a new one, copy the format of an existing ADR, number it
 sequentially, and set its status to `Accepted` once the decision is

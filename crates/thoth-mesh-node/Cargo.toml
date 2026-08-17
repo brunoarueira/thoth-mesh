@@ -18,9 +18,9 @@ name = "thoth-mesh-node"
 path = "src/main.rs"
 
 [dependencies]
-thoth-mesh-core = { path = "../thoth-mesh-core", version = "0.0.1", features = ["async"] }
-thoth-mesh = { path = "../thoth-mesh", version = "0.0.1" }
-thoth-mesh-broker = { path = "../thoth-mesh-broker", version = "0.0.1" }
+thoth-mesh-core = { path = "../thoth-mesh-core", version = "0.1.0", features = ["async"] }
+thoth-mesh = { path = "../thoth-mesh", version = "0.1.0" }
+thoth-mesh-broker = { path = "../thoth-mesh-broker", version = "0.1.0" }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "macros", "time"] }
 tokio-util = { version = "0.7.19", features = ["compat"] }
 tracing = "0.1.44"

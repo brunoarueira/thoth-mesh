@@ -9,9 +9,10 @@ deep on Rust (async networking, concurrency, protocol design, distributed
 systems) beyond CLI-toy scope.
 
 **Status:** early work in progress. A single node can broker pub/sub
-traffic over TCP end to end; federation between nodes doesn't exist
-yet. See [the roadmap](docs/ROADMAP.md) for what's next. Names are
-reserved on crates.io ahead of a first real release.
+traffic over TCP end to end, and nodes federate over peer links with
+reconnect/backoff and basic metrics. See [the roadmap](docs/ROADMAP.md)
+for what's next. All crates are 0.x — the wire protocol and public
+APIs are not yet stable (see ADR-0014).
 
 ## Layout
 
