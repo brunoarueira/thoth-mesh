@@ -18,6 +18,7 @@ thoth-mesh, using the format described in
 | [0010](0010-peer-links-share-client-dispatch.md) | Peer links share the client dispatch loop |
 | [0011](0011-interest-propagation-and-loop-prevention.md) | Topic-interest propagation and loop prevention |
 | [0012](0012-peer-reconnect-backoff.md) | Reconnect with exponential backoff for dropped peer links |
+| [0013](0013-metrics-hand-rolled-prometheus-exposition.md) | Metrics: hand-rolled Prometheus text exposition, opt-in port |
 
 To add a new one, copy the format of an existing ADR, number it
 sequentially, and set its status to `Accepted` once the decision is
