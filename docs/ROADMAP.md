@@ -83,9 +83,80 @@ a consumer today.
   `thoth-mesh-node` → `thoth-mesh-cli`), verified for real this time
   instead of `--no-verify`.
 
+## Phase 6 — Dynamic mesh topology
+
+**Goal:** the mesh's topology grows on its own instead of needing
+every edge hand-configured. Message *routing* is already multi-hop
+(ADR-0011); topology isn't — a node only ever dials the exact
+addresses passed via `--peer`.
+
+- Peer exchange / gossip, so a node can discover and dial peers it was
+  never directly configured with.
+
+## Phase 7 — Trust & transport security
+
+**Goal:** the mesh isn't wide open to anyone who can reach the port —
+today there's no TLS and no authentication anywhere in the wire
+protocol.
+
+- TLS on peer and client connections.
+- Peer authentication / allowlisting.
+- Fine-grained authorization: per-topic publish/subscribe permissions,
+  and access control on the metrics/admin surface (TLS alone doesn't
+  imply this).
+
+## Phase 8 — Message durability & topic model
+
+**Goal:** broker semantics grow beyond in-memory, best-effort,
+exact-match delivery.
+
+- Message persistence and replay for late subscribers.
+- Wildcard/pattern topic matching (ADR-0006 chose exact match for v1;
+  revisit now that it's been exercised across a real federated mesh).
+
+## Phase 9 — Deployment & operational hardening
+
+**Goal:** the mesh can be run somewhere real, and its resilience
+claims (reconnect/backoff, loop prevention, dedup) are tested under
+actual failure conditions, not just asserted by one lightweight
+integration test each.
+
+- Packaging: a Dockerfile, a systemd unit, and install docs.
+- A benchmark suite: throughput and latency across N mesh hops.
+- Chaos/partition testing: kill/restart nodes mid-mesh, partition a
+  peer, verify reconnect+backoff and loop prevention/dedup hold up.
+
+## Phase 10 — CLI ergonomics
+
+**Goal:** `thoth-mesh-cli` is pleasant to use for more than a demo —
+v1 was deliberately minimal (see issue #13).
+
+- Subscribe to multiple topics in one invocation.
+- Config file support, so `--addr` doesn't need repeating.
+- Payload input/output fidelity: read a publish payload from stdin,
+  stop assuming payloads are UTF-8 text end to end.
+- Shell completions.
+
+## Phase 11 — CLI admin & observability
+
+**Goal:** an operator can inspect a running mesh from the CLI —
+connected peers, a metrics summary — not just by scraping the
+Prometheus endpoint (ADR-0013) or reading logs.
+
+- Admin/status commands (e.g. `thoth-mesh status`), depends on Phase 6
+  for what "peers" means once topology isn't purely static-config-driven.
+
+## Standalone work (not tied to a phase)
+
+Some work is useful on its own regardless of which feature phase lands
+next — tracked as plain issues rather than under a milestone:
+
+- A written wire-protocol spec (`PROTOCOL.md`).
+- An operator / getting-started guide (`docs/OPERATIONS.md`).
+- `CONTRIBUTING.md` documenting the ADR/issue/branch/PR workflow.
+
 ## Non-goals (for now)
 
-Things intentionally left out of this roadmap because they're not
-blocking a working federated mesh: authn/authz, message persistence
-and replay, wildcard/pattern topic matching (ADR-0006 chose exact
-match for v1), and a hosted/managed deployment story.
+Things intentionally left out of this roadmap: a hosted/managed
+deployment story (a control plane, a SaaS offering — distinct from
+Phase 9's "runnable via Docker/systemd," which is in scope).
