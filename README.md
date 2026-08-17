@@ -32,6 +32,12 @@ Significant architecture decisions are recorded as ADRs in
 [`docs/adr/`](docs/adr/). For where the project is headed, see
 [`docs/ROADMAP.md`](docs/ROADMAP.md).
 
+## Contributing
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the workflow: how work is
+planned, when a change needs an ADR, and what to run locally before
+opening a PR.
+
 ## License
 
 Licensed under either of
