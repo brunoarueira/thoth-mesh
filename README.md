@@ -29,7 +29,9 @@ This is a Cargo workspace:
 ## Architecture decisions
 
 Significant architecture decisions are recorded as ADRs in
-[`docs/adr/`](docs/adr/). For where the project is headed, see
+[`docs/adr/`](docs/adr/). For a from-scratch description of the wire
+protocol itself, independent of the Rust implementation, see
+[`PROTOCOL.md`](PROTOCOL.md). For where the project is headed, see
 [`docs/ROADMAP.md`](docs/ROADMAP.md).
 
 ## Contributing
