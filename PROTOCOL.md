@@ -8,8 +8,10 @@ For the reasoning behind these choices, see
 [ADR-0005](docs/adr/0005-wire-protocol-v1.md) (envelope, framing,
 CBOR), [ADR-0008](docs/adr/0008-generic-async-framing.md) (async
 framing), [ADR-0009](docs/adr/0009-peer-handshake-shared-port.md) (the
-peer handshake), and [ADR-0011](docs/adr/0011-interest-propagation-and-loop-prevention.md)
-(interest propagation and loop prevention).
+peer handshake), [ADR-0011](docs/adr/0011-interest-propagation-and-loop-prevention.md)
+(interest propagation and loop prevention), and
+[ADR-0015](docs/adr/0015-dynamic-peer-discovery-gossip.md) (peer
+discovery via gossip).
 
 **Status:** version 1, and explicitly unstable — see ADR-0014. Nothing
 here should be assumed to hold across a breaking change; check
@@ -187,6 +189,25 @@ connection, and is the only message kind involved in the
 peers should dial to reach the sender back, if it accepts inbound
 connections at all (a peer that only ever dials out can send `null`).
 
+### `PeerAnnounce`
+
+```
+{"PeerAnnounce": {"peers": [{"peer_id": <PeerId>, "listen_addr": <string>}, ...]}}
+```
+
+Advertises peers the sender knows about, so the receiver can discover
+and dial peers it was never directly configured with (see
+[ADR-0015](docs/adr/0015-dynamic-peer-discovery-gossip.md)). Only
+peers with a known `listen_addr` are worth advertising — unlike
+`Hello`'s `listen_addr`, this one isn't nullable, since an entry with
+nothing to dial wouldn't be useful to gossip in the first place. Sent
+over a peer link only, never by/to a plain client connection: once as
+a batch catch-up when the link comes up (every peer already known,
+except the new link's own), and again, incrementally, whenever the
+sender itself learns of a peer it didn't already know.
+
+No reply is sent for a `PeerAnnounce`, the same as `Publish`.
+
 ## Connections: clients vs. peer links
 
 There is exactly one kind of connection at the transport level; the
@@ -203,6 +224,9 @@ plain client connection is purely behavioral:
   to forward its own subscribers' aggregate interest onward. See
   ADR-0011 for the loop-prevention/de-duplication this requires once
   a mesh can have cycles.
+- Peer links are also the only connections `PeerAnnounce` is ever
+  sent on — a plain client connection neither sends nor receives one
+  (see ADR-0015).
 
 A node's own set of "topics anything downstream wants" is what gets
 propagated to peers, not each individual client subscription.
