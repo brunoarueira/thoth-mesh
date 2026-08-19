@@ -57,10 +57,16 @@ construction in both would mean security-sensitive setup code living
 in two places that need to stay in sync by hand.
 
 `thoth-mesh-tls` is a new, small crate depending only on
-`tokio-rustls`, `rustls-pemfile`, and `rustls-pki-types`. It exposes:
+`tokio-rustls` and `rustls-pki-types`. It exposes:
 
 - `load_certs`/`load_private_key`: PEM file loading, the one piece of
-  I/O this crate does.
+  I/O this crate does — via `rustls-pki-types`'s own `PemObject`
+  trait, not the separate `rustls-pemfile` crate. `rustls-pemfile` was
+  the initial choice here, but turned out to be unmaintained
+  (RUSTSEC-2025-0134, flagged by CI's `cargo audit` job right after
+  this PR opened) and is itself now just a thin wrapper around the
+  same `rustls-pki-types` code — switching removed a dependency
+  instead of adding one.
 - `server_config(cert, key, ca) -> ServerConfig` and
   `client_config(ca, identity: Option<(cert, key)>) -> ClientConfig`:
   the trust/identity policy described below, built once at startup.
@@ -119,10 +125,9 @@ later (#62, not enforced by anything today).
 This gives #47 (peer authentication/allowlisting) exactly the hook it
 asked for without this issue owning any of it: by the time a `Hello`
 arrives, the connection may already carry a verified peer certificate
-identity, available via `MaybeTlsStream`'s underlying
-`tokio_rustls::TlsStream::get_ref()`. #47's allowlist logic can check
-it; #46 doesn't inspect it or enforce anything beyond "chains to the
-CA if present at all."
+identity, available via `MaybeTlsStream::peer_certificates()`. #47's
+allowlist logic can check it; #46 doesn't inspect it or enforce
+anything beyond "chains to the CA if present at all."
 
 ### Opt-in, not default-on
 
