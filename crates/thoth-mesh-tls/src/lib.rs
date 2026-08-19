@@ -21,6 +21,7 @@ use std::sync::{Arc, Once};
 
 use rustls::server::WebPkiClientVerifier;
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
+use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 
 pub use stream::MaybeTlsStream;
@@ -60,15 +61,15 @@ fn ensure_crypto_provider() {
 /// Loads a PEM-encoded certificate chain from `path`.
 pub fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, TlsError> {
     let path_str = path.display().to_string();
-    let bytes = std::fs::read(path).map_err(|source| TlsError::Io {
-        path: path_str.clone(),
-        source,
-    })?;
-    let certs = rustls_pemfile::certs(&mut bytes.as_slice())
+    let certs = CertificateDer::pem_file_iter(path)
+        .map_err(|source| TlsError::Io {
+            path: path_str.clone(),
+            source: pem_error_to_io(source),
+        })?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|source| TlsError::Io {
             path: path_str.clone(),
-            source,
+            source: pem_error_to_io(source),
         })?;
     if certs.is_empty() {
         return Err(TlsError::NoCertificates { path: path_str });
@@ -77,19 +78,20 @@ pub fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, TlsError>
 }
 
 /// Loads a single PEM-encoded private key from `path` (PKCS#8, RSA,
-/// or SEC1/EC — whichever `rustls-pemfile` finds first).
+/// or SEC1/EC — whichever comes first in the file).
 pub fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, TlsError> {
     let path_str = path.display().to_string();
-    let bytes = std::fs::read(path).map_err(|source| TlsError::Io {
-        path: path_str.clone(),
-        source,
-    })?;
-    rustls_pemfile::private_key(&mut bytes.as_slice())
-        .map_err(|source| TlsError::Io {
-            path: path_str.clone(),
-            source,
-        })?
-        .ok_or(TlsError::NoPrivateKey { path: path_str })
+    PrivateKeyDer::from_pem_file(path).map_err(|source| match source {
+        rustls_pki_types::pem::Error::NoItemsFound => TlsError::NoPrivateKey { path: path_str },
+        source => TlsError::Io {
+            path: path_str,
+            source: pem_error_to_io(source),
+        },
+    })
+}
+
+fn pem_error_to_io(err: rustls_pki_types::pem::Error) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, err.to_string())
 }
 
 fn root_store(ca_certs: Vec<CertificateDer<'static>>) -> Result<RootCertStore, TlsError> {
