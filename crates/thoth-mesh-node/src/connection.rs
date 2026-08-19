@@ -1,16 +1,17 @@
 //! Per-connection handling: reads framed envelopes off a socket,
 //! dispatches them to the broker, and forwards broadcast deliveries back
 //! out. See ADR-0007. Also propagates local topic-interest changes to
-//! peer links; see ADR-0011.
+//! peer links (see ADR-0011), and peer addresses learned about, for
+//! discovery (see ADR-0015).
 
 use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::sync::Arc;
 
-use thoth_mesh::{Interest, PeerInfo};
+use thoth_mesh::{Interest, PeerDirectory, PeerInfo};
 use thoth_mesh_broker::Broker;
 use thoth_mesh_core::async_framing;
-use thoth_mesh_core::{Envelope, FramingError, MessageKind, PeerId, Topic};
+use thoth_mesh_core::{Envelope, FramingError, MessageKind, PeerAdvert, PeerId, Topic};
 use tokio::net::TcpStream;
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::sync::broadcast;
@@ -61,6 +62,8 @@ async fn run_connection(socket: TcpStream, shared: Shared, initial_peer: Option<
         node_id,
         my_listen_addr,
         metrics,
+        discover,
+        discovered_tx,
     } = shared;
     let (reader, writer) = socket.into_split();
     let mut reader = reader.compat();
@@ -79,8 +82,16 @@ async fn run_connection(socket: TcpStream, shared: Shared, initial_peer: Option<
     }) = initial_peer
     {
         peer_identity = Some(peer_id);
-        membership.mark_connected(peer_id, listen_addr);
-        register_peer_link(&peer_links, &interest, node_id, peer_id, &outgoing_tx);
+        membership.mark_connected(peer_id, listen_addr.clone());
+        register_peer_link(
+            &peer_links,
+            &interest,
+            &discover,
+            node_id,
+            peer_id,
+            listen_addr,
+            &outgoing_tx,
+        );
     }
 
     loop {
@@ -150,7 +161,15 @@ async fn run_connection(socket: TcpStream, shared: Shared, initial_peer: Option<
                         );
                         peer_identity = Some(envelope.sender);
                         membership.mark_connected(envelope.sender, listen_addr.clone());
-                        register_peer_link(&peer_links, &interest, node_id, envelope.sender, &outgoing_tx);
+                        register_peer_link(
+                            &peer_links,
+                            &interest,
+                            &discover,
+                            node_id,
+                            envelope.sender,
+                            listen_addr.clone(),
+                            &outgoing_tx,
+                        );
                         let reply = Envelope::new(
                             node_id,
                             MessageKind::Hello {
@@ -160,6 +179,15 @@ async fn run_connection(socket: TcpStream, shared: Shared, initial_peer: Option<
                         if !send_envelope(&mut writer, &reply).await {
                             break;
                         }
+                    }
+                    MessageKind::PeerAnnounce { peers } => {
+                        learn_peers(
+                            &peer_links,
+                            &discover,
+                            &discovered_tx,
+                            node_id,
+                            peers,
+                        );
                     }
                 }
             }
@@ -187,19 +215,23 @@ async fn run_connection(socket: TcpStream, shared: Shared, initial_peer: Option<
 }
 
 /// Registers this connection as a peer link and catches it up on
-/// every topic this node is currently interested in - so a peer that
-/// connects after interest was already established still learns about
-/// it, not just future transitions (see ADR-0011).
+/// every topic this node is currently interested in (ADR-0011) and
+/// every other peer this node already knows how to reach (ADR-0015) -
+/// so a peer that connects after either was already established
+/// still learns about it, not just future transitions.
 ///
-/// Best-effort, like [`PeerLinks::broadcast`]: a catch-up `Subscribe`
-/// that doesn't fit in the outgoing queue right now is dropped rather
-/// than blocking the connection on it, on the assumption a channel
-/// this backed up already has bigger problems.
+/// Best-effort, like [`PeerLinks::broadcast`]: a catch-up message that
+/// doesn't fit in the outgoing queue right now is dropped rather than
+/// blocking the connection on it, on the assumption a channel this
+/// backed up already has bigger problems.
+#[allow(clippy::too_many_arguments)]
 fn register_peer_link(
     peer_links: &PeerLinks,
     interest: &Interest,
+    discover: &PeerDirectory,
     node_id: PeerId,
     peer_id: PeerId,
+    peer_listen_addr: Option<String>,
     outgoing_tx: &mpsc::Sender<Arc<Envelope>>,
 ) {
     peer_links.register(peer_id, outgoing_tx.clone());
@@ -214,6 +246,98 @@ fn register_peer_link(
             tracing::warn!(%topic, "outgoing queue full, dropping interest catch-up for this topic");
         }
     }
+
+    // Peer discovery (ADR-0015): record the newly-linked peer itself,
+    // if it's dialable, and tell every other active peer link about
+    // it - same 0-to-1 transition idempotency ADR-0011 established
+    // for interest, so this terminates the same way.
+    if let Some(listen_addr) = peer_listen_addr
+        && discover.record(peer_id, listen_addr.clone())
+    {
+        propagate_peer(peer_links, node_id, peer_id, listen_addr);
+    }
+
+    // Catch this new link up on every other peer we already know
+    // about, batched into one message (unlike interest's per-topic
+    // catch-up, a peer entry needs no per-connection forwarder task,
+    // so there's no reason to send one envelope per peer).
+    let known = discover.snapshot_excluding(peer_id);
+    if !known.is_empty() {
+        let peers = known
+            .into_iter()
+            .map(|(peer_id, listen_addr)| PeerAdvert {
+                peer_id,
+                listen_addr,
+            })
+            .collect();
+        let envelope = Arc::new(Envelope::new(node_id, MessageKind::PeerAnnounce { peers }));
+        if outgoing_tx.try_send(envelope).is_err() {
+            tracing::warn!("outgoing queue full, dropping peer catch-up announce");
+        }
+    }
+}
+
+/// Records every peer in `peers` this node didn't already know about,
+/// auto-dials the ones this node is responsible for dialing, and
+/// propagates the newly-learned ones onward to every other active
+/// peer link. See ADR-0015.
+///
+/// Auto-dial only happens for a peer whose `PeerId` sorts greater
+/// than `node_id`'s: both sides of a pair independently learning
+/// about each other at close to the same time would otherwise each
+/// dial the other, racing two concurrent connections for the same
+/// peer against `Membership`/`PeerLinks`' single-connection-per-peer
+/// assumption. Comparing `PeerId`s deterministically picks exactly one
+/// side to dial, with no coordination needed.
+fn learn_peers(
+    peer_links: &PeerLinks,
+    discover: &PeerDirectory,
+    discovered_tx: &mpsc::UnboundedSender<String>,
+    node_id: PeerId,
+    peers: &[PeerAdvert],
+) {
+    let mut newly_learned = Vec::new();
+    for advert in peers {
+        if advert.peer_id == node_id {
+            continue; // never learn about ourselves
+        }
+        if discover.record(advert.peer_id, advert.listen_addr.clone()) {
+            if we_should_dial(node_id, advert.peer_id) {
+                let _ = discovered_tx.send(advert.listen_addr.clone());
+            }
+            newly_learned.push(advert.clone());
+        }
+    }
+    if !newly_learned.is_empty() {
+        let envelope = Arc::new(Envelope::new(
+            node_id,
+            MessageKind::PeerAnnounce {
+                peers: newly_learned,
+            },
+        ));
+        peer_links.broadcast(envelope);
+    }
+}
+
+/// Whether this node (`node_id`) is the one responsible for dialing a
+/// newly-discovered `peer_id`, rather than waiting to be dialed by
+/// it. A `PeerId` comparison, evaluated independently by both sides
+/// of a pair with no coordination - see ADR-0015 for why this is
+/// needed and why it's sufficient.
+fn we_should_dial(node_id: PeerId, peer_id: PeerId) -> bool {
+    node_id < peer_id
+}
+
+/// Tells every active peer link about a newly-learned peer. See
+/// ADR-0015.
+fn propagate_peer(peer_links: &PeerLinks, node_id: PeerId, peer_id: PeerId, listen_addr: String) {
+    let kind = MessageKind::PeerAnnounce {
+        peers: vec![PeerAdvert {
+            peer_id,
+            listen_addr,
+        }],
+    };
+    peer_links.broadcast(Arc::new(Envelope::new(node_id, kind)));
 }
 
 /// Tells every active peer link about a local topic-interest
@@ -293,5 +417,178 @@ mod tests {
     fn frame_too_large_is_not_a_clean_disconnect() {
         let err = FramingError::FrameTooLarge { len: 100, max: 10 };
         assert!(!is_clean_disconnect(&err));
+    }
+
+    #[test]
+    fn we_should_dial_favors_the_smaller_peer_id() {
+        let mut ids = [PeerId::new(), PeerId::new()];
+        ids.sort();
+        let [smaller, larger] = ids;
+        assert!(we_should_dial(smaller, larger));
+        assert!(!we_should_dial(larger, smaller));
+    }
+
+    #[test]
+    fn we_should_dial_is_false_for_equal_ids() {
+        let id = PeerId::new();
+        assert!(!we_should_dial(id, id));
+    }
+
+    #[tokio::test]
+    async fn learn_peers_skips_self_dials_only_the_larger_side_and_rebroadcasts_new_ones() {
+        // Sorting three fresh ids and taking the middle one as our own
+        // guarantees one peer sorts below node_id and one sorts above
+        // it, exercising both branches of we_should_dial in one call.
+        let mut ids = [PeerId::new(), PeerId::new(), PeerId::new()];
+        ids.sort();
+        let [smaller_peer, node_id, larger_peer] = ids;
+
+        let peer_links = PeerLinks::new();
+        let discover = PeerDirectory::new();
+        let (discovered_tx, mut discovered_rx) = mpsc::unbounded_channel();
+        let (link_tx, mut link_rx) = mpsc::channel(8);
+        peer_links.register(PeerId::new(), link_tx);
+
+        let peers = vec![
+            PeerAdvert {
+                peer_id: node_id,
+                listen_addr: "127.0.0.1:1".to_owned(),
+            },
+            PeerAdvert {
+                peer_id: smaller_peer,
+                listen_addr: "127.0.0.1:2".to_owned(),
+            },
+            PeerAdvert {
+                peer_id: larger_peer,
+                listen_addr: "127.0.0.1:3".to_owned(),
+            },
+        ];
+
+        learn_peers(&peer_links, &discover, &discovered_tx, node_id, &peers);
+
+        // Only the larger peer gets auto-dialed; the smaller peer is
+        // learned about but left for it to dial us, and our own
+        // entry is ignored outright.
+        assert_eq!(discovered_rx.try_recv().unwrap(), "127.0.0.1:3");
+        assert!(discovered_rx.try_recv().is_err());
+
+        let mut known = discover.snapshot_excluding(PeerId::new());
+        known.sort();
+        let mut expected = vec![
+            (smaller_peer, "127.0.0.1:2".to_owned()),
+            (larger_peer, "127.0.0.1:3".to_owned()),
+        ];
+        expected.sort();
+        assert_eq!(known, expected);
+
+        let broadcast = link_rx.try_recv().unwrap();
+        match &broadcast.kind {
+            MessageKind::PeerAnnounce { peers } => assert_eq!(peers.len(), 2),
+            other => panic!("expected PeerAnnounce, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn learn_peers_does_not_rebroadcast_an_already_known_peer() {
+        let node_id = PeerId::new();
+        let peer_links = PeerLinks::new();
+        let discover = PeerDirectory::new();
+        let (discovered_tx, _discovered_rx) = mpsc::unbounded_channel();
+        let (link_tx, mut link_rx) = mpsc::channel(8);
+        peer_links.register(PeerId::new(), link_tx);
+
+        let already_known = PeerId::new();
+        discover.record(already_known, "127.0.0.1:1".to_owned());
+
+        learn_peers(
+            &peer_links,
+            &discover,
+            &discovered_tx,
+            node_id,
+            &[PeerAdvert {
+                peer_id: already_known,
+                listen_addr: "127.0.0.1:1".to_owned(),
+            }],
+        );
+
+        assert!(link_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn register_peer_link_announces_itself_and_catches_up_on_known_peers() {
+        let peer_links = PeerLinks::new();
+        let interest = Interest::new();
+        let discover = PeerDirectory::new();
+        let node_id = PeerId::new();
+        let already_known = PeerId::new();
+        discover.record(already_known, "127.0.0.1:1".to_owned());
+
+        let new_peer = PeerId::new();
+        let (outgoing_tx, mut outgoing_rx) = mpsc::channel(8);
+
+        register_peer_link(
+            &peer_links,
+            &interest,
+            &discover,
+            node_id,
+            new_peer,
+            Some("127.0.0.1:2".to_owned()),
+            &outgoing_tx,
+        );
+
+        let mut announced_peers = Vec::new();
+        while let Ok(envelope) = outgoing_rx.try_recv() {
+            match &envelope.kind {
+                MessageKind::PeerAnnounce { peers } => announced_peers.extend(peers.clone()),
+                other => panic!("expected only PeerAnnounce envelopes, got {other:?}"),
+            }
+        }
+        announced_peers.sort_by_key(|advert| advert.peer_id);
+
+        let mut expected = vec![
+            PeerAdvert {
+                peer_id: already_known,
+                listen_addr: "127.0.0.1:1".to_owned(),
+            },
+            PeerAdvert {
+                peer_id: new_peer,
+                listen_addr: "127.0.0.1:2".to_owned(),
+            },
+        ];
+        expected.sort_by_key(|advert| advert.peer_id);
+        assert_eq!(announced_peers, expected);
+
+        assert!(
+            discover
+                .snapshot_excluding(PeerId::new())
+                .into_iter()
+                .any(|(id, addr)| id == new_peer && addr == "127.0.0.1:2")
+        );
+    }
+
+    #[tokio::test]
+    async fn register_peer_link_does_not_record_a_peer_with_no_listen_addr() {
+        let peer_links = PeerLinks::new();
+        let interest = Interest::new();
+        let discover = PeerDirectory::new();
+        let node_id = PeerId::new();
+        let new_peer = PeerId::new();
+        let (outgoing_tx, mut outgoing_rx) = mpsc::channel(8);
+
+        register_peer_link(
+            &peer_links,
+            &interest,
+            &discover,
+            node_id,
+            new_peer,
+            None,
+            &outgoing_tx,
+        );
+
+        // Nothing to catch up on, and nothing recorded about the new
+        // peer itself - a dial-out-only peer isn't dialable by
+        // anyone, so there's nothing useful to gossip about it.
+        assert!(outgoing_rx.try_recv().is_err());
+        assert!(discover.snapshot_excluding(PeerId::new()).is_empty());
     }
 }

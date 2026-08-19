@@ -10,7 +10,9 @@
 mod handshake;
 mod interest;
 mod membership;
+mod peer_directory;
 
 pub use handshake::{HandshakeError, PeerInfo, dial_handshake, hello};
 pub use interest::Interest;
 pub use membership::{Membership, PeerStatus};
+pub use peer_directory::PeerDirectory;

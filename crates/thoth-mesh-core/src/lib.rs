@@ -15,7 +15,7 @@ mod topic;
 pub use envelope::{Envelope, PROTOCOL_VERSION};
 pub use error::{DecodeError, EncodeError, FramingError, TopicError};
 pub use framing::{MAX_FRAME_LEN, read_frame, write_frame};
-pub use message::{MessageId, MessageKind};
+pub use message::{MessageId, MessageKind, PeerAdvert};
 pub use peer::PeerId;
 pub use topic::{MAX_TOPIC_LEN, Topic};
 

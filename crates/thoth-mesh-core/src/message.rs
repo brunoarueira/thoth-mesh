@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::peer::PeerId;
 use crate::topic::Topic;
 
 /// The identity of a message.
@@ -32,6 +33,15 @@ impl Default for MessageId {
     }
 }
 
+/// One peer a [`MessageKind::PeerAnnounce`] advertises: a `PeerId`
+/// and the address other peers can dial it back at. Only peers with a
+/// known listen address are worth advertising - see ADR-0015.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerAdvert {
+    pub peer_id: PeerId,
+    pub listen_addr: String,
+}
+
 /// The payload of an [`Envelope`](crate::Envelope).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MessageKind {
@@ -57,6 +67,12 @@ pub enum MessageKind {
         /// if it accepts inbound connections.
         listen_addr: Option<String>,
     },
+    /// Advertise peers the sender knows about, so the receiver can
+    /// discover and dial peers it was never directly configured
+    /// with. Sent as a batch catch-up when a peer link comes up, and
+    /// again whenever the sender learns of a peer it didn't already
+    /// know. See ADR-0015.
+    PeerAnnounce { peers: Vec<PeerAdvert> },
 }
 
 #[cfg(test)]
@@ -104,6 +120,13 @@ mod tests {
                 listen_addr: Some("127.0.0.1:49500".to_owned()),
             },
             MessageKind::Hello { listen_addr: None },
+            MessageKind::PeerAnnounce {
+                peers: vec![PeerAdvert {
+                    peer_id: PeerId::new(),
+                    listen_addr: "127.0.0.1:49501".to_owned(),
+                }],
+            },
+            MessageKind::PeerAnnounce { peers: vec![] },
         ];
 
         for kind in kinds {
