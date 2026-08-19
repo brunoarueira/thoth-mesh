@@ -95,11 +95,13 @@ link came up (ADR-0011). This works transitively across more than two
 nodes; the mesh doesn't need to be fully connected, only reachable.
 
 If a peer link drops, the dialing side retries with backoff rather
-than giving up — there's no need to manually reconnect. Peer topology
-is static and one-directional to configure today: only the dialing
-side is told where to connect via `--peer`, and there's no discovery
-of peers beyond the ones explicitly listed (see
-[docs/ROADMAP.md](ROADMAP.md) Phase 6).
+than giving up — there's no need to manually reconnect. `--peer` is
+only needed to join the mesh in the first place: once B has dialed A,
+each side also gossips the other peers it knows about, so a node
+learns about (and auto-dials) peers-of-peers it was never directly
+configured with (see [ADR-0015](adr/0015-dynamic-peer-discovery-gossip.md)).
+Node C, started with only `--peer` pointing at B, ends up directly
+connected to A too, without ever being told A's address.
 
 ## Metrics
 
@@ -139,6 +141,58 @@ Point a Prometheus `scrape_configs` target at `--metrics-addr` the
 same way you would any other exporter; there's no special
 `/metrics`-only handling to configure around.
 
+## TLS
+
+Off by default — every connection (client or peer) is plaintext
+unless you opt in. Enabling it needs a CA and a cert/key per node,
+signed by that CA (see [ADR-0016](adr/0016-tls-transport-security.md)
+for the trust model). thoth-mesh doesn't generate certs itself;
+`openssl` does the job in a few commands:
+
+```sh
+# One CA for the whole mesh.
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+  -keyout ca-key.pem -out ca-cert.pem -days 3650 -subj "/CN=my-mesh-ca"
+
+# One cert per node, signed by that CA. subjectAltName has to match
+# how peers/clients will actually reach it (an IP here, since this
+# quickstart stays on loopback - use DNS:your.hostname for a real
+# deployment).
+openssl req -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+  -keyout node-a-key.pem -out node-a.csr -subj "/CN=node-a"
+openssl x509 -req -in node-a.csr -CA ca-cert.pem -CAkey ca-key.pem -CAcreateserial \
+  -out node-a-cert.pem -days 825 -extfile <(printf "subjectAltName=IP:127.0.0.1")
+
+# Repeat for node-b (and any other node) with its own key/CSR/cert.
+```
+
+Start each node with all three flags — partial specification (e.g.
+`--tls-cert` without `--tls-key`) is a startup error, not a silent
+fallback to plaintext:
+
+```sh
+cargo run -p thoth-mesh-node -- --addr 127.0.0.1:49500 \
+  --tls-cert node-a-cert.pem --tls-key node-a-key.pem --tls-ca ca-cert.pem
+
+cargo run -p thoth-mesh-node -- --addr 127.0.0.1:49501 --peer 127.0.0.1:49500 \
+  --tls-cert node-b-cert.pem --tls-key node-b-key.pem --tls-ca ca-cert.pem
+```
+
+A node dialing another node always presents its own cert (a peer
+dialing a peer identifies itself) and always verifies the far end's,
+so both sides above need real, CA-signed identities — there's no
+"TLS with only one side configured" for a peer link.
+
+The CLI only needs `--tls-ca` to talk to a TLS-enabled node — it
+verifies the node's cert, same as any TLS client, but doesn't need to
+prove its own identity (nothing enforces client identity yet, see
+[docs/ROADMAP.md](ROADMAP.md) Phase 7):
+
+```sh
+cargo run -p thoth-mesh-cli -- --addr 127.0.0.1:49500 --tls-ca ca-cert.pem \
+  subscribe demo.topic
+```
+
 ## Logging
 
 Both binaries use `tracing`. Control verbosity with `RUST_LOG`
@@ -168,14 +222,13 @@ its output is just what it prints for the command you ran.
 
 Worth knowing before running this anywhere that matters:
 
-- **No TLS, no authentication.** Every connection — client or peer —
-  is plaintext TCP, and any connection can claim any `PeerId`. Don't
-  expose a node's port beyond a trusted network. See
+- **No authentication.** TLS ([above](#tls)) is available but opt-in,
+  and even with it on, any connection can still claim any `PeerId` —
+  nothing ties the `sender` field to a connection's TLS identity yet,
+  and there's no allowlisting of which peers/clients are allowed to
+  join. Without TLS, every connection is plaintext TCP; don't expose a
+  node's port beyond a trusted network either way. See
   [docs/ROADMAP.md](ROADMAP.md) Phase 7.
-- **Static peer configuration.** `--peer` is the only way to join a
-  mesh; there's no discovery, and a node doesn't learn about peers
-  beyond the ones it or its peers were explicitly told about. See
-  [docs/ROADMAP.md](ROADMAP.md) Phase 6.
 - **No persistence.** A `Publish` reaches whoever is subscribed at
   that moment; nothing is stored for a subscriber that connects
   later, and there's no message replay. See

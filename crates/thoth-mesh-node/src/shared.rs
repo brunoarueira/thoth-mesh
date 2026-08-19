@@ -8,6 +8,7 @@ use std::sync::Arc;
 use thoth_mesh::{Interest, Membership, PeerDirectory};
 use thoth_mesh_broker::Broker;
 use thoth_mesh_core::PeerId;
+use thoth_mesh_tls::{TlsAcceptor, TlsConnector};
 use tokio::sync::mpsc;
 
 use crate::metrics::Metrics;
@@ -15,7 +16,7 @@ use crate::peer_links::PeerLinks;
 
 /// Everything a connection task needs beyond its own socket and
 /// whatever it learns from the peer on the other end.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Shared {
     pub broker: Arc<Broker>,
     pub membership: Membership,
@@ -31,6 +32,34 @@ pub struct Shared {
     /// worth auto-dialing. `peering::spawn_discovery_dialer` owns the
     /// receiving end. Not read from directly outside `connection.rs`.
     pub(crate) discovered_tx: mpsc::UnboundedSender<String>,
+    /// TLS config for the accept side, if TLS is enabled (see
+    /// ADR-0016). `None` - the default - means every accepted
+    /// connection stays plaintext, unchanged from before this ADR.
+    pub tls_acceptor: Option<Arc<TlsAcceptor>>,
+    /// TLS config for the dial side, if TLS is enabled. Always
+    /// presents this node's own identity when set (a peer dialing a
+    /// peer always identifies itself) - see ADR-0016.
+    pub tls_connector: Option<Arc<TlsConnector>>,
+}
+
+// Hand-rolled rather than derived: `TlsAcceptor`/`TlsConnector` don't
+// implement `Debug` (and printing TLS config wouldn't be useful even
+// if they did) - report only whether each is set.
+impl std::fmt::Debug for Shared {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Shared")
+            .field("broker", &self.broker)
+            .field("membership", &self.membership)
+            .field("interest", &self.interest)
+            .field("peer_links", &self.peer_links)
+            .field("node_id", &self.node_id)
+            .field("my_listen_addr", &self.my_listen_addr)
+            .field("metrics", &self.metrics)
+            .field("discover", &self.discover)
+            .field("tls_acceptor", &self.tls_acceptor.is_some())
+            .field("tls_connector", &self.tls_connector.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Shared {
@@ -66,6 +95,8 @@ impl Shared {
             metrics: Metrics::new(),
             discover: PeerDirectory::new(),
             discovered_tx,
+            tls_acceptor: None,
+            tls_connector: None,
         };
         (shared, discovered_rx)
     }

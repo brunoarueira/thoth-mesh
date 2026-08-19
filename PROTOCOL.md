@@ -9,9 +9,10 @@ For the reasoning behind these choices, see
 CBOR), [ADR-0008](docs/adr/0008-generic-async-framing.md) (async
 framing), [ADR-0009](docs/adr/0009-peer-handshake-shared-port.md) (the
 peer handshake), [ADR-0011](docs/adr/0011-interest-propagation-and-loop-prevention.md)
-(interest propagation and loop prevention), and
+(interest propagation and loop prevention),
 [ADR-0015](docs/adr/0015-dynamic-peer-discovery-gossip.md) (peer
-discovery via gossip).
+discovery via gossip), and
+[ADR-0016](docs/adr/0016-tls-transport-security.md) (TLS).
 
 **Status:** version 1, and explicitly unstable — see ADR-0014. Nothing
 here should be assumed to hold across a breaking change; check
@@ -27,8 +28,15 @@ connection and issues `Subscribe`/`Publish`/`Unsubscribe` on it for as
 long as it wants to stay connected, and a peer link stays open
 indefinitely once it's up.
 
-There is currently no TLS and no authentication at any layer — see
-[docs/ROADMAP.md](docs/ROADMAP.md) Phase 7.
+TLS is optional (see [ADR-0016](docs/adr/0016-tls-transport-security.md))
+and, when enabled, wraps the connection *underneath* everything
+below — framing, the envelope, and every message kind are unchanged
+either way, since a `MaybeTlsStream` looks like a plain byte stream to
+everything above it. There is still no authentication of what a
+`sender` value claims to be beyond TLS's own certificate verification
+— see [docs/ROADMAP.md](docs/ROADMAP.md) Phase 7 for peer
+authentication/allowlisting (#47) and per-topic authorization (#62),
+neither of which TLS alone provides.
 
 ## Framing
 
