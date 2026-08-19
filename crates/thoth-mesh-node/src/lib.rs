@@ -14,7 +14,10 @@
 //! to any other node reachable through the mesh, not just directly
 //! peered ones. Peers are similarly gossiped between links, so a node
 //! also discovers and dials peers it was never directly configured
-//! with (see ADR-0015).
+//! with (see ADR-0015). Connections are plaintext by default; passing
+//! a [`TlsConfig`] to the `_with_tls` variants of `run`/`serve`/
+//! `spawn` layers TLS underneath, transparently to everything above
+//! (see ADR-0016).
 
 pub mod connection;
 pub mod metrics;
@@ -22,31 +25,54 @@ mod metrics_server;
 mod peer_links;
 mod peering;
 mod shared;
+mod tls_config;
 
 use std::sync::Arc;
 
 use thoth_mesh_core::PeerId;
+use thoth_mesh_tls::MaybeTlsStream;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
 pub use shared::Shared;
 pub use thoth_mesh::{Interest, Membership, PeerDirectory};
 pub use thoth_mesh_core::DEFAULT_ADDR;
+pub use tls_config::TlsConfig;
 
 /// Binds `addr` and serves connections until an unrecoverable listener
 /// error occurs, dialing each of `seed_peers` in the background. If
 /// `metrics_addr` is given, also binds it and serves a Prometheus
 /// scrape endpoint there in the background (see ADR-0013) - with no
 /// `metrics_addr`, no second port is opened and nothing changes.
+///
+/// Every connection is plaintext - see [`run_with_tls`] to enable TLS
+/// (ADR-0016).
 pub async fn run(
     addr: &str,
     seed_peers: Vec<String>,
     metrics_addr: Option<String>,
 ) -> std::io::Result<()> {
+    run_with_tls(addr, seed_peers, metrics_addr, None).await
+}
+
+/// Like [`run`], but with TLS enabled when `tls` is given (ADR-0016).
+/// `None` - what [`run`] always passes - keeps every connection
+/// plaintext, unchanged from before this ADR.
+pub async fn run_with_tls(
+    addr: &str,
+    seed_peers: Vec<String>,
+    metrics_addr: Option<String>,
+    tls: Option<TlsConfig>,
+) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr).await?;
     let node_id = PeerId::new();
     let my_listen_addr = listener.local_addr().ok().map(|addr| addr.to_string());
-    let (shared, discovered_rx) = Shared::new_with_discovery(node_id, my_listen_addr);
+    let (mut shared, discovered_rx) = Shared::new_with_discovery(node_id, my_listen_addr);
+    if let Some(tls) = tls {
+        let (acceptor, connector) = tls.build()?;
+        shared.tls_acceptor = Some(acceptor);
+        shared.tls_connector = Some(connector);
+    }
     tokio::spawn(peering::spawn_discovery_dialer(
         discovered_rx,
         shared.clone(),
@@ -77,11 +103,27 @@ pub async fn run(
 /// Split out from [`run`] so tests can bind an ephemeral port (`:0`)
 /// and read back the actual bound address before serving. Doesn't
 /// serve metrics - only [`run`], the daemon binary's entry point,
-/// does that.
+/// does that. Plaintext only - see [`serve_with_tls`] for TLS
+/// (ADR-0016).
 pub async fn serve(listener: TcpListener, seed_peers: Vec<String>) -> std::io::Result<()> {
+    serve_with_tls(listener, seed_peers, None).await
+}
+
+/// Like [`serve`], but with TLS enabled when `tls` is given - see
+/// [`run_with_tls`].
+pub async fn serve_with_tls(
+    listener: TcpListener,
+    seed_peers: Vec<String>,
+    tls: Option<TlsConfig>,
+) -> std::io::Result<()> {
     let node_id = PeerId::new();
     let my_listen_addr = listener.local_addr().ok().map(|addr| addr.to_string());
-    let (shared, discovered_rx) = Shared::new_with_discovery(node_id, my_listen_addr);
+    let (mut shared, discovered_rx) = Shared::new_with_discovery(node_id, my_listen_addr);
+    if let Some(tls) = tls {
+        let (acceptor, connector) = tls.build()?;
+        shared.tls_acceptor = Some(acceptor);
+        shared.tls_connector = Some(connector);
+    }
     tokio::spawn(peering::spawn_discovery_dialer(
         discovered_rx,
         shared.clone(),
@@ -106,11 +148,29 @@ pub struct Node {
 /// Like [`serve`], but returns immediately with a [`Node`] instead of
 /// only once the (non-terminating) accept loop errors out - so tests
 /// can query membership, or abort a `peer_dials` entry to simulate
-/// that peer disappearing, while the node keeps running.
+/// that peer disappearing, while the node keeps running. Plaintext
+/// only - see [`spawn_with_tls`] for TLS (ADR-0016).
 pub fn spawn(listener: TcpListener, seed_peers: Vec<String>) -> Node {
+    spawn_with_tls(listener, seed_peers, None)
+        .expect("plaintext spawn (tls: None) never fails building TLS config")
+}
+
+/// Like [`spawn`], but with TLS enabled when `tls` is given - see
+/// [`run_with_tls`]. Fails only if `tls` is given and its
+/// certs/key/CA don't load or don't build into a valid config.
+pub fn spawn_with_tls(
+    listener: TcpListener,
+    seed_peers: Vec<String>,
+    tls: Option<TlsConfig>,
+) -> std::io::Result<Node> {
     let node_id = PeerId::new();
     let my_listen_addr = listener.local_addr().ok().map(|addr| addr.to_string());
-    let (shared, discovered_rx) = Shared::new_with_discovery(node_id, my_listen_addr);
+    let (mut shared, discovered_rx) = Shared::new_with_discovery(node_id, my_listen_addr);
+    if let Some(tls) = tls {
+        let (acceptor, connector) = tls.build()?;
+        shared.tls_acceptor = Some(acceptor);
+        shared.tls_connector = Some(connector);
+    }
     tokio::spawn(peering::spawn_discovery_dialer(
         discovered_rx,
         shared.clone(),
@@ -119,13 +179,13 @@ pub fn spawn(listener: TcpListener, seed_peers: Vec<String>) -> Node {
     let discover = shared.discover.clone();
     let peer_dials = peering::spawn_seed_peers(seed_peers, shared.clone());
     let accept_loop = tokio::spawn(accept_loop(listener, shared));
-    Node {
+    Ok(Node {
         id: node_id,
         membership,
         discover,
         accept_loop,
         peer_dials,
-    }
+    })
 }
 
 /// Test-only helpers, shared between this crate's own unit tests and
@@ -170,6 +230,20 @@ async fn accept_loop(listener: TcpListener, shared: Shared) -> std::io::Result<(
         tracing::debug!(%peer_addr, "accepted connection");
         let shared = shared.clone();
         tokio::spawn(async move {
+            // TLS, if enabled, wraps every accepted connection before
+            // anything else touches it - client or peer alike, since
+            // which this is isn't known until a Hello arrives, over
+            // an already-secured stream if TLS is on (ADR-0016).
+            let socket = match &shared.tls_acceptor {
+                Some(acceptor) => match MaybeTlsStream::accept(acceptor, socket).await {
+                    Ok(socket) => socket,
+                    Err(err) => {
+                        tracing::warn!(%err, %peer_addr, "TLS handshake failed, dropping connection");
+                        return;
+                    }
+                },
+                None => MaybeTlsStream::Plain(socket),
+            };
             connection::handle_connection(socket, shared, None).await;
         });
     }

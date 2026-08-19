@@ -21,6 +21,7 @@ thoth-mesh, using the format described in
 | [0013](0013-metrics-hand-rolled-prometheus-exposition.md) | Metrics: hand-rolled Prometheus text exposition, opt-in port |
 | [0014](0014-release-readiness-versioning-and-republish.md) | Release readiness: lockstep versioning, unstable protocol, republish all five crates |
 | [0015](0015-dynamic-peer-discovery-gossip.md) | Dynamic peer discovery via gossip |
+| [0016](0016-tls-transport-security.md) | TLS on peer and client connections |
 
 To add a new one, copy the format of an existing ADR, number it
 sequentially, and set its status to `Accepted` once the decision is

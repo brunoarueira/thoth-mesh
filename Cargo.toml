@@ -4,6 +4,7 @@ members = [
     "crates/thoth-mesh-core",
     "crates/thoth-mesh",
     "crates/thoth-mesh-broker",
+    "crates/thoth-mesh-tls",
     "crates/thoth-mesh-node",
     "crates/thoth-mesh-cli",
 ]

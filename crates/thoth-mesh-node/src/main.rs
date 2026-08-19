@@ -1,6 +1,9 @@
 //! `thoth-mesh-node`: the daemon that runs a thoth-mesh node.
 
+use std::path::PathBuf;
+
 use clap::Parser;
+use thoth_mesh_node::TlsConfig;
 use tracing_subscriber::EnvFilter;
 
 /// Daemon that runs a thoth-mesh node: wires the local pub/sub broker
@@ -26,6 +29,21 @@ struct Cli {
     /// unless this is given.
     #[arg(long)]
     metrics_addr: Option<String>,
+
+    /// This node's TLS certificate (PEM). Requires --tls-key and
+    /// --tls-ca too - TLS is off (plaintext, as before) unless all
+    /// three are given. See ADR-0016 and docs/OPERATIONS.md.
+    #[arg(long, requires_all = ["tls_key", "tls_ca"])]
+    tls_cert: Option<PathBuf>,
+
+    /// This node's TLS private key (PEM). See --tls-cert.
+    #[arg(long, requires_all = ["tls_cert", "tls_ca"])]
+    tls_key: Option<PathBuf>,
+
+    /// CA certificate (PEM) this node trusts to verify anyone else's
+    /// TLS certificate. See --tls-cert.
+    #[arg(long, requires_all = ["tls_cert", "tls_key"])]
+    tls_ca: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -41,5 +59,12 @@ async fn main() -> std::io::Result<()> {
         .unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
-    thoth_mesh_node::run(&cli.addr, cli.peers, cli.metrics_addr).await
+    // clap's requires_all already enforces all-or-nothing across the
+    // three flags; this just assembles them once that's guaranteed.
+    let tls = match (cli.tls_cert, cli.tls_key, cli.tls_ca) {
+        (Some(cert), Some(key), Some(ca)) => Some(TlsConfig { cert, key, ca }),
+        _ => None,
+    };
+
+    thoth_mesh_node::run_with_tls(&cli.addr, cli.peers, cli.metrics_addr, tls).await
 }

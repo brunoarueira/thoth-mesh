@@ -6,8 +6,11 @@
 //! commands are deferred until the node actually has an admin
 //! protocol to talk to.
 
+use std::path::PathBuf;
+
 use clap::{Parser, Subcommand};
 use thoth_mesh_core::{Envelope, MessageKind, PeerId, Topic, async_framing};
+use thoth_mesh_tls::{MaybeTlsStream, TlsConnector, client_config, load_certs, load_private_key};
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncReadCompatExt};
 
@@ -19,6 +22,23 @@ pub struct Cli {
     /// Node address to connect to.
     #[arg(long, global = true, default_value = DEFAULT_ADDR)]
     pub addr: String,
+
+    /// CA certificate (PEM) to trust for verifying the node's TLS
+    /// certificate. Enables TLS for this connection - without it, the
+    /// connection is plaintext, as before. See ADR-0016.
+    #[arg(long, global = true)]
+    pub tls_ca: Option<PathBuf>,
+
+    /// This client's own TLS certificate (PEM), to identify itself to
+    /// the node. Optional even with --tls-ca set - a plain client has
+    /// nothing to prove an identity for yet (see issue #62). Requires
+    /// --tls-key.
+    #[arg(long, global = true, requires = "tls_key")]
+    pub tls_cert: Option<PathBuf>,
+
+    /// This client's own TLS private key (PEM). See --tls-cert.
+    #[arg(long, global = true, requires = "tls_cert")]
+    pub tls_key: Option<PathBuf>,
 
     #[command(subcommand)]
     pub command: Command,
@@ -49,7 +69,14 @@ pub async fn run(cli: Cli) -> std::io::Result<()> {
     };
     let topic = parse_topic(topic_arg)?;
 
-    let stream = TcpStream::connect(&cli.addr).await?;
+    let connector = build_connector(&cli)?;
+    let tcp = TcpStream::connect(&cli.addr).await?;
+    let stream = match &connector {
+        Some(connector) => MaybeTlsStream::connect(connector, tcp, &cli.addr)
+            .await
+            .map_err(std::io::Error::other)?,
+        None => MaybeTlsStream::Plain(tcp),
+    };
     let mut conn = stream.compat();
     let sender = PeerId::new();
 
@@ -71,7 +98,7 @@ pub async fn run(cli: Cli) -> std::io::Result<()> {
 /// Sends a `Subscribe` for `topic`, waits for its ack, then prints
 /// each delivered message until interrupted (Ctrl-C).
 async fn subscribe_and_print(
-    conn: &mut Compat<TcpStream>,
+    conn: &mut Compat<MaybeTlsStream>,
     sender: PeerId,
     topic: Topic,
 ) -> std::io::Result<()> {
@@ -98,7 +125,7 @@ fn print_if_publish(envelope: Envelope) {
 /// factored out so tests can drive it directly without simulating
 /// Ctrl-C or capturing stdout.
 async fn subscribe(
-    conn: &mut Compat<TcpStream>,
+    conn: &mut Compat<MaybeTlsStream>,
     sender: PeerId,
     topic: Topic,
 ) -> std::io::Result<()> {
@@ -113,6 +140,30 @@ async fn subscribe(
     }
 }
 
+/// Builds this connection's TLS connector from `cli`'s `--tls-*`
+/// flags, if `--tls-ca` was given - `None` (plaintext, as before)
+/// otherwise. `--tls-cert`/`--tls-key`, if also given, are presented
+/// as this client's own identity; clap's `requires` already enforces
+/// they're both-or-neither. See ADR-0016.
+fn build_connector(cli: &Cli) -> std::io::Result<Option<TlsConnector>> {
+    let Some(ca_path) = &cli.tls_ca else {
+        return Ok(None);
+    };
+    let to_io =
+        |err: thoth_mesh_tls::TlsError| std::io::Error::new(std::io::ErrorKind::InvalidInput, err);
+
+    let ca = load_certs(ca_path).map_err(to_io)?;
+    let identity = match (&cli.tls_cert, &cli.tls_key) {
+        (Some(cert_path), Some(key_path)) => Some((
+            load_certs(cert_path).map_err(to_io)?,
+            load_private_key(key_path).map_err(to_io)?,
+        )),
+        _ => None,
+    };
+    let config = client_config(ca, identity).map_err(to_io)?;
+    Ok(Some(TlsConnector::from(std::sync::Arc::new(config))))
+}
+
 fn parse_topic(s: &str) -> std::io::Result<Topic> {
     s.parse().map_err(|err| {
         std::io::Error::new(
@@ -122,7 +173,7 @@ fn parse_topic(s: &str) -> std::io::Result<Topic> {
     })
 }
 
-async fn send(conn: &mut Compat<TcpStream>, envelope: &Envelope) -> std::io::Result<()> {
+async fn send(conn: &mut Compat<MaybeTlsStream>, envelope: &Envelope) -> std::io::Result<()> {
     let bytes = envelope
         .to_bytes()
         .map_err(|err| std::io::Error::other(err.to_string()))?;
@@ -131,7 +182,7 @@ async fn send(conn: &mut Compat<TcpStream>, envelope: &Envelope) -> std::io::Res
         .map_err(|err| std::io::Error::other(err.to_string()))
 }
 
-async fn recv(conn: &mut Compat<TcpStream>) -> std::io::Result<Envelope> {
+async fn recv(conn: &mut Compat<MaybeTlsStream>) -> std::io::Result<Envelope> {
     let bytes = async_framing::read_frame(conn)
         .await
         .map_err(|err| std::io::Error::other(err.to_string()))?;
@@ -157,8 +208,9 @@ mod tests {
         addr
     }
 
-    async fn connect(addr: std::net::SocketAddr) -> Compat<TcpStream> {
-        TcpStream::connect(addr).await.unwrap().compat()
+    async fn connect(addr: std::net::SocketAddr) -> Compat<MaybeTlsStream> {
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        MaybeTlsStream::Plain(tcp).compat()
     }
 
     #[tokio::test]
@@ -178,6 +230,9 @@ mod tests {
         // The CLI's own public entry point, run against the same node.
         let cli = Cli {
             addr: addr.to_string(),
+            tls_ca: None,
+            tls_cert: None,
+            tls_key: None,
             command: Command::Publish {
                 topic: "weather.updates".into(),
                 payload: "sunny".into(),

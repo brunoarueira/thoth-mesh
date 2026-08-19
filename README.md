@@ -23,6 +23,7 @@ This is a Cargo workspace:
 | [`thoth-mesh-core`](crates/thoth-mesh-core) | lib | Core protocol types and wire format shared by everything else. |
 | [`thoth-mesh-broker`](crates/thoth-mesh-broker) | lib | In-process pub/sub dispatch: per-topic broadcast to subscribers. |
 | [`thoth-mesh`](crates/thoth-mesh) | lib | Federation/gossip layer: peer discovery, membership, replication. |
+| [`thoth-mesh-tls`](crates/thoth-mesh-tls) | lib | TLS transport helpers: certificate loading, config, and a plaintext/TLS stream shim. |
 | [`thoth-mesh-node`](crates/thoth-mesh-node) | bin | Daemon that runs a mesh node over a network transport. |
 | [`thoth-mesh-cli`](crates/thoth-mesh-cli) | bin | Command-line client (`thoth-mesh` binary) for publishing, subscribing, and admin. |
 

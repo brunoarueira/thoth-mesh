@@ -21,6 +21,7 @@ path = "src/main.rs"
 thoth-mesh-core = { path = "../thoth-mesh-core", version = "0.1.0", features = ["async"] }
 thoth-mesh = { path = "../thoth-mesh", version = "0.1.0" }
 thoth-mesh-broker = { path = "../thoth-mesh-broker", version = "0.1.0" }
+thoth-mesh-tls = { path = "../thoth-mesh-tls", version = "0.1.0" }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "macros", "time"] }
 tokio-util = { version = "0.7.19", features = ["compat"] }
 tracing = "0.1.44"
@@ -28,4 +29,5 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 clap = { version = "4.6.6", features = ["derive"] }
 
 [dev-dependencies]
+rcgen = "0.13"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "macros", "test-util", "time"] }

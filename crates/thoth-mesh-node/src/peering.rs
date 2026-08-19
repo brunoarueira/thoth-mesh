@@ -8,6 +8,7 @@
 use std::time::Duration;
 
 use thoth_mesh::dial_handshake;
+use thoth_mesh_tls::MaybeTlsStream;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -98,12 +99,25 @@ fn next_backoff(previous: Duration, connection_uptime: Duration) -> Duration {
 async fn dial_peer(peer_addr: String, shared: Shared) {
     let span = tracing::info_span!("peer", addr = %peer_addr);
     async move {
-        let stream = match TcpStream::connect(&peer_addr).await {
+        let tcp = match TcpStream::connect(&peer_addr).await {
             Ok(stream) => stream,
             Err(err) => {
                 tracing::warn!(%err, "failed to connect to seed peer");
                 return;
             }
+        };
+        // A peer dialing another peer always identifies itself - the
+        // same cert/key this node uses to identify itself on accept
+        // - and always verifies the far end's server cert (ADR-0016).
+        let stream = match &shared.tls_connector {
+            Some(connector) => match MaybeTlsStream::connect(connector, tcp, &peer_addr).await {
+                Ok(stream) => stream,
+                Err(err) => {
+                    tracing::warn!(%err, "TLS handshake with seed peer failed");
+                    return;
+                }
+            },
+            None => MaybeTlsStream::Plain(tcp),
         };
         let mut conn = stream.compat();
 

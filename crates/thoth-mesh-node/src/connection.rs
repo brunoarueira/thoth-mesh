@@ -12,8 +12,8 @@ use thoth_mesh::{Interest, PeerDirectory, PeerInfo};
 use thoth_mesh_broker::Broker;
 use thoth_mesh_core::async_framing;
 use thoth_mesh_core::{Envelope, FramingError, MessageKind, PeerAdvert, PeerId, Topic};
-use tokio::net::TcpStream;
-use tokio::net::tcp::OwnedWriteHalf;
+use thoth_mesh_tls::MaybeTlsStream;
+use tokio::io::{WriteHalf, split};
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -43,7 +43,11 @@ const OUTGOING_CHANNEL_CAPACITY: usize = 64;
 /// becoming usable for interest propagation (ADR-0011) are meant to
 /// be one and the same moment, not two that could race apart under
 /// scheduling delay.
-pub async fn handle_connection(socket: TcpStream, shared: Shared, initial_peer: Option<PeerInfo>) {
+pub async fn handle_connection(
+    socket: MaybeTlsStream,
+    shared: Shared,
+    initial_peer: Option<PeerInfo>,
+) {
     let peer_addr = socket.peer_addr().ok();
     let span = tracing::info_span!("connection", peer = ?peer_addr);
     async move {
@@ -53,7 +57,7 @@ pub async fn handle_connection(socket: TcpStream, shared: Shared, initial_peer: 
     .await
 }
 
-async fn run_connection(socket: TcpStream, shared: Shared, initial_peer: Option<PeerInfo>) {
+async fn run_connection(socket: MaybeTlsStream, shared: Shared, initial_peer: Option<PeerInfo>) {
     let Shared {
         broker,
         membership,
@@ -64,8 +68,10 @@ async fn run_connection(socket: TcpStream, shared: Shared, initial_peer: Option<
         metrics,
         discover,
         discovered_tx,
+        tls_acceptor: _,
+        tls_connector: _,
     } = shared;
-    let (reader, writer) = socket.into_split();
+    let (reader, writer) = split(socket);
     let mut reader = reader.compat();
     let mut writer = writer.compat_write();
     let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<Arc<Envelope>>(OUTGOING_CHANNEL_CAPACITY);
@@ -360,7 +366,10 @@ fn is_clean_disconnect(err: &FramingError) -> bool {
     matches!(err, FramingError::Io(io_err) if io_err.kind() == ErrorKind::UnexpectedEof)
 }
 
-async fn send_envelope(writer: &mut Compat<OwnedWriteHalf>, envelope: &Envelope) -> bool {
+async fn send_envelope(
+    writer: &mut Compat<WriteHalf<MaybeTlsStream>>,
+    envelope: &Envelope,
+) -> bool {
     match envelope.to_bytes() {
         Ok(bytes) => async_framing::write_frame(writer, &bytes).await.is_ok(),
         Err(_) => false,
