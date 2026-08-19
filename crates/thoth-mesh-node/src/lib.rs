@@ -12,7 +12,9 @@
 //! back around a cyclic mesh are dropped rather than redelivered (see
 //! ADR-0011) - so a publish on one node reaches subscribers connected
 //! to any other node reachable through the mesh, not just directly
-//! peered ones.
+//! peered ones. Peers are similarly gossiped between links, so a node
+//! also discovers and dials peers it was never directly configured
+//! with (see ADR-0015).
 
 pub mod connection;
 pub mod metrics;
@@ -28,7 +30,7 @@ use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
 pub use shared::Shared;
-pub use thoth_mesh::{Interest, Membership};
+pub use thoth_mesh::{Interest, Membership, PeerDirectory};
 pub use thoth_mesh_core::DEFAULT_ADDR;
 
 /// Binds `addr` and serves connections until an unrecoverable listener
@@ -44,7 +46,11 @@ pub async fn run(
     let listener = TcpListener::bind(addr).await?;
     let node_id = PeerId::new();
     let my_listen_addr = listener.local_addr().ok().map(|addr| addr.to_string());
-    let shared = Shared::new(node_id, my_listen_addr);
+    let (shared, discovered_rx) = Shared::new_with_discovery(node_id, my_listen_addr);
+    tokio::spawn(peering::spawn_discovery_dialer(
+        discovered_rx,
+        shared.clone(),
+    ));
 
     if let Some(metrics_addr) = metrics_addr {
         let metrics_listener = TcpListener::bind(&metrics_addr).await?;
@@ -75,7 +81,11 @@ pub async fn run(
 pub async fn serve(listener: TcpListener, seed_peers: Vec<String>) -> std::io::Result<()> {
     let node_id = PeerId::new();
     let my_listen_addr = listener.local_addr().ok().map(|addr| addr.to_string());
-    let shared = Shared::new(node_id, my_listen_addr);
+    let (shared, discovered_rx) = Shared::new_with_discovery(node_id, my_listen_addr);
+    tokio::spawn(peering::spawn_discovery_dialer(
+        discovered_rx,
+        shared.clone(),
+    ));
     peering::spawn_seed_peers(seed_peers, shared.clone());
     accept_loop(listener, shared).await
 }
@@ -86,6 +96,9 @@ pub async fn serve(listener: TcpListener, seed_peers: Vec<String>) -> std::io::R
 pub struct Node {
     pub id: PeerId,
     pub membership: Membership,
+    /// Every peer this node has learned a dialable address for, via
+    /// direct handshake or gossip (see ADR-0015).
+    pub discover: PeerDirectory,
     pub accept_loop: JoinHandle<std::io::Result<()>>,
     pub peer_dials: Vec<JoinHandle<()>>,
 }
@@ -97,13 +110,19 @@ pub struct Node {
 pub fn spawn(listener: TcpListener, seed_peers: Vec<String>) -> Node {
     let node_id = PeerId::new();
     let my_listen_addr = listener.local_addr().ok().map(|addr| addr.to_string());
-    let shared = Shared::new(node_id, my_listen_addr);
+    let (shared, discovered_rx) = Shared::new_with_discovery(node_id, my_listen_addr);
+    tokio::spawn(peering::spawn_discovery_dialer(
+        discovered_rx,
+        shared.clone(),
+    ));
     let membership = shared.membership.clone();
+    let discover = shared.discover.clone();
     let peer_dials = peering::spawn_seed_peers(seed_peers, shared.clone());
     let accept_loop = tokio::spawn(accept_loop(listener, shared));
     Node {
         id: node_id,
         membership,
+        discover,
         accept_loop,
         peer_dials,
     }

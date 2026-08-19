@@ -556,6 +556,31 @@ async fn loop_prevention_stops_a_publish_from_bouncing_forever() {
 }
 
 #[tokio::test]
+async fn gossip_discovers_a_peer_of_a_peer_and_dials_it() {
+    // A - B - C, a chain: A and C are only ever configured with B as
+    // a seed peer, never with each other. Gossip (ADR-0015) should
+    // teach each of them about the other through B, and one side
+    // should auto-dial the other so they end up directly connected
+    // too - not just reachable transitively through B.
+    let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_a = listener_a.local_addr().unwrap();
+    let node_a = thoth_mesh_node::spawn(listener_a, Vec::new());
+
+    let listener_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_b = listener_b.local_addr().unwrap();
+    let node_b = thoth_mesh_node::spawn(listener_b, vec![addr_a.to_string()]);
+
+    let listener_c = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let node_c = thoth_mesh_node::spawn(listener_c, vec![addr_b.to_string()]);
+
+    eventually(|| node_a.membership.is_reachable(node_b.id)).await;
+    eventually(|| node_b.membership.is_reachable(node_c.id)).await;
+
+    eventually(|| node_a.membership.is_reachable(node_c.id)).await;
+    eventually(|| node_c.membership.is_reachable(node_a.id)).await;
+}
+
+#[tokio::test]
 async fn malformed_frame_closes_connection() {
     let addr = spawn_test_node().await;
     let mut client = connect(addr).await;

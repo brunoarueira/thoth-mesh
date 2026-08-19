@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use thoth_mesh::dial_handshake;
 use tokio::net::TcpStream;
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::compat::TokioAsyncReadCompatExt;
@@ -40,6 +41,23 @@ pub fn spawn_seed_peers(seed_peers: Vec<String>, shared: Shared) -> Vec<JoinHand
         .into_iter()
         .map(|peer_addr| tokio::spawn(dial_peer_with_reconnect(peer_addr, shared.clone())))
         .collect()
+}
+
+/// Spawns one background task per address received on
+/// `discovered_rx` - each an ordinary [`dial_peer_with_reconnect`]
+/// loop, the same as a configured seed peer gets, just triggered by
+/// gossip instead of `--peer` (see ADR-0015). Runs until
+/// `discovered_rx`'s sender (`Shared::discovered_tx`) is dropped,
+/// which only happens when every clone of `Shared` holding it does -
+/// i.e. never, for a live node.
+pub async fn spawn_discovery_dialer(
+    mut discovered_rx: mpsc::UnboundedReceiver<String>,
+    shared: Shared,
+) {
+    while let Some(peer_addr) = discovered_rx.recv().await {
+        tracing::info!(addr = %peer_addr, "dialing peer discovered via gossip");
+        tokio::spawn(dial_peer_with_reconnect(peer_addr, shared.clone()));
+    }
 }
 
 /// Wraps [`dial_peer`] in an unending retry loop: a seed peer is

@@ -20,6 +20,7 @@ thoth-mesh, using the format described in
 | [0012](0012-peer-reconnect-backoff.md) | Reconnect with exponential backoff for dropped peer links |
 | [0013](0013-metrics-hand-rolled-prometheus-exposition.md) | Metrics: hand-rolled Prometheus text exposition, opt-in port |
 | [0014](0014-release-readiness-versioning-and-republish.md) | Release readiness: lockstep versioning, unstable protocol, republish all five crates |
+| [0015](0015-dynamic-peer-discovery-gossip.md) | Dynamic peer discovery via gossip |
 
 To add a new one, copy the format of an existing ADR, number it
 sequentially, and set its status to `Accepted` once the decision is
