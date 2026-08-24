@@ -10,6 +10,11 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
+# ring is already pulled in transitively via rustls/tokio-rustls's
+# "ring" feature below - declared directly too so this crate can use
+# ring::digest for peer certificate fingerprinting (ADR-0017) without
+# adding a new dependency to the build.
+ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
 # PEM loading uses rustls-pki-types::pem::PemObject directly rather
 # than rustls-pemfile - the latter is unmaintained as of late 2025

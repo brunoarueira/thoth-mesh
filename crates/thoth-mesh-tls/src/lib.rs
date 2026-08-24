@@ -13,6 +13,7 @@
 //! side ([`client_config`]) always verifies the far end's server cert
 //! against the CA, and optionally presents its own identity.
 
+mod fingerprint;
 mod stream;
 
 use std::io;
@@ -24,6 +25,7 @@ use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 
+pub use fingerprint::{ParseFingerprintError, fingerprint, fingerprint_hex, parse_fingerprint};
 pub use stream::MaybeTlsStream;
 pub use tokio_rustls::{TlsAcceptor, TlsConnector};
 

@@ -193,6 +193,44 @@ cargo run -p thoth-mesh-cli -- --addr 127.0.0.1:49500 --tls-ca ca-cert.pem \
   subscribe demo.topic
 ```
 
+### Peer allowlist
+
+TLS alone doesn't restrict *which* certificates get to link as a peer
+— by default, any connection presenting a cert this node's CA
+recognizes (or none at all, on the accept side) is accepted as a peer
+the moment it sends `Hello`. `--allow-peer` closes that gap (see
+[ADR-0017](adr/0017-peer-allowlist-via-tls-fingerprint.md)): repeat it
+once per peer certificate this node should accept a link from,
+identified by its SHA-256 fingerprint. Off by default — with no
+`--allow-peer` given, every peer link is allowed, same as before this
+flag existed.
+
+```sh
+# Get node B's fingerprint, to allow it on node A.
+openssl x509 -in node-b-cert.pem -noout -fingerprint -sha256
+# sha256 Fingerprint=3F:08:CA:D2:92:03:BB:AA:B8:DD:92:32:33:8B:BD:0E:F8:E6:D9:E4:70:27:87:4E:51:D3:24:6E:CC:1A:92:10
+```
+
+`--allow-peer` accepts that output verbatim, pasted in as-is:
+
+```sh
+cargo run -p thoth-mesh-node -- --addr 127.0.0.1:49500 \
+  --tls-cert node-a-cert.pem --tls-key node-a-key.pem --tls-ca ca-cert.pem \
+  --allow-peer "sha256 Fingerprint=3F:08:CA:D2:92:03:BB:AA:B8:DD:92:32:33:8B:BD:0E:F8:E6:D9:E4:70:27:87:4E:51:D3:24:6E:CC:1A:92:10"
+```
+
+Requires `--tls-cert`/`--tls-key`/`--tls-ca` too (a startup error
+otherwise) — there's no verified identity to check without TLS.
+Enforcement is symmetric: it applies whether this node dialed the
+other side or accepted the connection, so a seed peer this node dials
+via `--peer` also needs to be on the allowlist if one is configured.
+A rejected link gets an `Error` envelope explaining why, then the
+connection closes without completing the handshake — it never
+appears in this node's membership. Note that a fingerprint is tied to
+the exact certificate, not the CA that signed it — reissuing a node's
+cert (even from the same CA) means updating every allowlist entry
+that named its old fingerprint.
+
 ## Logging
 
 Both binaries use `tracing`. Control verbosity with `RUST_LOG`
@@ -222,11 +260,13 @@ its output is just what it prints for the command you ran.
 
 Worth knowing before running this anywhere that matters:
 
-- **No authentication.** TLS ([above](#tls)) is available but opt-in,
-  and even with it on, any connection can still claim any `PeerId` —
-  nothing ties the `sender` field to a connection's TLS identity yet,
-  and there's no allowlisting of which peers/clients are allowed to
-  join. Without TLS, every connection is plaintext TCP; don't expose a
+- **No client authentication or authorization.** TLS ([above](#tls))
+  and a [peer allowlist](#peer-allowlist) are both available but
+  opt-in, and even with both on, any connection can still claim any
+  `PeerId` — nothing ties the `sender` field to a connection's TLS
+  identity, and a client (as opposed to a peer link) is never checked
+  against an allowlist or restricted to which topics it can use.
+  Without TLS, every connection is plaintext TCP; don't expose a
   node's port beyond a trusted network either way. See
   [docs/ROADMAP.md](ROADMAP.md) Phase 7.
 - **No persistence.** A `Publish` reaches whoever is subscribed at

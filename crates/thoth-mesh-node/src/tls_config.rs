@@ -1,7 +1,9 @@
 //! Turns `--tls-cert`/`--tls-key`/`--tls-ca` file paths into the
 //! `rustls` configs `Shared` needs for both the accept and dial side.
-//! See ADR-0016.
+//! See ADR-0016. Also carries the parsed `--allow-peer` allowlist, if
+//! any - see ADR-0017.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -17,6 +19,10 @@ pub struct TlsConfig {
     pub cert: PathBuf,
     pub key: PathBuf,
     pub ca: PathBuf,
+    /// Peer certificate fingerprints allowed to link as a peer, parsed
+    /// from `--allow-peer`. `None` means no enforcement - see
+    /// ADR-0017.
+    pub allowed_peers: Option<HashSet<[u8; 32]>>,
 }
 
 impl TlsConfig {
