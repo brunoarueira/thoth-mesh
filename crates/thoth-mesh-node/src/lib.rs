@@ -69,9 +69,11 @@ pub async fn run_with_tls(
     let my_listen_addr = listener.local_addr().ok().map(|addr| addr.to_string());
     let (mut shared, discovered_rx) = Shared::new_with_discovery(node_id, my_listen_addr);
     if let Some(tls) = tls {
+        let allowed_peers = tls.allowed_peers.clone();
         let (acceptor, connector) = tls.build()?;
         shared.tls_acceptor = Some(acceptor);
         shared.tls_connector = Some(connector);
+        shared.allowed_peers = allowed_peers.map(Arc::new);
     }
     tokio::spawn(peering::spawn_discovery_dialer(
         discovered_rx,
@@ -120,9 +122,11 @@ pub async fn serve_with_tls(
     let my_listen_addr = listener.local_addr().ok().map(|addr| addr.to_string());
     let (mut shared, discovered_rx) = Shared::new_with_discovery(node_id, my_listen_addr);
     if let Some(tls) = tls {
+        let allowed_peers = tls.allowed_peers.clone();
         let (acceptor, connector) = tls.build()?;
         shared.tls_acceptor = Some(acceptor);
         shared.tls_connector = Some(connector);
+        shared.allowed_peers = allowed_peers.map(Arc::new);
     }
     tokio::spawn(peering::spawn_discovery_dialer(
         discovered_rx,
@@ -167,9 +171,11 @@ pub fn spawn_with_tls(
     let my_listen_addr = listener.local_addr().ok().map(|addr| addr.to_string());
     let (mut shared, discovered_rx) = Shared::new_with_discovery(node_id, my_listen_addr);
     if let Some(tls) = tls {
+        let allowed_peers = tls.allowed_peers.clone();
         let (acceptor, connector) = tls.build()?;
         shared.tls_acceptor = Some(acceptor);
         shared.tls_connector = Some(connector);
+        shared.allowed_peers = allowed_peers.map(Arc::new);
     }
     tokio::spawn(peering::spawn_discovery_dialer(
         discovered_rx,

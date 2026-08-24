@@ -1,5 +1,6 @@
 //! `thoth-mesh-node`: the daemon that runs a thoth-mesh node.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use clap::Parser;
@@ -44,6 +45,14 @@ struct Cli {
     /// TLS certificate. See --tls-cert.
     #[arg(long, requires_all = ["tls_cert", "tls_key"])]
     tls_ca: Option<PathBuf>,
+
+    /// SHA-256 fingerprint (as printed by `openssl x509 -fingerprint
+    /// -sha256`) of a peer certificate allowed to link as a peer.
+    /// Repeatable. Requires --tls-cert/--tls-key/--tls-ca too - with
+    /// none given, every peer link is allowed, unchanged from before
+    /// this flag existed. See ADR-0017 and docs/OPERATIONS.md.
+    #[arg(long = "allow-peer", requires = "tls_cert")]
+    allow_peer: Vec<String>,
 }
 
 #[tokio::main]
@@ -59,10 +68,32 @@ async fn main() -> std::io::Result<()> {
         .unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
-    // clap's requires_all already enforces all-or-nothing across the
-    // three flags; this just assembles them once that's guaranteed.
+    let allowed_peers = if cli.allow_peer.is_empty() {
+        None
+    } else {
+        let mut fingerprints = HashSet::new();
+        for raw in &cli.allow_peer {
+            let fingerprint = thoth_mesh_tls::parse_fingerprint(raw).map_err(|err| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("--allow-peer {raw:?}: {err}"),
+                )
+            })?;
+            fingerprints.insert(fingerprint);
+        }
+        Some(fingerprints)
+    };
+
+    // clap's requires_all/requires already enforces all-or-nothing
+    // across the three TLS flags (and that --allow-peer needs them
+    // too); this just assembles them once that's guaranteed.
     let tls = match (cli.tls_cert, cli.tls_key, cli.tls_ca) {
-        (Some(cert), Some(key), Some(ca)) => Some(TlsConfig { cert, key, ca }),
+        (Some(cert), Some(key), Some(ca)) => Some(TlsConfig {
+            cert,
+            key,
+            ca,
+            allowed_peers,
+        }),
         _ => None,
     };
 

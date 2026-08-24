@@ -3,6 +3,7 @@
 //! growing every function signature that threads state through. See
 //! ADR-0011.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use thoth_mesh::{Interest, Membership, PeerDirectory};
@@ -40,6 +41,12 @@ pub struct Shared {
     /// presents this node's own identity when set (a peer dialing a
     /// peer always identifies itself) - see ADR-0016.
     pub tls_connector: Option<Arc<TlsConnector>>,
+    /// Peer certificate fingerprints allowed to link as a peer,
+    /// `--allow-peer` (repeatable). `None` - the default - means
+    /// unchanged behavior: no allowlist enforcement, same as before
+    /// this ADR. `Some` (including an empty set) enforces on every
+    /// peer link regardless of which side dialed. See ADR-0017.
+    pub allowed_peers: Option<Arc<HashSet<[u8; 32]>>>,
 }
 
 // Hand-rolled rather than derived: `TlsAcceptor`/`TlsConnector` don't
@@ -58,6 +65,10 @@ impl std::fmt::Debug for Shared {
             .field("discover", &self.discover)
             .field("tls_acceptor", &self.tls_acceptor.is_some())
             .field("tls_connector", &self.tls_connector.is_some())
+            .field(
+                "allowed_peers",
+                &self.allowed_peers.as_ref().map(|set| set.len()),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -97,6 +108,7 @@ impl Shared {
             discovered_tx,
             tls_acceptor: None,
             tls_connector: None,
+            allowed_peers: None,
         };
         (shared, discovered_rx)
     }

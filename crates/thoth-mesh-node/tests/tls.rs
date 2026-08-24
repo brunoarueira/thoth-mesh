@@ -4,6 +4,7 @@
 //! `TlsConfig` takes file paths, matching how an operator would
 //! configure it for real (see docs/OPERATIONS.md).
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -39,8 +40,16 @@ impl TestCa {
     }
 
     /// Issues a leaf identity for `127.0.0.1` (every node in these
-    /// tests listens there) and writes out a full [`TlsConfig`].
+    /// tests listens there) and writes out a full [`TlsConfig`], with
+    /// no `--allow-peer` enforcement (see [`TestCa::issue_allowing`]
+    /// for that).
     fn issue(&self) -> TlsConfig {
+        self.issue_allowing(None)
+    }
+
+    /// Like [`TestCa::issue`], but with `allowed_peers` as the
+    /// resulting `TlsConfig`'s allowlist (ADR-0017).
+    fn issue_allowing(&self, allowed_peers: impl Into<Option<HashSet<[u8; 32]>>>) -> TlsConfig {
         let leaf_key = KeyPair::generate().unwrap();
         let leaf_params = CertificateParams::new(vec!["127.0.0.1".to_string()]).unwrap();
         let leaf_cert = leaf_params
@@ -50,8 +59,17 @@ impl TestCa {
             cert: write_temp("cert", &leaf_cert.pem()),
             key: write_temp("key", &leaf_key.serialize_pem()),
             ca: self.ca_path.clone(),
+            allowed_peers: allowed_peers.into(),
         }
     }
+}
+
+/// The fingerprint (ADR-0017) of the leaf certificate `config` was
+/// [`TestCa::issue`]d with - what an `--allow-peer` entry for it would
+/// have to contain.
+fn fingerprint_of(config: &TlsConfig) -> [u8; 32] {
+    let certs = thoth_mesh_tls::load_certs(&config.cert).unwrap();
+    thoth_mesh_tls::fingerprint(&certs[0])
 }
 
 fn write_temp(label: &str, pem: &str) -> PathBuf {
@@ -66,11 +84,51 @@ fn write_temp(label: &str, pem: &str) -> PathBuf {
 }
 
 async fn connect_tls(addr: SocketAddr, ca: &TlsConfig) -> Compat<MaybeTlsStream> {
+    connect_tls_as(addr, ca, None).await
+}
+
+/// Like [`connect_tls`], but presents `identity` as this connection's
+/// own client certificate when given - what a real peer link's dial
+/// side always does (ADR-0016), and what an ADR-0017 allowlist test
+/// needs to control directly, without going through a whole
+/// [`thoth_mesh_node::spawn_with_tls`] node to produce one.
+async fn connect_tls_as(
+    addr: SocketAddr,
+    ca: &TlsConfig,
+    identity: Option<&TlsConfig>,
+) -> Compat<MaybeTlsStream> {
+    let identity = identity.map(|id| {
+        (
+            thoth_mesh_tls::load_certs(&id.cert).unwrap(),
+            thoth_mesh_tls::load_private_key(&id.key).unwrap(),
+        )
+    });
     let connector = thoth_mesh_tls::TlsConnector::from(std::sync::Arc::new(
-        thoth_mesh_tls::client_config(thoth_mesh_tls::load_certs(&ca.ca).unwrap(), None).unwrap(),
+        thoth_mesh_tls::client_config(thoth_mesh_tls::load_certs(&ca.ca).unwrap(), identity)
+            .unwrap(),
     ));
     let tcp = TcpStream::connect(addr).await.unwrap();
     MaybeTlsStream::connect(&connector, tcp, &addr.to_string())
+        .await
+        .unwrap()
+        .compat()
+}
+
+/// Accepts one connection on `listener`, completing the TLS handshake
+/// as the server side using `identity`. Stands in for a real peer's
+/// accept side without going through a whole
+/// [`thoth_mesh_node::spawn_with_tls`] node - just enough to test what
+/// a dialing node does when *it's* the one enforcing an allowlist
+/// (ADR-0017).
+async fn accept_tls(listener: &TcpListener, identity: &TlsConfig) -> Compat<MaybeTlsStream> {
+    let cert = thoth_mesh_tls::load_certs(&identity.cert).unwrap();
+    let key = thoth_mesh_tls::load_private_key(&identity.key).unwrap();
+    let ca = thoth_mesh_tls::load_certs(&identity.ca).unwrap();
+    let acceptor = thoth_mesh_tls::TlsAcceptor::from(std::sync::Arc::new(
+        thoth_mesh_tls::server_config(cert, key, ca).unwrap(),
+    ));
+    let (tcp, _) = listener.accept().await.unwrap();
+    MaybeTlsStream::accept(&acceptor, tcp)
         .await
         .unwrap()
         .compat()
@@ -162,4 +220,124 @@ async fn two_tls_nodes_federate_and_a_tls_client_publishes_and_subscribes() {
             }
         }
     }
+}
+
+/// ADR-0017: with `--allow-peer` (a `TlsConfig::allowed_peers`)
+/// configured on both sides and each naming the other's fingerprint,
+/// federation still works exactly as it does with no allowlist at all
+/// - enforcement doesn't get in the way of a peer it's actually
+/// supposed to allow.
+#[tokio::test]
+async fn two_tls_nodes_federate_with_a_mutual_allowlist() {
+    let ca = TestCa::new();
+
+    let mut node_a_identity = ca.issue();
+    let mut node_b_identity = ca.issue();
+    node_a_identity.allowed_peers = Some(HashSet::from([fingerprint_of(&node_b_identity)]));
+    node_b_identity.allowed_peers = Some(HashSet::from([fingerprint_of(&node_a_identity)]));
+
+    let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_a = listener_a.local_addr().unwrap();
+    let node_a =
+        thoth_mesh_node::spawn_with_tls(listener_a, Vec::new(), Some(node_a_identity)).unwrap();
+
+    let listener_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let node_b = thoth_mesh_node::spawn_with_tls(
+        listener_b,
+        vec![addr_a.to_string()],
+        Some(node_b_identity),
+    )
+    .unwrap();
+
+    eventually(|| node_b.membership.is_reachable(node_a.id)).await;
+    eventually(|| node_a.membership.is_reachable(node_b.id)).await;
+}
+
+/// ADR-0017, accept side: a connection presenting a CA-signed but
+/// unlisted certificate gets a `MessageKind::Error` referencing its
+/// `Hello`, then the connection is closed - it never becomes a
+/// registered peer link.
+#[tokio::test]
+async fn accept_side_rejects_an_unlisted_peer_certificate() {
+    let ca = TestCa::new();
+
+    // Node A's allowlist names a fingerprint that belongs to nobody in
+    // this test, so any peer that dials in is rejected regardless of
+    // how legitimate its certificate otherwise is.
+    let node_a_identity = ca.issue_allowing(HashSet::from([[0u8; 32]]));
+
+    let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_a = listener_a.local_addr().unwrap();
+    let node_a =
+        thoth_mesh_node::spawn_with_tls(listener_a, Vec::new(), Some(node_a_identity)).unwrap();
+
+    // Dial in "as a peer": a real, CA-signed identity (so the TLS
+    // handshake itself succeeds), then a Hello, exactly what a real
+    // peer link's first message looks like.
+    let peer_identity = ca.issue();
+    let peer_id = thoth_mesh_core::PeerId::new();
+    let mut conn = connect_tls_as(addr_a, &peer_identity, Some(&peer_identity)).await;
+    let hello = Envelope::new(peer_id, MessageKind::Hello { listen_addr: None });
+    send(&mut conn, &hello).await;
+
+    match recv(&mut conn).await.kind {
+        MessageKind::Error { in_reply_to, .. } => assert_eq!(in_reply_to, Some(hello.id)),
+        other => panic!("expected an Error, got {other:?}"),
+    }
+
+    // No Hello reply follows - the connection closes instead.
+    let closed = timeout(TEST_TIMEOUT, async_framing::read_frame(&mut conn)).await;
+    assert!(
+        closed.unwrap().is_err(),
+        "connection should have closed after the rejection"
+    );
+    assert!(!node_a.membership.is_reachable(peer_id));
+}
+
+/// ADR-0017, dial side: a node dialing a seed peer whose certificate
+/// isn't on its own allowlist rejects the link itself, symmetrically
+/// with the accept side - the same `Error`-then-close, and the link
+/// never registers, even though this node is the one that dialed.
+#[tokio::test]
+async fn dial_side_rejects_an_unlisted_seed_peer_certificate() {
+    let ca = TestCa::new();
+
+    // A raw TLS peer, standing in for a real thoth-mesh-node peer,
+    // that the node under test will dial as a seed peer.
+    let raw_peer_identity = ca.issue();
+    let raw_peer_fingerprint = fingerprint_of(&raw_peer_identity);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let raw_peer_addr = listener.local_addr().unwrap();
+
+    // The dialing node's allowlist doesn't include the raw peer's
+    // fingerprint.
+    assert_ne!(raw_peer_fingerprint, [0u8; 32]);
+    let dialer_identity = ca.issue_allowing(HashSet::from([[0u8; 32]]));
+
+    let dialer = thoth_mesh_node::spawn_with_tls(
+        TcpListener::bind("127.0.0.1:0").await.unwrap(),
+        vec![raw_peer_addr.to_string()],
+        Some(dialer_identity),
+    )
+    .unwrap();
+
+    let mut conn = accept_tls(&listener, &raw_peer_identity).await;
+    let their_hello = recv(&mut conn).await;
+    assert!(matches!(their_hello.kind, MessageKind::Hello { .. }));
+
+    let raw_peer_id = thoth_mesh_core::PeerId::new();
+    let our_hello = Envelope::new(raw_peer_id, MessageKind::Hello { listen_addr: None });
+    send(&mut conn, &our_hello).await;
+
+    match recv(&mut conn).await.kind {
+        MessageKind::Error { in_reply_to, .. } => assert_eq!(in_reply_to, Some(our_hello.id)),
+        other => panic!("expected an Error, got {other:?}"),
+    }
+
+    let closed = timeout(TEST_TIMEOUT, async_framing::read_frame(&mut conn)).await;
+    assert!(
+        closed.unwrap().is_err(),
+        "connection should have closed after the rejection"
+    );
+    assert!(!dialer.membership.is_reachable(raw_peer_id));
 }

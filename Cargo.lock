@@ -700,6 +700,7 @@ name = "thoth-mesh-tls"
 version = "0.1.0"
 dependencies = [
  "rcgen",
+ "ring",
  "rustls",
  "rustls-pki-types",
  "thiserror",

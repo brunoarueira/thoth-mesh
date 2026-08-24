@@ -4,7 +4,9 @@
 
 use futures_util::io::{AsyncRead, AsyncWrite};
 use thoth_mesh_core::async_framing;
-use thoth_mesh_core::{DecodeError, EncodeError, Envelope, FramingError, MessageKind, PeerId};
+use thoth_mesh_core::{
+    DecodeError, EncodeError, Envelope, FramingError, MessageId, MessageKind, PeerId,
+};
 
 /// A peer's self-reported identity, learned from its `Hello`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -14,6 +16,10 @@ pub struct PeerInfo {
     /// The address other peers should dial to reach this peer, if it
     /// reported one.
     pub listen_addr: Option<String>,
+    /// The `Hello` envelope's own id - what an allowlist rejection
+    /// (ADR-0017) references via `Error { in_reply_to, .. }` if this
+    /// peer turns out not to be allowed.
+    pub hello_id: MessageId,
 }
 
 /// The handshake failed.
@@ -53,6 +59,7 @@ async fn recv_hello<S: AsyncRead + Unpin>(stream: &mut S) -> Result<PeerInfo, Ha
         MessageKind::Hello { listen_addr } => Ok(PeerInfo {
             peer_id: envelope.sender,
             listen_addr,
+            hello_id: envelope.id,
         }),
         other => Err(HandshakeError::UnexpectedMessage(other)),
     }
@@ -143,6 +150,7 @@ mod tests {
                 .unwrap();
             assert_eq!(info.peer_id, their_id);
             assert_eq!(info.listen_addr, Some("127.0.0.1:49501".to_owned()));
+            assert_eq!(info.hello_id, their_hello.id);
 
             // And it actually sent our own Hello, not just consumed
             // the reply.

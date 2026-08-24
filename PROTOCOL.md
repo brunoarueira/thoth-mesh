@@ -11,8 +11,9 @@ framing), [ADR-0009](docs/adr/0009-peer-handshake-shared-port.md) (the
 peer handshake), [ADR-0011](docs/adr/0011-interest-propagation-and-loop-prevention.md)
 (interest propagation and loop prevention),
 [ADR-0015](docs/adr/0015-dynamic-peer-discovery-gossip.md) (peer
-discovery via gossip), and
-[ADR-0016](docs/adr/0016-tls-transport-security.md) (TLS).
+discovery via gossip), [ADR-0016](docs/adr/0016-tls-transport-security.md)
+(TLS), and [ADR-0017](docs/adr/0017-peer-allowlist-via-tls-fingerprint.md)
+(peer certificate allowlisting).
 
 **Status:** version 1, and explicitly unstable — see ADR-0014. Nothing
 here should be assumed to hold across a breaking change; check
@@ -32,11 +33,14 @@ TLS is optional (see [ADR-0016](docs/adr/0016-tls-transport-security.md))
 and, when enabled, wraps the connection *underneath* everything
 below — framing, the envelope, and every message kind are unchanged
 either way, since a `MaybeTlsStream` looks like a plain byte stream to
-everything above it. There is still no authentication of what a
-`sender` value claims to be beyond TLS's own certificate verification
-— see [docs/ROADMAP.md](docs/ROADMAP.md) Phase 7 for peer
-authentication/allowlisting (#47) and per-topic authorization (#62),
-neither of which TLS alone provides.
+everything above it. A peer link's TLS certificate can optionally be
+checked against an `--allow-peer` allowlist (see
+[ADR-0017](docs/adr/0017-peer-allowlist-via-tls-fingerprint.md)), but
+there is still no authentication of what a `sender` value itself
+claims to be — nothing ties an envelope's `sender` field to the
+connection's TLS identity, and client connections have no
+authentication or per-topic authorization at all yet — see
+[docs/ROADMAP.md](docs/ROADMAP.md) Phase 7 (#62).
 
 ## Framing
 
@@ -178,12 +182,16 @@ the reply.
 ```
 
 Reserved for reporting a protocol-level error, optionally in response
-to a specific message. **The reference implementation defines this
-variant but never sends it** — a malformed frame or envelope closes
-the connection outright rather than replying with an `Error`. A
-client should be able to decode and handle receiving one, but
-shouldn't expect one where the current server-side behavior is to
-just drop the connection.
+to a specific message. A malformed frame or envelope still closes the
+connection outright rather than replying with an `Error` — the one
+case the reference implementation does send one is a peer link
+rejected by an `--allow-peer` allowlist
+([ADR-0017](docs/adr/0017-peer-allowlist-via-tls-fingerprint.md)):
+`in_reply_to` names the `Hello` being rejected, and the connection
+closes right after, on either side of the link — whichever side is
+enforcing an allowlist and finds the far end's TLS certificate
+missing or unlisted. A client should be able to decode and handle
+receiving one either way.
 
 ### `Hello`
 
@@ -257,6 +265,14 @@ up (the reference implementation ties this to the underlying TCP
 connect/read behavior). Receiving anything other than a `Hello` as
 the very first message on a freshly dialed connection is a handshake
 failure.
+
+If an `--allow-peer` allowlist is configured (ADR-0017), either side
+may reject the other's `Hello` instead of replying with its own: it
+sends `Error { in_reply_to: <the rejected Hello's id>, .. }` and
+closes the connection without ever completing the handshake. This can
+happen on the dialing side too — a dialed peer's `Hello` reply can
+itself be rejected by the dialer's own allowlist — not only on the
+accepting side.
 
 ## Delivery semantics
 

@@ -4,7 +4,7 @@
 //! peer links (see ADR-0011), and peer addresses learned about, for
 //! discovery (see ADR-0015).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::ErrorKind;
 use std::sync::Arc;
 
@@ -12,7 +12,7 @@ use thoth_mesh::{Interest, PeerDirectory, PeerInfo};
 use thoth_mesh_broker::Broker;
 use thoth_mesh_core::async_framing;
 use thoth_mesh_core::{Envelope, FramingError, MessageKind, PeerAdvert, PeerId, Topic};
-use thoth_mesh_tls::MaybeTlsStream;
+use thoth_mesh_tls::{MaybeTlsStream, fingerprint};
 use tokio::io::{WriteHalf, split};
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
@@ -58,6 +58,15 @@ pub async fn handle_connection(
 }
 
 async fn run_connection(socket: MaybeTlsStream, shared: Shared, initial_peer: Option<PeerInfo>) {
+    // Has to be read off `socket` itself, before it's split below -
+    // the split halves only implement AsyncRead/AsyncWrite, not the
+    // TLS session introspection `peer_certificates` needs. The leaf
+    // cert (what gets fingerprinted) is conventionally first in the
+    // chain a peer presents. See ADR-0017.
+    let peer_fingerprint = socket
+        .peer_certificates()
+        .and_then(|certs| certs.first())
+        .map(fingerprint);
     let Shared {
         broker,
         membership,
@@ -70,6 +79,7 @@ async fn run_connection(socket: MaybeTlsStream, shared: Shared, initial_peer: Op
         discovered_tx,
         tls_acceptor: _,
         tls_connector: _,
+        allowed_peers,
     } = shared;
     let (reader, writer) = split(socket);
     let mut reader = reader.compat();
@@ -85,8 +95,24 @@ async fn run_connection(socket: MaybeTlsStream, shared: Shared, initial_peer: Op
     if let Some(PeerInfo {
         peer_id,
         listen_addr,
+        hello_id,
     }) = initial_peer
     {
+        if !allowlist_permits(&allowed_peers, peer_fingerprint) {
+            tracing::warn!(
+                ?peer_id,
+                "closing connection: peer certificate not on the --allow-peer allowlist"
+            );
+            let error = Envelope::new(
+                node_id,
+                MessageKind::Error {
+                    in_reply_to: Some(hello_id),
+                    message: "peer certificate not on the --allow-peer allowlist".to_owned(),
+                },
+            );
+            let _ = send_envelope(&mut writer, &error).await;
+            return;
+        }
         peer_identity = Some(peer_id);
         membership.mark_connected(peer_id, listen_addr.clone());
         register_peer_link(
@@ -165,6 +191,22 @@ async fn run_connection(socket: MaybeTlsStream, shared: Shared, initial_peer: Op
                             peer_listen_addr = ?listen_addr,
                             "peer said hello"
                         );
+                        if !allowlist_permits(&allowed_peers, peer_fingerprint) {
+                            tracing::warn!(
+                                sender = ?envelope.sender,
+                                "closing connection: peer certificate not on the --allow-peer allowlist"
+                            );
+                            let error = Envelope::new(
+                                node_id,
+                                MessageKind::Error {
+                                    in_reply_to: Some(envelope.id),
+                                    message: "peer certificate not on the --allow-peer allowlist"
+                                        .to_owned(),
+                                },
+                            );
+                            let _ = send_envelope(&mut writer, &error).await;
+                            break;
+                        }
                         peer_identity = Some(envelope.sender);
                         membership.mark_connected(envelope.sender, listen_addr.clone());
                         register_peer_link(
@@ -357,6 +399,21 @@ fn propagate_interest(peer_links: &PeerLinks, node_id: PeerId, topic: Topic, now
         MessageKind::Unsubscribe { topic }
     };
     peer_links.broadcast(Arc::new(Envelope::new(node_id, kind)));
+}
+
+/// Whether a peer link presenting `peer_fingerprint` is allowed to
+/// register, given `allowed_peers`. `None` - no `--allow-peer` given -
+/// permits everything, unchanged from before ADR-0017. A missing
+/// fingerprint (no client certificate presented) never satisfies a
+/// configured allowlist; it just never matches one.
+fn allowlist_permits(
+    allowed_peers: &Option<Arc<HashSet<[u8; 32]>>>,
+    peer_fingerprint: Option<[u8; 32]>,
+) -> bool {
+    match allowed_peers {
+        None => true,
+        Some(allowed) => peer_fingerprint.is_some_and(|fp| allowed.contains(&fp)),
+    }
 }
 
 /// A [`FramingError::Io`] whose kind is `UnexpectedEof` is what a
