@@ -12,8 +12,10 @@ peer handshake), [ADR-0011](docs/adr/0011-interest-propagation-and-loop-preventi
 (interest propagation and loop prevention),
 [ADR-0015](docs/adr/0015-dynamic-peer-discovery-gossip.md) (peer
 discovery via gossip), [ADR-0016](docs/adr/0016-tls-transport-security.md)
-(TLS), and [ADR-0017](docs/adr/0017-peer-allowlist-via-tls-fingerprint.md)
-(peer certificate allowlisting).
+(TLS), [ADR-0017](docs/adr/0017-peer-allowlist-via-tls-fingerprint.md)
+(peer certificate allowlisting), and
+[ADR-0018](docs/adr/0018-per-topic-client-authorization.md) (per-topic
+client authorization).
 
 **Status:** version 1, and explicitly unstable — see ADR-0014. Nothing
 here should be assumed to hold across a breaking change; check
@@ -35,12 +37,15 @@ below — framing, the envelope, and every message kind are unchanged
 either way, since a `MaybeTlsStream` looks like a plain byte stream to
 everything above it. A peer link's TLS certificate can optionally be
 checked against an `--allow-peer` allowlist (see
-[ADR-0017](docs/adr/0017-peer-allowlist-via-tls-fingerprint.md)), but
-there is still no authentication of what a `sender` value itself
-claims to be — nothing ties an envelope's `sender` field to the
-connection's TLS identity, and client connections have no
-authentication or per-topic authorization at all yet — see
-[docs/ROADMAP.md](docs/ROADMAP.md) Phase 7 (#62).
+[ADR-0017](docs/adr/0017-peer-allowlist-via-tls-fingerprint.md)), and
+a client's own certificate (or lack of one) can likewise gate which
+topics it may `Subscribe`/`Publish` to, via `--topic-acl` (see
+[ADR-0018](docs/adr/0018-per-topic-client-authorization.md)). Neither
+authenticates what a `sender` value itself claims to be, though —
+nothing ties an envelope's `sender` field to the connection's TLS
+identity, and there is still no auth at all on the metrics endpoint
+(`--metrics-addr`) or peer-scoped topic restriction — see
+[docs/ROADMAP.md](docs/ROADMAP.md) Phase 7.
 
 ## Framing
 
@@ -138,9 +143,11 @@ compact, but an implementation reading this protocol needs to accept
 what's actually on the wire today.
 
 No reply is sent for a `Publish` — it's fire-and-forget from the
-sender's point of view. See
-[Delivery semantics](#delivery-semantics) for what "published"
-actually guarantees.
+sender's point of view, unless a `--topic-acl`
+([ADR-0018](docs/adr/0018-per-topic-client-authorization.md)) refuses
+it, in which case an `Error` takes the place of the (otherwise absent)
+reply. See [Delivery semantics](#delivery-semantics) for what
+"published" actually guarantees.
 
 ### `Subscribe`
 
@@ -149,7 +156,8 @@ actually guarantees.
 ```
 
 Registers interest in `topic` on this connection. The node replies
-with an `Ack` once registered. Sending `Subscribe` for a topic this
+with an `Ack` once registered, or an `Error` instead if a
+`--topic-acl` refuses it. Sending `Subscribe` for a topic this
 connection is already subscribed to is a no-op (still gets an `Ack`).
 
 ### `Unsubscribe`
@@ -183,15 +191,25 @@ the reply.
 
 Reserved for reporting a protocol-level error, optionally in response
 to a specific message. A malformed frame or envelope still closes the
-connection outright rather than replying with an `Error` — the one
-case the reference implementation does send one is a peer link
-rejected by an `--allow-peer` allowlist
-([ADR-0017](docs/adr/0017-peer-allowlist-via-tls-fingerprint.md)):
-`in_reply_to` names the `Hello` being rejected, and the connection
-closes right after, on either side of the link — whichever side is
-enforcing an allowlist and finds the far end's TLS certificate
-missing or unlisted. A client should be able to decode and handle
-receiving one either way.
+connection outright rather than replying with an `Error`. Two cases
+the reference implementation does send one for:
+
+- A peer link rejected by an `--allow-peer` allowlist
+  ([ADR-0017](docs/adr/0017-peer-allowlist-via-tls-fingerprint.md)):
+  `in_reply_to` names the `Hello` being rejected, and the connection
+  closes right after, on either side of the link — whichever side is
+  enforcing an allowlist and finds the far end's TLS certificate
+  missing or unlisted.
+- A `Subscribe` or `Publish` refused by a `--topic-acl`
+  ([ADR-0018](docs/adr/0018-per-topic-client-authorization.md)):
+  `in_reply_to` names the refused message, and — unlike the peer-link
+  case above — **the connection stays open**. A client denied on one
+  topic may be entitled to others; only a `Subscribe`/`Publish`
+  actually rejected gets an `Error` in place of its usual
+  `Ack`/delivery, nothing else about the connection changes.
+
+A client should be able to decode and handle receiving one either
+way.
 
 ### `Hello`
 

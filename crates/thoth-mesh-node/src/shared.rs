@@ -14,6 +14,7 @@ use tokio::sync::mpsc;
 
 use crate::metrics::Metrics;
 use crate::peer_links::PeerLinks;
+use crate::topic_acl::TopicAcl;
 
 /// Everything a connection task needs beyond its own socket and
 /// whatever it learns from the peer on the other end.
@@ -47,6 +48,12 @@ pub struct Shared {
     /// this ADR. `Some` (including an empty set) enforces on every
     /// peer link regardless of which side dialed. See ADR-0017.
     pub allowed_peers: Option<Arc<HashSet<[u8; 32]>>>,
+    /// Per-topic client publish/subscribe permissions, `--topic-acl`
+    /// (repeatable). `None` - the default - means unchanged behavior:
+    /// any client can publish/subscribe to anything. `Some` enforces
+    /// default-deny for whatever's not explicitly listed, against
+    /// connections not (yet) known to be peer links. See ADR-0018.
+    pub topic_acl: Option<Arc<TopicAcl>>,
 }
 
 // Hand-rolled rather than derived: `TlsAcceptor`/`TlsConnector` don't
@@ -69,6 +76,7 @@ impl std::fmt::Debug for Shared {
                 "allowed_peers",
                 &self.allowed_peers.as_ref().map(|set| set.len()),
             )
+            .field("topic_acl", &self.topic_acl.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -109,6 +117,7 @@ impl Shared {
             tls_acceptor: None,
             tls_connector: None,
             allowed_peers: None,
+            topic_acl: None,
         };
         (shared, discovered_rx)
     }

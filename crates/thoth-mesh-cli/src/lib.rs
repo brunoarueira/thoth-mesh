@@ -30,8 +30,10 @@ pub struct Cli {
     pub tls_ca: Option<PathBuf>,
 
     /// This client's own TLS certificate (PEM), to identify itself to
-    /// the node. Optional even with --tls-ca set - a plain client has
-    /// nothing to prove an identity for yet (see issue #62). Requires
+    /// the node. Optional even with --tls-ca set - a plain client is
+    /// still the `anonymous` principal for any `--topic-acl` on the
+    /// node it's talking to (see ADR-0018), which may or may not be
+    /// enough depending on how that node's configured. Requires
     /// --tls-key.
     #[arg(long, global = true, requires = "tls_key")]
     pub tls_cert: Option<PathBuf>,
@@ -119,7 +121,10 @@ fn print_if_publish(envelope: Envelope) {
     }
 }
 
-/// Sends a `Subscribe` for `topic` and waits for the matching `Ack`.
+/// Sends a `Subscribe` for `topic` and waits for the matching `Ack` -
+/// or, if the node refuses it (e.g. a `--topic-acl`, see ADR-0018),
+/// the matching `Error`, surfaced as an `Err` rather than waiting
+/// forever for an `Ack` that will never come.
 ///
 /// This is the actual protocol logic behind `subscribe_and_print`,
 /// factored out so tests can drive it directly without simulating
@@ -133,9 +138,18 @@ async fn subscribe(
     send(conn, &envelope).await?;
     loop {
         let received = recv(conn).await?;
-        if matches!(&received.kind, MessageKind::Ack { in_reply_to } if *in_reply_to == envelope.id)
-        {
-            return Ok(());
+        match &received.kind {
+            MessageKind::Ack { in_reply_to } if *in_reply_to == envelope.id => return Ok(()),
+            MessageKind::Error {
+                in_reply_to,
+                message,
+            } if *in_reply_to == Some(envelope.id) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    message.clone(),
+                ));
+            }
+            _ => continue,
         }
     }
 }
@@ -300,5 +314,30 @@ mod tests {
     #[test]
     fn parse_topic_rejects_invalid_topics() {
         assert!(parse_topic("").is_err());
+    }
+
+    #[tokio::test]
+    async fn subscribe_returns_an_error_when_the_topic_acl_rejects_it() {
+        // A node with a topic ACL that grants nothing at all for
+        // "secret.topic" - every Subscribe to it is refused (ADR-0018).
+        let acl = thoth_mesh_node::TopicAcl::parse(["anonymous|sub|weather.updates"]).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(thoth_mesh_node::serve_with_tls(
+            listener,
+            Vec::new(),
+            None,
+            Some(acl),
+        ));
+
+        let mut client = connect(addr).await;
+        let err = timeout(
+            TEST_TIMEOUT,
+            subscribe(&mut client, PeerId::new(), "secret.topic".parse().unwrap()),
+        )
+        .await
+        .expect("timed out waiting for the rejection - subscribe() must not hang on an Error")
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
     }
 }

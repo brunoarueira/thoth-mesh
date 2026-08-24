@@ -685,6 +685,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "rcgen",
+ "thiserror",
  "thoth-mesh",
  "thoth-mesh-broker",
  "thoth-mesh-core",
