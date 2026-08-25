@@ -15,6 +15,9 @@ use thoth_mesh_broker::Broker;
 #[derive(Debug, Default, Clone)]
 pub struct Metrics {
     forwarder_lag: Arc<AtomicU64>,
+    /// `Subscribe`/`Publish` attempts refused by a `--topic-acl`
+    /// (ADR-0018). Zero unless one is configured.
+    topic_acl_rejections: Arc<AtomicU64>,
 }
 
 impl Metrics {
@@ -30,8 +33,18 @@ impl Metrics {
         self.forwarder_lag.fetch_add(skipped, Ordering::Relaxed);
     }
 
+    /// Records that a `Subscribe` or `Publish` was refused by a
+    /// `--topic-acl` (ADR-0018).
+    pub fn record_topic_acl_rejection(&self) {
+        self.topic_acl_rejections.fetch_add(1, Ordering::Relaxed);
+    }
+
     fn forwarder_lag_total(&self) -> u64 {
         self.forwarder_lag.load(Ordering::Relaxed)
+    }
+
+    fn topic_acl_rejections_total(&self) -> u64 {
+        self.topic_acl_rejections.load(Ordering::Relaxed)
     }
 }
 
@@ -44,10 +57,13 @@ pub fn render_prometheus(membership: &Membership, broker: &Broker, metrics: &Met
          # TYPE thothmesh_messages_published_total counter\n\
          thothmesh_messages_published_total {}\n\
          # TYPE thothmesh_forwarder_lag_total counter\n\
-         thothmesh_forwarder_lag_total {}\n",
+         thothmesh_forwarder_lag_total {}\n\
+         # TYPE thothmesh_topic_acl_rejections_total counter\n\
+         thothmesh_topic_acl_rejections_total {}\n",
         membership.connected_count(),
         broker.messages_published(),
         metrics.forwarder_lag_total(),
+        metrics.topic_acl_rejections_total(),
     )
 }
 
@@ -64,17 +80,27 @@ mod tests {
     }
 
     #[test]
-    fn render_prometheus_includes_all_three_metrics() {
+    fn record_topic_acl_rejection_accumulates() {
+        let metrics = Metrics::new();
+        metrics.record_topic_acl_rejection();
+        metrics.record_topic_acl_rejection();
+        assert_eq!(metrics.topic_acl_rejections_total(), 2);
+    }
+
+    #[test]
+    fn render_prometheus_includes_all_four_metrics() {
         let membership = Membership::new();
         membership.mark_connected(thoth_mesh_core::PeerId::new(), None);
         let broker = Broker::new();
         let metrics = Metrics::new();
         metrics.record_forwarder_lag(7);
+        metrics.record_topic_acl_rejection();
 
         let rendered = render_prometheus(&membership, &broker, &metrics);
 
         assert!(rendered.contains("thothmesh_peers_connected 1"));
         assert!(rendered.contains("thothmesh_messages_published_total 0"));
         assert!(rendered.contains("thothmesh_forwarder_lag_total 7"));
+        assert!(rendered.contains("thothmesh_topic_acl_rejections_total 1"));
     }
 }

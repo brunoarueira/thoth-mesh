@@ -127,15 +127,19 @@ thothmesh_peers_connected 1
 thothmesh_messages_published_total 1
 # TYPE thothmesh_forwarder_lag_total counter
 thothmesh_forwarder_lag_total 0
+# TYPE thothmesh_topic_acl_rejections_total counter
+thothmesh_topic_acl_rejections_total 0
 ```
 
-Three metrics today (ADR-0013):
+Four metrics today (ADR-0013, plus `topic_acl_rejections_total` added
+by ADR-0018):
 
 | Metric | Type | Meaning |
 | --- | --- | --- |
 | `thothmesh_peers_connected` | gauge | Peer links currently up (not client connections). |
 | `thothmesh_messages_published_total` | counter | `Publish` messages this node has processed since startup. |
 | `thothmesh_forwarder_lag_total` | counter | Envelopes silently dropped because a subscriber's delivery channel fell behind (see [`PROTOCOL.md`](../PROTOCOL.md#delivery-semantics)). Nonzero here means a consumer is too slow, not that the node is misbehaving. |
+| `thothmesh_topic_acl_rejections_total` | counter | `Subscribe`/`Publish` attempts refused by a [`--topic-acl`](#per-topic-client-authorization). Zero unless one is configured. |
 
 Point a Prometheus `scrape_configs` target at `--metrics-addr` the
 same way you would any other exporter; there's no special
@@ -185,11 +189,21 @@ so both sides above need real, CA-signed identities — there's no
 
 The CLI only needs `--tls-ca` to talk to a TLS-enabled node — it
 verifies the node's cert, same as any TLS client, but doesn't need to
-prove its own identity (nothing enforces client identity yet, see
-[docs/ROADMAP.md](ROADMAP.md) Phase 7):
+prove its own identity unless a [topic ACL](#per-topic-client-authorization)
+on the node it's talking to actually checks for one:
 
 ```sh
 cargo run -p thoth-mesh-cli -- --addr 127.0.0.1:49500 --tls-ca ca-cert.pem \
+  subscribe demo.topic
+```
+
+To also present a client certificate (so a `--topic-acl` entry can
+name this specific client rather than falling back to `anonymous`),
+add `--tls-cert`/`--tls-key`, the same flags the node itself uses:
+
+```sh
+cargo run -p thoth-mesh-cli -- --addr 127.0.0.1:49500 --tls-ca ca-cert.pem \
+  --tls-cert client-cert.pem --tls-key client-key.pem \
   subscribe demo.topic
 ```
 
@@ -231,6 +245,48 @@ the exact certificate, not the CA that signed it — reissuing a node's
 cert (even from the same CA) means updating every allowlist entry
 that named its old fingerprint.
 
+### Per-topic client authorization
+
+`--allow-peer` controls who gets to link as a peer at all; it says
+nothing about what a *client* already connected is allowed to
+`Subscribe`/`Publish` to. `--topic-acl` closes that gap (see
+[ADR-0018](adr/0018-per-topic-client-authorization.md)): repeat it
+once per `<principal>|<action>|<topic>` permission this node should
+grant. Off by default — with no `--topic-acl` given, any client can
+publish/subscribe to anything, same as before this flag existed; given
+at least once, only the combinations listed are allowed (everything
+else on a connection not already known to be a peer link is refused).
+
+- `<principal>`: a client certificate's SHA-256 fingerprint (same
+  tolerant formats as `--allow-peer`), or the literal `anonymous` for
+  a client that didn't present one — which is every client when TLS
+  is off entirely, and still an option even with TLS on (ADR-0016
+  never requires a client certificate).
+- `<action>`: `pub`, `sub`, or `pubsub` for both.
+- `<topic>`: an exact topic name — no wildcards.
+
+```sh
+# Anyone (no certificate needed) may subscribe to a public status
+# topic; only a specific, identified client may publish sensor data.
+cargo run -p thoth-mesh-node -- --addr 127.0.0.1:49500 \
+  --tls-cert node-a-cert.pem --tls-key node-a-key.pem --tls-ca ca-cert.pem \
+  --topic-acl "anonymous|sub|status.public" \
+  --topic-acl "3F:08:CA:D2:92:03:BB:AA:B8:DD:92:32:33:8B:BD:0E:F8:E6:D9:E4:70:27:87:4E:51:D3:24:6E:CC:1A:92:10|pub|sensors.data"
+```
+
+Unlike a rejected peer link, a topic ACL rejection doesn't close the
+connection — a client denied on one topic may be entitled to others.
+It gets an `Error` in place of the `Subscribe`'s usual `Ack` (or, for
+a `Publish`, in place of the silence a fire-and-forget message
+normally gets), naming the rejected request, and nothing else about
+the connection changes. Every rejection also bumps
+`thothmesh_topic_acl_rejections_total` (see [Metrics](#metrics)).
+
+Peer traffic (interest propagation over an established peer link) is
+never checked against a `--topic-acl` — it only applies to connections
+not (yet) known to be peer links. Restricting what a peer link itself
+may propagate is a separate, unresolved problem (see the ADR).
+
 ## Logging
 
 Both binaries use `tracing`. Control verbosity with `RUST_LOG`
@@ -260,15 +316,23 @@ its output is just what it prints for the command you ran.
 
 Worth knowing before running this anywhere that matters:
 
-- **No client authentication or authorization.** TLS ([above](#tls))
-  and a [peer allowlist](#peer-allowlist) are both available but
-  opt-in, and even with both on, any connection can still claim any
-  `PeerId` — nothing ties the `sender` field to a connection's TLS
-  identity, and a client (as opposed to a peer link) is never checked
-  against an allowlist or restricted to which topics it can use.
-  Without TLS, every connection is plaintext TCP; don't expose a
-  node's port beyond a trusted network either way. See
-  [docs/ROADMAP.md](ROADMAP.md) Phase 7.
+- **`sender` is still unverified.** TLS ([above](#tls)), a
+  [peer allowlist](#peer-allowlist), and
+  [per-topic client authorization](#per-topic-client-authorization)
+  are all available but opt-in, and even with all three on, any
+  connection can still claim any `PeerId` in an envelope's `sender`
+  field — nothing ties it to the connection's TLS identity. Without
+  TLS, every connection is plaintext TCP; don't expose a node's port
+  beyond a trusted network either way.
+- **The metrics endpoint has no access control at all.**
+  `--metrics-addr` (see [Metrics](#metrics)) doesn't go through TLS or
+  any of the above — anyone who can reach the port gets the current
+  render. Tracked separately (#75).
+- **Peer-scoped topic restriction doesn't exist.**
+  [Per-topic client authorization](#per-topic-client-authorization)
+  only ever applies to a connection not (yet) known to be a peer
+  link — there's no way to restrict what a peer link itself may
+  propagate. See [docs/ROADMAP.md](ROADMAP.md) Phase 7.
 - **No persistence.** A `Publish` reaches whoever is subscribed at
   that moment; nothing is stored for a subscriber that connects
   later, and there's no message replay. See

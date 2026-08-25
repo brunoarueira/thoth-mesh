@@ -157,13 +157,18 @@ async fn two_tls_nodes_federate_and_a_tls_client_publishes_and_subscribes() {
 
     let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr_a = listener_a.local_addr().unwrap();
-    let node_a = thoth_mesh_node::spawn_with_tls(listener_a, Vec::new(), Some(ca.issue())).unwrap();
+    let node_a =
+        thoth_mesh_node::spawn_with_tls(listener_a, Vec::new(), Some(ca.issue()), None).unwrap();
 
     let listener_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr_b = listener_b.local_addr().unwrap();
-    let node_b =
-        thoth_mesh_node::spawn_with_tls(listener_b, vec![addr_a.to_string()], Some(ca.issue()))
-            .unwrap();
+    let node_b = thoth_mesh_node::spawn_with_tls(
+        listener_b,
+        vec![addr_a.to_string()],
+        Some(ca.issue()),
+        None,
+    )
+    .unwrap();
 
     eventually(|| node_b.membership.is_reachable(node_a.id)).await;
     eventually(|| node_a.membership.is_reachable(node_b.id)).await;
@@ -239,13 +244,15 @@ async fn two_tls_nodes_federate_with_a_mutual_allowlist() {
     let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr_a = listener_a.local_addr().unwrap();
     let node_a =
-        thoth_mesh_node::spawn_with_tls(listener_a, Vec::new(), Some(node_a_identity)).unwrap();
+        thoth_mesh_node::spawn_with_tls(listener_a, Vec::new(), Some(node_a_identity), None)
+            .unwrap();
 
     let listener_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let node_b = thoth_mesh_node::spawn_with_tls(
         listener_b,
         vec![addr_a.to_string()],
         Some(node_b_identity),
+        None,
     )
     .unwrap();
 
@@ -269,7 +276,8 @@ async fn accept_side_rejects_an_unlisted_peer_certificate() {
     let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr_a = listener_a.local_addr().unwrap();
     let node_a =
-        thoth_mesh_node::spawn_with_tls(listener_a, Vec::new(), Some(node_a_identity)).unwrap();
+        thoth_mesh_node::spawn_with_tls(listener_a, Vec::new(), Some(node_a_identity), None)
+            .unwrap();
 
     // Dial in "as a peer": a real, CA-signed identity (so the TLS
     // handshake itself succeeds), then a Hello, exactly what a real
@@ -318,6 +326,7 @@ async fn dial_side_rejects_an_unlisted_seed_peer_certificate() {
         TcpListener::bind("127.0.0.1:0").await.unwrap(),
         vec![raw_peer_addr.to_string()],
         Some(dialer_identity),
+        None,
     )
     .unwrap();
 
@@ -340,4 +349,74 @@ async fn dial_side_rejects_an_unlisted_seed_peer_certificate() {
         "connection should have closed after the rejection"
     );
     assert!(!dialer.membership.is_reachable(raw_peer_id));
+}
+
+/// ADR-0018, using a TLS certificate fingerprint as the principal
+/// (rather than `anonymous`, which `tests/topic_acl.rs` already
+/// covers over plain TCP): two different client certificates get two
+/// different outcomes publishing to the same topic, based on which
+/// one a `--topic-acl` entry names.
+#[tokio::test]
+async fn topic_acl_distinguishes_principals_by_certificate_fingerprint() {
+    let ca = TestCa::new();
+    let node_identity = ca.issue();
+    let allowed_client = ca.issue();
+    let other_client = ca.issue();
+
+    let allowed_fingerprint = fingerprint_of(&allowed_client)
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<String>();
+    let acl = thoth_mesh_node::TopicAcl::parse([
+        format!("{allowed_fingerprint}|pub|sensors.data").as_str(),
+        "anonymous|sub|sensors.data",
+    ])
+    .unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    thoth_mesh_node::spawn_with_tls(listener, Vec::new(), Some(node_identity), Some(acl)).unwrap();
+
+    let mut subscriber = connect_tls(addr, &allowed_client).await;
+    let sub = Envelope::new(
+        thoth_mesh_core::PeerId::new(),
+        MessageKind::Subscribe {
+            topic: topic("sensors.data"),
+        },
+    );
+    send(&mut subscriber, &sub).await;
+    assert_eq!(
+        recv(&mut subscriber).await.kind,
+        MessageKind::Ack {
+            in_reply_to: sub.id
+        }
+    );
+
+    // The listed client's publish gets delivered normally.
+    let mut allowed_conn = connect_tls_as(addr, &allowed_client, Some(&allowed_client)).await;
+    let publish = Envelope::new(
+        thoth_mesh_core::PeerId::new(),
+        MessageKind::Publish {
+            topic: topic("sensors.data"),
+            payload: b"42".to_vec(),
+        },
+    );
+    send(&mut allowed_conn, &publish).await;
+    assert_eq!(recv(&mut subscriber).await.id, publish.id);
+
+    // A different, otherwise perfectly valid CA-signed client isn't on
+    // that --topic-acl entry, so its publish is rejected instead.
+    let mut other_conn = connect_tls_as(addr, &other_client, Some(&other_client)).await;
+    let rejected = Envelope::new(
+        thoth_mesh_core::PeerId::new(),
+        MessageKind::Publish {
+            topic: topic("sensors.data"),
+            payload: b"should not arrive".to_vec(),
+        },
+    );
+    send(&mut other_conn, &rejected).await;
+    match recv(&mut other_conn).await.kind {
+        MessageKind::Error { in_reply_to, .. } => assert_eq!(in_reply_to, Some(rejected.id)),
+        other => panic!("expected an Error, got {other:?}"),
+    }
 }

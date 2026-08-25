@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 use clap::Parser;
-use thoth_mesh_node::TlsConfig;
+use thoth_mesh_node::{TlsConfig, TopicAcl};
 use tracing_subscriber::EnvFilter;
 
 /// Daemon that runs a thoth-mesh node: wires the local pub/sub broker
@@ -53,6 +53,16 @@ struct Cli {
     /// this flag existed. See ADR-0017 and docs/OPERATIONS.md.
     #[arg(long = "allow-peer", requires = "tls_cert")]
     allow_peer: Vec<String>,
+
+    /// Per-topic client publish/subscribe permission, shaped
+    /// `<principal>|<action>|<topic>` (principal: a fingerprint like
+    /// --allow-peer's, or "anonymous"; action: "pub", "sub", or
+    /// "pubsub"). Repeatable. With none given, every client can
+    /// publish/subscribe to anything, unchanged from before this flag
+    /// existed; given at least once, only listed combinations are
+    /// allowed. See ADR-0018 and docs/OPERATIONS.md.
+    #[arg(long = "topic-acl")]
+    topic_acl: Vec<String>,
 }
 
 #[tokio::main]
@@ -97,5 +107,17 @@ async fn main() -> std::io::Result<()> {
         _ => None,
     };
 
-    thoth_mesh_node::run_with_tls(&cli.addr, cli.peers, cli.metrics_addr, tls).await
+    let topic_acl = if cli.topic_acl.is_empty() {
+        None
+    } else {
+        let acl = TopicAcl::parse(cli.topic_acl.iter().map(String::as_str)).map_err(|err| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("--topic-acl {err}"),
+            )
+        })?;
+        Some(acl)
+    };
+
+    thoth_mesh_node::run_with_tls(&cli.addr, cli.peers, cli.metrics_addr, tls, topic_acl).await
 }

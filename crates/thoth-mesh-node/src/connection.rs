@@ -23,6 +23,7 @@ use tracing::Instrument;
 use crate::metrics::Metrics;
 use crate::peer_links::PeerLinks;
 use crate::shared::Shared;
+use crate::topic_acl::{Action, Principal, TopicAcl};
 
 const OUTGOING_CHANNEL_CAPACITY: usize = 64;
 
@@ -67,6 +68,10 @@ async fn run_connection(socket: MaybeTlsStream, shared: Shared, initial_peer: Op
         .peer_certificates()
         .and_then(|certs| certs.first())
         .map(fingerprint);
+    // The principal a --topic-acl check (ADR-0018) runs against -
+    // derived from the same fingerprint ADR-0017's allowlist check
+    // uses, no separate introspection needed.
+    let principal = Principal::from_fingerprint(peer_fingerprint);
     let Shared {
         broker,
         membership,
@@ -80,6 +85,7 @@ async fn run_connection(socket: MaybeTlsStream, shared: Shared, initial_peer: Op
         tls_acceptor: _,
         tls_connector: _,
         allowed_peers,
+        topic_acl,
     } = shared;
     let (reader, writer) = split(socket);
     let mut reader = reader.compat();
@@ -151,6 +157,28 @@ async fn run_connection(socket: MaybeTlsStream, shared: Shared, initial_peer: Op
                 match &envelope.kind {
                     MessageKind::Subscribe { topic } => {
                         let topic = topic.clone();
+                        // Client-scoped only (ADR-0018): a connection
+                        // already known to be a peer link skips this
+                        // check entirely - peer-scoped topic
+                        // restriction is a distinct, unresolved
+                        // problem (see the ADR).
+                        if peer_identity.is_none()
+                            && !topic_acl_permits(&topic_acl, principal, &topic, Action::Subscribe)
+                        {
+                            tracing::warn!(sender = ?envelope.sender, %topic, "rejected: not on the --topic-acl allowlist");
+                            metrics.record_topic_acl_rejection();
+                            let error = Envelope::new(
+                                node_id,
+                                MessageKind::Error {
+                                    in_reply_to: Some(envelope.id),
+                                    message: format!("not authorized to subscribe to {topic}"),
+                                },
+                            );
+                            if !send_envelope(&mut writer, &error).await {
+                                break;
+                            }
+                            continue;
+                        }
                         tracing::info!(sender = ?envelope.sender, %topic, "subscribed");
                         let is_new_forwarder = !forwarders.contains_key(&topic);
                         forwarders.entry(topic.clone()).or_insert_with(|| {
@@ -180,6 +208,25 @@ async fn run_connection(socket: MaybeTlsStream, shared: Shared, initial_peer: Op
                     MessageKind::Publish { topic, payload } => {
                         tracing::debug!(sender = ?envelope.sender, %topic, len = payload.len(), "publish");
                         let topic = topic.clone();
+                        // Client-scoped only (ADR-0018) - see the
+                        // Subscribe arm above.
+                        if peer_identity.is_none()
+                            && !topic_acl_permits(&topic_acl, principal, &topic, Action::Publish)
+                        {
+                            tracing::warn!(sender = ?envelope.sender, %topic, "rejected: not on the --topic-acl allowlist");
+                            metrics.record_topic_acl_rejection();
+                            let error = Envelope::new(
+                                node_id,
+                                MessageKind::Error {
+                                    in_reply_to: Some(envelope.id),
+                                    message: format!("not authorized to publish to {topic}"),
+                                },
+                            );
+                            if !send_envelope(&mut writer, &error).await {
+                                break;
+                            }
+                            continue;
+                        }
                         broker.publish(&topic, Arc::new(envelope)).await;
                     }
                     MessageKind::Ack { .. } | MessageKind::Error { .. } => {
@@ -413,6 +460,22 @@ fn allowlist_permits(
     match allowed_peers {
         None => true,
         Some(allowed) => peer_fingerprint.is_some_and(|fp| allowed.contains(&fp)),
+    }
+}
+
+/// Whether `principal` is allowed to perform `action` on `topic`,
+/// given `topic_acl`. `None` - no `--topic-acl` given - permits
+/// everything, unchanged from before ADR-0018. `Some` is default-deny:
+/// only combinations an entry explicitly lists are permitted.
+fn topic_acl_permits(
+    topic_acl: &Option<Arc<TopicAcl>>,
+    principal: Principal,
+    topic: &Topic,
+    action: Action,
+) -> bool {
+    match topic_acl {
+        None => true,
+        Some(acl) => acl.permits(principal, topic, action),
     }
 }
 
