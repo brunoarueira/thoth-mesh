@@ -15,7 +15,8 @@ discovery via gossip), [ADR-0016](docs/adr/0016-tls-transport-security.md)
 (TLS), [ADR-0017](docs/adr/0017-peer-allowlist-via-tls-fingerprint.md)
 (peer certificate allowlisting), and
 [ADR-0018](docs/adr/0018-per-topic-client-authorization.md) (per-topic
-client authorization).
+client authorization). For diagrams of several of these flows, see
+[docs/FLOWS.md](docs/FLOWS.md).
 
 **Status:** version 1, and explicitly unstable — see ADR-0014. Nothing
 here should be assumed to hold across a breaking change; check

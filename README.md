@@ -38,8 +38,10 @@ see [`docs/OPERATIONS.md`](docs/OPERATIONS.md).
 Significant architecture decisions are recorded as ADRs in
 [`docs/adr/`](docs/adr/). For a from-scratch description of the wire
 protocol itself, independent of the Rust implementation, see
-[`PROTOCOL.md`](PROTOCOL.md). For where the project is headed, see
-[`docs/ROADMAP.md`](docs/ROADMAP.md).
+[`PROTOCOL.md`](PROTOCOL.md). For diagrams of the runtime flows that
+are easier to follow as a picture (handshake, gossip, propagation),
+see [`docs/FLOWS.md`](docs/FLOWS.md). For where the project is headed,
+see [`docs/ROADMAP.md`](docs/ROADMAP.md).
 
 ## Contributing
 
