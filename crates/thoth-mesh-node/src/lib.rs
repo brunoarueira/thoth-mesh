@@ -19,7 +19,9 @@
 //! `spawn` layers TLS underneath, transparently to everything above
 //! (see ADR-0016). Those same variants also accept an optional
 //! [`TopicAcl`], for per-topic client publish/subscribe authorization
-//! (see ADR-0018).
+//! (see ADR-0018). [`run`]/[`run_with_tls`] additionally accept an
+//! optional bearer token gating the metrics endpoint, when one is
+//! opened at all (see ADR-0019).
 
 pub mod connection;
 pub mod metrics;
@@ -49,27 +51,32 @@ pub use topic_acl::{Action, Principal, TopicAcl, TopicAclParseError};
 /// scrape endpoint there in the background (see ADR-0013) - with no
 /// `metrics_addr`, no second port is opened and nothing changes.
 ///
-/// Every connection is plaintext and every client can publish/subscribe
-/// to any topic - see [`run_with_tls`] for TLS (ADR-0016) and a
-/// [`TopicAcl`] (ADR-0018).
+/// Every connection is plaintext, every client can publish/subscribe
+/// to any topic, and the metrics endpoint (if any) has no access
+/// control - see [`run_with_tls`] for TLS (ADR-0016), a [`TopicAcl`]
+/// (ADR-0018), and a metrics bearer token (ADR-0019).
 pub async fn run(
     addr: &str,
     seed_peers: Vec<String>,
     metrics_addr: Option<String>,
 ) -> std::io::Result<()> {
-    run_with_tls(addr, seed_peers, metrics_addr, None, None).await
+    run_with_tls(addr, seed_peers, metrics_addr, None, None, None).await
 }
 
-/// Like [`run`], but with TLS enabled when `tls` is given (ADR-0016)
-/// and per-topic client authorization enabled when `topic_acl` is
-/// given (ADR-0018). Either `None` - what [`run`] always passes -
-/// keeps that aspect unchanged from before its ADR.
+/// Like [`run`], but with TLS enabled when `tls` is given (ADR-0016),
+/// per-topic client authorization enabled when `topic_acl` is given
+/// (ADR-0018), and the metrics endpoint gated behind `metrics_token`
+/// when given (ADR-0019). Each `None` - what [`run`] always passes -
+/// keeps that aspect unchanged from before its ADR. `metrics_token`
+/// only has an effect when `metrics_addr` is also given; nothing binds
+/// otherwise.
 pub async fn run_with_tls(
     addr: &str,
     seed_peers: Vec<String>,
     metrics_addr: Option<String>,
     tls: Option<TlsConfig>,
     topic_acl: Option<TopicAcl>,
+    metrics_token: Option<Arc<str>>,
 ) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr).await?;
     let node_id = PeerId::new();
@@ -94,8 +101,14 @@ pub async fn run_with_tls(
         let broker = Arc::clone(&shared.broker);
         let metrics = shared.metrics.clone();
         tokio::spawn(async move {
-            if let Err(err) =
-                metrics_server::serve_metrics(metrics_listener, membership, broker, metrics).await
+            if let Err(err) = metrics_server::serve_metrics(
+                metrics_listener,
+                membership,
+                broker,
+                metrics,
+                metrics_token,
+            )
+            .await
             {
                 tracing::error!(%err, "metrics endpoint failed");
             }

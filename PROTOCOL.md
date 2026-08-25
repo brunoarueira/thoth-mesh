@@ -44,9 +44,12 @@ topics it may `Subscribe`/`Publish` to, via `--topic-acl` (see
 [ADR-0018](docs/adr/0018-per-topic-client-authorization.md)). Neither
 authenticates what a `sender` value itself claims to be, though —
 nothing ties an envelope's `sender` field to the connection's TLS
-identity, and there is still no auth at all on the metrics endpoint
-(`--metrics-addr`) or peer-scoped topic restriction — see
-[docs/ROADMAP.md](docs/ROADMAP.md) Phase 7.
+identity. The metrics endpoint (`--metrics-addr`) is unrelated to this
+port and this TLS layer entirely — it's a separate, plain-HTTP port
+with its own opt-in bearer-token authentication (see
+[ADR-0019](docs/adr/0019-metrics-endpoint-authentication.md) and
+`docs/OPERATIONS.md`). Peer-scoped topic restriction still doesn't
+exist — see [docs/ROADMAP.md](docs/ROADMAP.md) Phase 7.
 
 ## Framing
 
