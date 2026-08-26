@@ -20,7 +20,7 @@ struct Identity {
 /// A throwaway CA, able to issue leaf certs signed by itself.
 struct TestCa {
     cert: rcgen::Certificate,
-    key: KeyPair,
+    issuer: rcgen::Issuer<'static, KeyPair>,
 }
 
 impl TestCa {
@@ -29,7 +29,8 @@ impl TestCa {
         let mut params = CertificateParams::new(Vec::new()).unwrap();
         params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
         let cert = params.self_signed(&key).unwrap();
-        Self { cert, key }
+        let issuer = rcgen::Issuer::new(params, key);
+        Self { cert, issuer }
     }
 
     fn der(&self) -> CertificateDer<'static> {
@@ -41,9 +42,7 @@ impl TestCa {
     fn issue(&self, name: &str) -> Identity {
         let leaf_key = KeyPair::generate().unwrap();
         let leaf_params = CertificateParams::new(vec![name.to_string()]).unwrap();
-        let leaf_cert = leaf_params
-            .signed_by(&leaf_key, &self.cert, &self.key)
-            .unwrap();
+        let leaf_cert = leaf_params.signed_by(&leaf_key, &self.issuer).unwrap();
         Identity {
             cert: leaf_cert.der().clone(),
             key: PrivateKeyDer::Pkcs8(leaf_key.serialize_der().into()),
