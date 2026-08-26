@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::Parser;
 use thoth_mesh_node::{TlsConfig, TopicAcl};
@@ -63,6 +64,15 @@ struct Cli {
     /// allowed. See ADR-0018 and docs/OPERATIONS.md.
     #[arg(long = "topic-acl")]
     topic_acl: Vec<String>,
+
+    /// File containing a shared-secret bearer token a metrics scrape
+    /// must present (as `Authorization: Bearer <token>`) to get the
+    /// render. Requires --metrics-addr - with neither given, no
+    /// metrics port opens at all; with --metrics-addr but no token
+    /// file, any connection to it gets the render, unchanged from
+    /// before this flag existed. See ADR-0019 and docs/OPERATIONS.md.
+    #[arg(long = "metrics-token-file", requires = "metrics_addr")]
+    metrics_token_file: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -119,5 +129,30 @@ async fn main() -> std::io::Result<()> {
         Some(acl)
     };
 
-    thoth_mesh_node::run_with_tls(&cli.addr, cli.peers, cli.metrics_addr, tls, topic_acl).await
+    let metrics_token = match &cli.metrics_token_file {
+        None => None,
+        Some(path) => {
+            let raw = std::fs::read_to_string(path).map_err(|err| {
+                std::io::Error::new(err.kind(), format!("--metrics-token-file {path:?}: {err}"))
+            })?;
+            let token = raw.trim();
+            if token.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("--metrics-token-file {path:?}: file is empty"),
+                ));
+            }
+            Some(Arc::from(token))
+        }
+    };
+
+    thoth_mesh_node::run_with_tls(
+        &cli.addr,
+        cli.peers,
+        cli.metrics_addr,
+        tls,
+        topic_acl,
+        metrics_token,
+    )
+    .await
 }

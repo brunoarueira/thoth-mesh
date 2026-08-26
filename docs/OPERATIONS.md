@@ -129,10 +129,12 @@ thothmesh_messages_published_total 1
 thothmesh_forwarder_lag_total 0
 # TYPE thothmesh_topic_acl_rejections_total counter
 thothmesh_topic_acl_rejections_total 0
+# TYPE thothmesh_metrics_auth_rejections_total counter
+thothmesh_metrics_auth_rejections_total 0
 ```
 
-Four metrics today (ADR-0013, plus `topic_acl_rejections_total` added
-by ADR-0018):
+Five metrics today (ADR-0013, plus `topic_acl_rejections_total` added
+by ADR-0018 and `metrics_auth_rejections_total` added by ADR-0019):
 
 | Metric | Type | Meaning |
 | --- | --- | --- |
@@ -140,10 +142,44 @@ by ADR-0018):
 | `thothmesh_messages_published_total` | counter | `Publish` messages this node has processed since startup. |
 | `thothmesh_forwarder_lag_total` | counter | Envelopes silently dropped because a subscriber's delivery channel fell behind (see [`PROTOCOL.md`](../PROTOCOL.md#delivery-semantics)). Nonzero here means a consumer is too slow, not that the node is misbehaving. |
 | `thothmesh_topic_acl_rejections_total` | counter | `Subscribe`/`Publish` attempts refused by a [`--topic-acl`](#per-topic-client-authorization). Zero unless one is configured. |
+| `thothmesh_metrics_auth_rejections_total` | counter | Scrapes refused by a [`--metrics-token-file`](#metrics-authentication). Zero unless one is configured. |
 
 Point a Prometheus `scrape_configs` target at `--metrics-addr` the
 same way you would any other exporter; there's no special
 `/metrics`-only handling to configure around.
+
+### Metrics authentication
+
+By default, anyone who can reach `--metrics-addr` gets the render —
+this port is plain HTTP and deliberately outside the TLS layer
+described [below](#tls) (ADR-0016 scoped TLS to the client/peer port
+only). `--metrics-token-file` closes that gap with a shared-secret
+bearer token (see [ADR-0019](adr/0019-metrics-endpoint-authentication.md)):
+
+```sh
+echo -n "a-long-random-secret" > metrics-token.txt
+cargo run -p thoth-mesh-node -- --addr 127.0.0.1:49500 \
+  --metrics-addr 127.0.0.1:9090 --metrics-token-file metrics-token.txt
+```
+
+A scrape now needs a matching `Authorization` header:
+
+```sh
+curl -s http://127.0.0.1:9090/metrics                                  # 401 Unauthorized
+curl -s -H "Authorization: Bearer a-long-random-secret" \
+  http://127.0.0.1:9090/metrics                                        # 200 OK, the render
+```
+
+Point Prometheus's `scrape_configs` at the same token with its
+built-in `authorization`/`bearer_token` scrape option — no extra
+client-side TLS setup needed for this port. Requires
+`--metrics-addr` (a startup error otherwise, since a token with no
+metrics port to guard is a no-op). Off by default — with no
+`--metrics-token-file` given, any connection to `--metrics-addr` gets
+the render, same as before this flag existed. Unlike TLS-based auth on
+the main port, this is one shared secret, not a per-scraper identity —
+anyone with the token can scrape, and there's no way to revoke just
+one holder of it.
 
 ## TLS
 
@@ -324,10 +360,13 @@ Worth knowing before running this anywhere that matters:
   field — nothing ties it to the connection's TLS identity. Without
   TLS, every connection is plaintext TCP; don't expose a node's port
   beyond a trusted network either way.
-- **The metrics endpoint has no access control at all.**
-  `--metrics-addr` (see [Metrics](#metrics)) doesn't go through TLS or
-  any of the above — anyone who can reach the port gets the current
-  render. Tracked separately (#75).
+- **The metrics endpoint's authentication, when on, is a single shared
+  secret.** `--metrics-token-file` (see
+  [Metrics authentication](#metrics-authentication)) is opt-in and
+  doesn't go through TLS or either mechanism above — it's one bearer
+  token for the whole endpoint, not a per-scraper identity, and with
+  no token file configured, anyone who can reach the port still gets
+  the current render, same as before ADR-0019.
 - **Peer-scoped topic restriction doesn't exist.**
   [Per-topic client authorization](#per-topic-client-authorization)
   only ever applies to a connection not (yet) known to be a peer
