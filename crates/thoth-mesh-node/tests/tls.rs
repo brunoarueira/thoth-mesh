@@ -24,8 +24,7 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// A throwaway CA, able to issue node identities signed by itself,
 /// each written out as a `TlsConfig`'s three PEM files.
 struct TestCa {
-    cert: rcgen::Certificate,
-    key: KeyPair,
+    issuer: rcgen::Issuer<'static, KeyPair>,
     ca_path: PathBuf,
 }
 
@@ -36,7 +35,8 @@ impl TestCa {
         params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
         let cert = params.self_signed(&key).unwrap();
         let ca_path = write_temp("ca", &cert.pem());
-        Self { cert, key, ca_path }
+        let issuer = rcgen::Issuer::new(params, key);
+        Self { issuer, ca_path }
     }
 
     /// Issues a leaf identity for `127.0.0.1` (every node in these
@@ -52,9 +52,7 @@ impl TestCa {
     fn issue_allowing(&self, allowed_peers: impl Into<Option<HashSet<[u8; 32]>>>) -> TlsConfig {
         let leaf_key = KeyPair::generate().unwrap();
         let leaf_params = CertificateParams::new(vec!["127.0.0.1".to_string()]).unwrap();
-        let leaf_cert = leaf_params
-            .signed_by(&leaf_key, &self.cert, &self.key)
-            .unwrap();
+        let leaf_cert = leaf_params.signed_by(&leaf_key, &self.issuer).unwrap();
         TlsConfig {
             cert: write_temp("cert", &leaf_cert.pem()),
             key: write_temp("key", &leaf_key.serialize_pem()),
