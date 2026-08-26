@@ -326,8 +326,10 @@ mod tests {
         tokio::spawn(thoth_mesh_node::serve_with_tls(
             listener,
             Vec::new(),
-            None,
-            Some(acl),
+            thoth_mesh_node::NodeOptions {
+                topic_acl: Some(acl),
+                ..Default::default()
+            },
         ));
 
         let mut client = connect(addr).await;

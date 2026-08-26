@@ -25,6 +25,7 @@ thoth-mesh, using the format described in
 | [0017](0017-peer-allowlist-via-tls-fingerprint.md) | Peer authentication via TLS certificate fingerprint allowlist |
 | [0018](0018-per-topic-client-authorization.md) | Per-topic client authorization via TLS certificate fingerprint principals |
 | [0019](0019-metrics-endpoint-authentication.md) | Metrics endpoint authentication via shared-secret bearer token |
+| [0020](0020-peer-scoped-topic-restriction.md) | Peer-scoped topic restriction via a second `--peer-topic-acl` list |
 
 To add a new one, copy the format of an existing ADR, number it
 sequentially, and set its status to `Accepted` once the decision is

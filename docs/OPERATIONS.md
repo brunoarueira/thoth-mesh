@@ -131,10 +131,13 @@ thothmesh_forwarder_lag_total 0
 thothmesh_topic_acl_rejections_total 0
 # TYPE thothmesh_metrics_auth_rejections_total counter
 thothmesh_metrics_auth_rejections_total 0
+# TYPE thothmesh_peer_topic_acl_rejections_total counter
+thothmesh_peer_topic_acl_rejections_total 0
 ```
 
-Five metrics today (ADR-0013, plus `topic_acl_rejections_total` added
-by ADR-0018 and `metrics_auth_rejections_total` added by ADR-0019):
+Six metrics today (ADR-0013, plus `topic_acl_rejections_total` added
+by ADR-0018, `metrics_auth_rejections_total` added by ADR-0019, and
+`peer_topic_acl_rejections_total` added by ADR-0020):
 
 | Metric | Type | Meaning |
 | --- | --- | --- |
@@ -143,6 +146,7 @@ by ADR-0018 and `metrics_auth_rejections_total` added by ADR-0019):
 | `thothmesh_forwarder_lag_total` | counter | Envelopes silently dropped because a subscriber's delivery channel fell behind (see [`PROTOCOL.md`](../PROTOCOL.md#delivery-semantics)). Nonzero here means a consumer is too slow, not that the node is misbehaving. |
 | `thothmesh_topic_acl_rejections_total` | counter | `Subscribe`/`Publish` attempts refused by a [`--topic-acl`](#per-topic-client-authorization). Zero unless one is configured. |
 | `thothmesh_metrics_auth_rejections_total` | counter | Scrapes refused by a [`--metrics-token-file`](#metrics-authentication). Zero unless one is configured. |
+| `thothmesh_peer_topic_acl_rejections_total` | counter | `Subscribe`/`Publish` attempts from a peer link refused by a [`--peer-topic-acl`](#peer-scoped-topic-authorization). Zero unless one is configured. |
 
 Point a Prometheus `scrape_configs` target at `--metrics-addr` the
 same way you would any other exporter; there's no special
@@ -320,8 +324,43 @@ the connection changes. Every rejection also bumps
 
 Peer traffic (interest propagation over an established peer link) is
 never checked against a `--topic-acl` — it only applies to connections
-not (yet) known to be peer links. Restricting what a peer link itself
-may propagate is a separate, unresolved problem (see the ADR).
+not (yet) known to be peer links. See
+[Peer-scoped topic authorization](#peer-scoped-topic-authorization) for
+the equivalent applying to a peer link itself.
+
+### Peer-scoped topic authorization
+
+`--topic-acl` never applies to a peer link (a peer relays on behalf of
+however many clients and further peers sit behind it, not for itself);
+`--peer-topic-acl` closes that gap instead (see
+[ADR-0020](adr/0020-peer-scoped-topic-restriction.md)). Same shape,
+same parser, same `anonymous`-or-fingerprint principal, checked
+against a peer's own certificate instead of a client's — but a
+completely independent list: a peer link is never checked against
+`--topic-acl`, and a client is never checked against `--peer-topic-acl`.
+
+- `<action>` means something slightly different here: `sub` permits
+  the peer link to be forwarded the topic (its own `Subscribe`
+  request for it is honored); `pub` permits it to send the topic to
+  this node (its `Publish` is accepted rather than refused).
+- Off by default — with no `--peer-topic-acl` given, every peer link
+  can carry anything, same as before this flag existed.
+
+```sh
+# The peer link at this fingerprint may only carry sensor readings -
+# it can neither ask for anything else forwarded to it, nor publish
+# anything else through this node.
+cargo run -p thoth-mesh-node -- --addr 127.0.0.1:49500 \
+  --tls-cert node-a-cert.pem --tls-key node-a-key.pem --tls-ca ca-cert.pem \
+  --peer-topic-acl "3F:08:CA:D2:92:03:BB:AA:B8:DD:92:32:33:8B:BD:0E:F8:E6:D9:E4:70:27:87:4E:51:D3:24:6E:CC:1A:92:10|pubsub|sensors.data"
+```
+
+Rejection has the same shape as `--topic-acl`'s: an `Error` in place
+of the usual `Ack`/silence, the connection stays open, and every
+rejection bumps `thothmesh_peer_topic_acl_rejections_total` (see
+[Metrics](#metrics)) — kept separate from
+`thothmesh_topic_acl_rejections_total` so a misbehaving peer is
+distinguishable from a misbehaving client at a glance.
 
 ## Logging
 
@@ -367,11 +406,6 @@ Worth knowing before running this anywhere that matters:
   token for the whole endpoint, not a per-scraper identity, and with
   no token file configured, anyone who can reach the port still gets
   the current render, same as before ADR-0019.
-- **Peer-scoped topic restriction doesn't exist.**
-  [Per-topic client authorization](#per-topic-client-authorization)
-  only ever applies to a connection not (yet) known to be a peer
-  link — there's no way to restrict what a peer link itself may
-  propagate. See [docs/ROADMAP.md](ROADMAP.md) Phase 7.
 - **No persistence.** A `Publish` reaches whoever is subscribed at
   that moment; nothing is stored for a subscriber that connects
   later, and there's no message replay. See

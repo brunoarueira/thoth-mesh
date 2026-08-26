@@ -2,7 +2,9 @@
 //! dispatches them to the broker, and forwards broadcast deliveries back
 //! out. See ADR-0007. Also propagates local topic-interest changes to
 //! peer links (see ADR-0011), and peer addresses learned about, for
-//! discovery (see ADR-0015).
+//! discovery (see ADR-0015). `Subscribe`/`Publish` are authorized
+//! against a client-scoped `--topic-acl` (ADR-0018) or a peer-scoped
+//! `--peer-topic-acl` (ADR-0020), whichever applies to the connection.
 
 use std::collections::{HashMap, HashSet};
 use std::io::ErrorKind;
@@ -86,6 +88,7 @@ async fn run_connection(socket: MaybeTlsStream, shared: Shared, initial_peer: Op
         tls_connector: _,
         allowed_peers,
         topic_acl,
+        peer_topic_acl,
     } = shared;
     let (reader, writer) = split(socket);
     let mut reader = reader.compat();
@@ -157,16 +160,26 @@ async fn run_connection(socket: MaybeTlsStream, shared: Shared, initial_peer: Op
                 match &envelope.kind {
                     MessageKind::Subscribe { topic } => {
                         let topic = topic.clone();
-                        // Client-scoped only (ADR-0018): a connection
-                        // already known to be a peer link skips this
-                        // check entirely - peer-scoped topic
-                        // restriction is a distinct, unresolved
-                        // problem (see the ADR).
-                        if peer_identity.is_none()
-                            && !topic_acl_permits(&topic_acl, principal, &topic, Action::Subscribe)
-                        {
-                            tracing::warn!(sender = ?envelope.sender, %topic, "rejected: not on the --topic-acl allowlist");
-                            metrics.record_topic_acl_rejection();
+                        // Client-scoped (ADR-0018) for a connection
+                        // not yet known to be a peer link;
+                        // peer-scoped (ADR-0020) once it is - the two
+                        // lists are independent, and exactly one ever
+                        // applies to a given connection.
+                        let is_peer = peer_identity.is_some();
+                        if !acl_permits(
+                            &topic_acl,
+                            &peer_topic_acl,
+                            is_peer,
+                            principal,
+                            &topic,
+                            Action::Subscribe,
+                        ) {
+                            tracing::warn!(sender = ?envelope.sender, %topic, is_peer, "rejected: not on the configured topic ACL");
+                            if is_peer {
+                                metrics.record_peer_topic_acl_rejection();
+                            } else {
+                                metrics.record_topic_acl_rejection();
+                            }
                             let error = Envelope::new(
                                 node_id,
                                 MessageKind::Error {
@@ -208,13 +221,23 @@ async fn run_connection(socket: MaybeTlsStream, shared: Shared, initial_peer: Op
                     MessageKind::Publish { topic, payload } => {
                         tracing::debug!(sender = ?envelope.sender, %topic, len = payload.len(), "publish");
                         let topic = topic.clone();
-                        // Client-scoped only (ADR-0018) - see the
-                        // Subscribe arm above.
-                        if peer_identity.is_none()
-                            && !topic_acl_permits(&topic_acl, principal, &topic, Action::Publish)
-                        {
-                            tracing::warn!(sender = ?envelope.sender, %topic, "rejected: not on the --topic-acl allowlist");
-                            metrics.record_topic_acl_rejection();
+                        // Client-scoped (ADR-0018) or peer-scoped
+                        // (ADR-0020) - see the Subscribe arm above.
+                        let is_peer = peer_identity.is_some();
+                        if !acl_permits(
+                            &topic_acl,
+                            &peer_topic_acl,
+                            is_peer,
+                            principal,
+                            &topic,
+                            Action::Publish,
+                        ) {
+                            tracing::warn!(sender = ?envelope.sender, %topic, is_peer, "rejected: not on the configured topic ACL");
+                            if is_peer {
+                                metrics.record_peer_topic_acl_rejection();
+                            } else {
+                                metrics.record_topic_acl_rejection();
+                            }
                             let error = Envelope::new(
                                 node_id,
                                 MessageKind::Error {
@@ -477,6 +500,24 @@ fn topic_acl_permits(
         None => true,
         Some(acl) => acl.permits(principal, topic, action),
     }
+}
+
+/// Picks which of the two independent lists applies to this
+/// connection - `topic_acl` (ADR-0018) if it's not (yet) known to be a
+/// peer link, `peer_topic_acl` (ADR-0020) if it is - and checks
+/// `principal`/`topic`/`action` against it via [`topic_acl_permits`].
+/// A client is never checked against `peer_topic_acl`, and a peer link
+/// is never checked against `topic_acl`.
+fn acl_permits(
+    topic_acl: &Option<Arc<TopicAcl>>,
+    peer_topic_acl: &Option<Arc<TopicAcl>>,
+    is_peer: bool,
+    principal: Principal,
+    topic: &Topic,
+    action: Action,
+) -> bool {
+    let acl = if is_peer { peer_topic_acl } else { topic_acl };
+    topic_acl_permits(acl, principal, topic, action)
 }
 
 /// A [`FramingError::Io`] whose kind is `UnexpectedEof` is what a
