@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use rcgen::{CertificateParams, KeyPair};
 use thoth_mesh_core::{Envelope, MessageKind, Topic, async_framing};
-use thoth_mesh_node::TlsConfig;
 use thoth_mesh_node::test_support::eventually;
+use thoth_mesh_node::{NodeOptions, TlsConfig};
 use thoth_mesh_tls::MaybeTlsStream;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
@@ -155,16 +155,25 @@ async fn two_tls_nodes_federate_and_a_tls_client_publishes_and_subscribes() {
 
     let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr_a = listener_a.local_addr().unwrap();
-    let node_a =
-        thoth_mesh_node::spawn_with_tls(listener_a, Vec::new(), Some(ca.issue()), None).unwrap();
+    let node_a = thoth_mesh_node::spawn_with_tls(
+        listener_a,
+        Vec::new(),
+        NodeOptions {
+            tls: Some(ca.issue()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
 
     let listener_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr_b = listener_b.local_addr().unwrap();
     let node_b = thoth_mesh_node::spawn_with_tls(
         listener_b,
         vec![addr_a.to_string()],
-        Some(ca.issue()),
-        None,
+        NodeOptions {
+            tls: Some(ca.issue()),
+            ..Default::default()
+        },
     )
     .unwrap();
 
@@ -241,16 +250,24 @@ async fn two_tls_nodes_federate_with_a_mutual_allowlist() {
 
     let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr_a = listener_a.local_addr().unwrap();
-    let node_a =
-        thoth_mesh_node::spawn_with_tls(listener_a, Vec::new(), Some(node_a_identity), None)
-            .unwrap();
+    let node_a = thoth_mesh_node::spawn_with_tls(
+        listener_a,
+        Vec::new(),
+        NodeOptions {
+            tls: Some(node_a_identity),
+            ..Default::default()
+        },
+    )
+    .unwrap();
 
     let listener_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let node_b = thoth_mesh_node::spawn_with_tls(
         listener_b,
         vec![addr_a.to_string()],
-        Some(node_b_identity),
-        None,
+        NodeOptions {
+            tls: Some(node_b_identity),
+            ..Default::default()
+        },
     )
     .unwrap();
 
@@ -273,9 +290,15 @@ async fn accept_side_rejects_an_unlisted_peer_certificate() {
 
     let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr_a = listener_a.local_addr().unwrap();
-    let node_a =
-        thoth_mesh_node::spawn_with_tls(listener_a, Vec::new(), Some(node_a_identity), None)
-            .unwrap();
+    let node_a = thoth_mesh_node::spawn_with_tls(
+        listener_a,
+        Vec::new(),
+        NodeOptions {
+            tls: Some(node_a_identity),
+            ..Default::default()
+        },
+    )
+    .unwrap();
 
     // Dial in "as a peer": a real, CA-signed identity (so the TLS
     // handshake itself succeeds), then a Hello, exactly what a real
@@ -323,8 +346,10 @@ async fn dial_side_rejects_an_unlisted_seed_peer_certificate() {
     let dialer = thoth_mesh_node::spawn_with_tls(
         TcpListener::bind("127.0.0.1:0").await.unwrap(),
         vec![raw_peer_addr.to_string()],
-        Some(dialer_identity),
-        None,
+        NodeOptions {
+            tls: Some(dialer_identity),
+            ..Default::default()
+        },
     )
     .unwrap();
 
@@ -373,7 +398,16 @@ async fn topic_acl_distinguishes_principals_by_certificate_fingerprint() {
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    thoth_mesh_node::spawn_with_tls(listener, Vec::new(), Some(node_identity), Some(acl)).unwrap();
+    thoth_mesh_node::spawn_with_tls(
+        listener,
+        Vec::new(),
+        NodeOptions {
+            tls: Some(node_identity),
+            topic_acl: Some(acl),
+            ..Default::default()
+        },
+    )
+    .unwrap();
 
     let mut subscriber = connect_tls(addr, &allowed_client).await;
     let sub = Envelope::new(

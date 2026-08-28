@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
-use thoth_mesh_node::{TlsConfig, TopicAcl};
+use thoth_mesh_node::{NodeOptions, TlsConfig, TopicAcl};
 use tracing_subscriber::EnvFilter;
 
 /// Daemon that runs a thoth-mesh node: wires the local pub/sub broker
@@ -65,6 +65,16 @@ struct Cli {
     #[arg(long = "topic-acl")]
     topic_acl: Vec<String>,
 
+    /// Per-topic peer-link publish/subscribe permission, same shape as
+    /// --topic-acl - but checked against a connection already known to
+    /// be a peer link instead of a client, and completely independent
+    /// of --topic-acl (a peer link is never checked against that one,
+    /// and a client is never checked against this one). With none
+    /// given, every peer link can carry anything, unchanged from
+    /// before this flag existed. See ADR-0020 and docs/OPERATIONS.md.
+    #[arg(long = "peer-topic-acl")]
+    peer_topic_acl: Vec<String>,
+
     /// File containing a shared-secret bearer token a metrics scrape
     /// must present (as `Authorization: Bearer <token>`) to get the
     /// render. Requires --metrics-addr - with neither given, no
@@ -117,17 +127,8 @@ async fn main() -> std::io::Result<()> {
         _ => None,
     };
 
-    let topic_acl = if cli.topic_acl.is_empty() {
-        None
-    } else {
-        let acl = TopicAcl::parse(cli.topic_acl.iter().map(String::as_str)).map_err(|err| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("--topic-acl {err}"),
-            )
-        })?;
-        Some(acl)
-    };
+    let topic_acl = parse_topic_acl("--topic-acl", &cli.topic_acl)?;
+    let peer_topic_acl = parse_topic_acl("--peer-topic-acl", &cli.peer_topic_acl)?;
 
     let metrics_token = match &cli.metrics_token_file {
         None => None,
@@ -146,13 +147,33 @@ async fn main() -> std::io::Result<()> {
         }
     };
 
+    let options = NodeOptions {
+        tls,
+        topic_acl,
+        peer_topic_acl,
+    };
+
     thoth_mesh_node::run_with_tls(
         &cli.addr,
         cli.peers,
         cli.metrics_addr,
-        tls,
-        topic_acl,
+        options,
         metrics_token,
     )
     .await
+}
+
+/// Parses a repeatable `<flag> <principal>|<action>|<topic>` list
+/// (`--topic-acl`/`--peer-topic-acl`) into a [`TopicAcl`], or `None`
+/// if `entries` is empty - the "unchanged from before this flag
+/// existed" case both flags share. `flag` is included in a parse
+/// error so it's clear which of the two was invalid.
+fn parse_topic_acl(flag: &str, entries: &[String]) -> std::io::Result<Option<TopicAcl>> {
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    let acl = TopicAcl::parse(entries.iter().map(String::as_str)).map_err(|err| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{flag} {err}"))
+    })?;
+    Ok(Some(acl))
 }

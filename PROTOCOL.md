@@ -15,7 +15,9 @@ discovery via gossip), [ADR-0016](docs/adr/0016-tls-transport-security.md)
 (TLS), [ADR-0017](docs/adr/0017-peer-allowlist-via-tls-fingerprint.md)
 (peer certificate allowlisting), and
 [ADR-0018](docs/adr/0018-per-topic-client-authorization.md) (per-topic
-client authorization). For diagrams of several of these flows, see
+client authorization), and
+[ADR-0020](docs/adr/0020-peer-scoped-topic-restriction.md) (per-topic
+peer-link authorization). For diagrams of several of these flows, see
 [docs/FLOWS.md](docs/FLOWS.md).
 
 **Status:** version 1, and explicitly unstable — see ADR-0014. Nothing
@@ -41,15 +43,19 @@ checked against an `--allow-peer` allowlist (see
 [ADR-0017](docs/adr/0017-peer-allowlist-via-tls-fingerprint.md)), and
 a client's own certificate (or lack of one) can likewise gate which
 topics it may `Subscribe`/`Publish` to, via `--topic-acl` (see
-[ADR-0018](docs/adr/0018-per-topic-client-authorization.md)). Neither
-authenticates what a `sender` value itself claims to be, though —
+[ADR-0018](docs/adr/0018-per-topic-client-authorization.md)) — and,
+independently, a peer link's own certificate can gate which topics
+*it* may carry, via `--peer-topic-acl` (see
+[ADR-0020](docs/adr/0020-peer-scoped-topic-restriction.md)); the two
+lists never cross-apply, a peer is never checked against `--topic-acl`
+and a client is never checked against `--peer-topic-acl`. None of
+these authenticate what a `sender` value itself claims to be, though —
 nothing ties an envelope's `sender` field to the connection's TLS
 identity. The metrics endpoint (`--metrics-addr`) is unrelated to this
 port and this TLS layer entirely — it's a separate, plain-HTTP port
 with its own opt-in bearer-token authentication (see
 [ADR-0019](docs/adr/0019-metrics-endpoint-authentication.md) and
-`docs/OPERATIONS.md`). Peer-scoped topic restriction still doesn't
-exist — see [docs/ROADMAP.md](docs/ROADMAP.md) Phase 7.
+`docs/OPERATIONS.md`).
 
 ## Framing
 
@@ -148,7 +154,9 @@ what's actually on the wire today.
 
 No reply is sent for a `Publish` — it's fire-and-forget from the
 sender's point of view, unless a `--topic-acl`
-([ADR-0018](docs/adr/0018-per-topic-client-authorization.md)) refuses
+([ADR-0018](docs/adr/0018-per-topic-client-authorization.md)) or, for
+a peer link, a `--peer-topic-acl`
+([ADR-0020](docs/adr/0020-peer-scoped-topic-restriction.md)) refuses
 it, in which case an `Error` takes the place of the (otherwise absent)
 reply. See [Delivery semantics](#delivery-semantics) for what
 "published" actually guarantees.
@@ -161,8 +169,9 @@ reply. See [Delivery semantics](#delivery-semantics) for what
 
 Registers interest in `topic` on this connection. The node replies
 with an `Ack` once registered, or an `Error` instead if a
-`--topic-acl` refuses it. Sending `Subscribe` for a topic this
-connection is already subscribed to is a no-op (still gets an `Ack`).
+`--topic-acl` (or, for a peer link, a `--peer-topic-acl`) refuses it.
+Sending `Subscribe` for a topic this connection is already subscribed
+to is a no-op (still gets an `Ack`).
 
 ### `Unsubscribe`
 
@@ -205,12 +214,14 @@ the reference implementation does send one for:
   enforcing an allowlist and finds the far end's TLS certificate
   missing or unlisted.
 - A `Subscribe` or `Publish` refused by a `--topic-acl`
-  ([ADR-0018](docs/adr/0018-per-topic-client-authorization.md)):
+  ([ADR-0018](docs/adr/0018-per-topic-client-authorization.md)), or,
+  symmetrically for a peer link, by a `--peer-topic-acl`
+  ([ADR-0020](docs/adr/0020-peer-scoped-topic-restriction.md)):
   `in_reply_to` names the refused message, and — unlike the peer-link
-  case above — **the connection stays open**. A client denied on one
-  topic may be entitled to others; only a `Subscribe`/`Publish`
-  actually rejected gets an `Error` in place of its usual
-  `Ack`/delivery, nothing else about the connection changes.
+  *rejection* case above — **the connection stays open**. A client (or
+  peer link) denied on one topic may be entitled to others; only a
+  `Subscribe`/`Publish` actually rejected gets an `Error` in place of
+  its usual `Ack`/delivery, nothing else about the connection changes.
 
 A client should be able to decode and handle receiving one either
 way.

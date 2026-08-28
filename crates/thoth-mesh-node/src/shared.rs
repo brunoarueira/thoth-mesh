@@ -54,6 +54,14 @@ pub struct Shared {
     /// default-deny for whatever's not explicitly listed, against
     /// connections not (yet) known to be peer links. See ADR-0018.
     pub topic_acl: Option<Arc<TopicAcl>>,
+    /// Per-topic peer-link publish/subscribe permissions,
+    /// `--peer-topic-acl` (repeatable). `None` - the default - means
+    /// unchanged behavior: any peer link can carry anything. `Some`
+    /// enforces default-deny for whatever's not explicitly listed,
+    /// against connections already known to be peer links -
+    /// independent of `topic_acl`, which never applies to one. See
+    /// ADR-0020.
+    pub peer_topic_acl: Option<Arc<TopicAcl>>,
 }
 
 // Hand-rolled rather than derived: `TlsAcceptor`/`TlsConnector` don't
@@ -77,6 +85,7 @@ impl std::fmt::Debug for Shared {
                 &self.allowed_peers.as_ref().map(|set| set.len()),
             )
             .field("topic_acl", &self.topic_acl.is_some())
+            .field("peer_topic_acl", &self.peer_topic_acl.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -118,6 +127,7 @@ impl Shared {
             tls_connector: None,
             allowed_peers: None,
             topic_acl: None,
+            peer_topic_acl: None,
         };
         (shared, discovered_rx)
     }

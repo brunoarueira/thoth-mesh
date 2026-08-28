@@ -16,12 +16,15 @@
 //! also discovers and dials peers it was never directly configured
 //! with (see ADR-0015). Connections are plaintext by default; passing
 //! a [`TlsConfig`] to the `_with_tls` variants of `run`/`serve`/
-//! `spawn` layers TLS underneath, transparently to everything above
-//! (see ADR-0016). Those same variants also accept an optional
-//! [`TopicAcl`], for per-topic client publish/subscribe authorization
-//! (see ADR-0018). [`run`]/[`run_with_tls`] additionally accept an
-//! optional bearer token gating the metrics endpoint, when one is
-//! opened at all (see ADR-0019).
+//! `spawn` (via [`NodeOptions`]) layers TLS underneath, transparently
+//! to everything above (see ADR-0016). [`NodeOptions`] also carries an
+//! optional [`TopicAcl`], for per-topic client publish/subscribe
+//! authorization (see ADR-0018), and a second, independent one scoped
+//! to peer links instead of clients (see ADR-0020). [`run`]/
+//! [`run_with_tls`] additionally accept an optional bearer token
+//! gating the metrics endpoint, when one is opened at all (see
+//! ADR-0019) - kept separate from [`NodeOptions`] since it's the one
+//! knob `serve_with_tls`/`spawn_with_tls` have no use for.
 
 pub mod connection;
 pub mod metrics;
@@ -45,51 +48,76 @@ pub use thoth_mesh_core::DEFAULT_ADDR;
 pub use tls_config::TlsConfig;
 pub use topic_acl::{Action, Principal, TopicAcl, TopicAclParseError};
 
+/// The connection-dispatch-level options shared identically by
+/// [`run_with_tls`], [`serve_with_tls`], and [`spawn_with_tls`] -
+/// bundled into one struct rather than growing their positional
+/// `Option` parameters further. See ADR-0020, which introduced this
+/// after ADR-0018 flagged a fourth orthogonal knob as the point worth
+/// stopping to reconsider that.
+///
+/// `Default` (every field `None`) is exactly the plaintext,
+/// unrestricted behavior [`run`]/[`serve`]/[`spawn`] always pass.
+#[derive(Debug, Default, Clone)]
+pub struct NodeOptions {
+    /// TLS config for this node, if enabled - see ADR-0016.
+    pub tls: Option<TlsConfig>,
+    /// Per-topic client publish/subscribe permissions, `--topic-acl` -
+    /// see ADR-0018.
+    pub topic_acl: Option<TopicAcl>,
+    /// Per-topic peer-link publish/subscribe permissions,
+    /// `--peer-topic-acl` - see ADR-0020. Independent of `topic_acl`:
+    /// a peer link is never checked against `topic_acl`, and a client
+    /// connection is never checked against this.
+    pub peer_topic_acl: Option<TopicAcl>,
+}
+
 /// Binds `addr` and serves connections until an unrecoverable listener
 /// error occurs, dialing each of `seed_peers` in the background. If
 /// `metrics_addr` is given, also binds it and serves a Prometheus
 /// scrape endpoint there in the background (see ADR-0013) - with no
 /// `metrics_addr`, no second port is opened and nothing changes.
 ///
-/// Every connection is plaintext, every client can publish/subscribe
-/// to any topic, and the metrics endpoint (if any) has no access
-/// control - see [`run_with_tls`] for TLS (ADR-0016), a [`TopicAcl`]
-/// (ADR-0018), and a metrics bearer token (ADR-0019).
+/// Every connection is plaintext, every client and peer link can
+/// publish/subscribe to any topic, and the metrics endpoint (if any)
+/// has no access control - see [`run_with_tls`] for TLS (ADR-0016), a
+/// [`NodeOptions`] (ADR-0018/ADR-0020), and a metrics bearer token
+/// (ADR-0019).
 pub async fn run(
     addr: &str,
     seed_peers: Vec<String>,
     metrics_addr: Option<String>,
 ) -> std::io::Result<()> {
-    run_with_tls(addr, seed_peers, metrics_addr, None, None, None).await
+    run_with_tls(addr, seed_peers, metrics_addr, NodeOptions::default(), None).await
 }
 
-/// Like [`run`], but with TLS enabled when `tls` is given (ADR-0016),
-/// per-topic client authorization enabled when `topic_acl` is given
-/// (ADR-0018), and the metrics endpoint gated behind `metrics_token`
-/// when given (ADR-0019). Each `None` - what [`run`] always passes -
-/// keeps that aspect unchanged from before its ADR. `metrics_token`
+/// Like [`run`], but with `options` (ADR-0020) controlling TLS
+/// (ADR-0016), client-scoped topic authorization (ADR-0018), and
+/// peer-scoped topic authorization (ADR-0020) all at once, and the
+/// metrics endpoint gated behind `metrics_token` when given
+/// (ADR-0019). `NodeOptions::default()` - what [`run`] always passes -
+/// keeps every aspect unchanged from before its ADR. `metrics_token`
 /// only has an effect when `metrics_addr` is also given; nothing binds
 /// otherwise.
 pub async fn run_with_tls(
     addr: &str,
     seed_peers: Vec<String>,
     metrics_addr: Option<String>,
-    tls: Option<TlsConfig>,
-    topic_acl: Option<TopicAcl>,
+    options: NodeOptions,
     metrics_token: Option<Arc<str>>,
 ) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr).await?;
     let node_id = PeerId::new();
     let my_listen_addr = listener.local_addr().ok().map(|addr| addr.to_string());
     let (mut shared, discovered_rx) = Shared::new_with_discovery(node_id, my_listen_addr);
-    if let Some(tls) = tls {
+    if let Some(tls) = options.tls {
         let allowed_peers = tls.allowed_peers.clone();
         let (acceptor, connector) = tls.build()?;
         shared.tls_acceptor = Some(acceptor);
         shared.tls_connector = Some(connector);
         shared.allowed_peers = allowed_peers.map(Arc::new);
     }
-    shared.topic_acl = topic_acl.map(Arc::new);
+    shared.topic_acl = options.topic_acl.map(Arc::new);
+    shared.peer_topic_acl = options.peer_topic_acl.map(Arc::new);
     tokio::spawn(peering::spawn_discovery_dialer(
         discovered_rx,
         shared.clone(),
@@ -126,32 +154,32 @@ pub async fn run_with_tls(
 /// Split out from [`run`] so tests can bind an ephemeral port (`:0`)
 /// and read back the actual bound address before serving. Doesn't
 /// serve metrics - only [`run`], the daemon binary's entry point,
-/// does that. Plaintext, with no topic ACL - see [`serve_with_tls`]
-/// for TLS (ADR-0016) and a [`TopicAcl`] (ADR-0018).
+/// does that. Plaintext, with no topic ACLs - see [`serve_with_tls`]
+/// for TLS (ADR-0016) and a [`NodeOptions`] (ADR-0018/ADR-0020).
 pub async fn serve(listener: TcpListener, seed_peers: Vec<String>) -> std::io::Result<()> {
-    serve_with_tls(listener, seed_peers, None, None).await
+    serve_with_tls(listener, seed_peers, NodeOptions::default()).await
 }
 
-/// Like [`serve`], but with TLS enabled when `tls` is given and
-/// per-topic client authorization enabled when `topic_acl` is given -
-/// see [`run_with_tls`].
+/// Like [`serve`], but with `options` (ADR-0020) controlling TLS
+/// (ADR-0016), client-scoped topic authorization (ADR-0018), and
+/// peer-scoped topic authorization (ADR-0020) - see [`run_with_tls`].
 pub async fn serve_with_tls(
     listener: TcpListener,
     seed_peers: Vec<String>,
-    tls: Option<TlsConfig>,
-    topic_acl: Option<TopicAcl>,
+    options: NodeOptions,
 ) -> std::io::Result<()> {
     let node_id = PeerId::new();
     let my_listen_addr = listener.local_addr().ok().map(|addr| addr.to_string());
     let (mut shared, discovered_rx) = Shared::new_with_discovery(node_id, my_listen_addr);
-    if let Some(tls) = tls {
+    if let Some(tls) = options.tls {
         let allowed_peers = tls.allowed_peers.clone();
         let (acceptor, connector) = tls.build()?;
         shared.tls_acceptor = Some(acceptor);
         shared.tls_connector = Some(connector);
         shared.allowed_peers = allowed_peers.map(Arc::new);
     }
-    shared.topic_acl = topic_acl.map(Arc::new);
+    shared.topic_acl = options.topic_acl.map(Arc::new);
+    shared.peer_topic_acl = options.peer_topic_acl.map(Arc::new);
     tokio::spawn(peering::spawn_discovery_dialer(
         discovered_rx,
         shared.clone(),
@@ -177,34 +205,35 @@ pub struct Node {
 /// only once the (non-terminating) accept loop errors out - so tests
 /// can query membership, or abort a `peer_dials` entry to simulate
 /// that peer disappearing, while the node keeps running. Plaintext,
-/// with no topic ACL - see [`spawn_with_tls`] for TLS (ADR-0016) and a
-/// [`TopicAcl`] (ADR-0018).
+/// with no topic ACLs - see [`spawn_with_tls`] for TLS (ADR-0016) and
+/// a [`NodeOptions`] (ADR-0018/ADR-0020).
 pub fn spawn(listener: TcpListener, seed_peers: Vec<String>) -> Node {
-    spawn_with_tls(listener, seed_peers, None, None)
+    spawn_with_tls(listener, seed_peers, NodeOptions::default())
         .expect("plaintext spawn (tls: None) never fails building TLS config")
 }
 
-/// Like [`spawn`], but with TLS enabled when `tls` is given and
-/// per-topic client authorization enabled when `topic_acl` is given -
-/// see [`run_with_tls`]. Fails only if `tls` is given and its
-/// certs/key/CA don't load or don't build into a valid config.
+/// Like [`spawn`], but with `options` (ADR-0020) controlling TLS
+/// (ADR-0016), client-scoped topic authorization (ADR-0018), and
+/// peer-scoped topic authorization (ADR-0020) - see [`run_with_tls`].
+/// Fails only if `options.tls` is given and its certs/key/CA don't
+/// load or don't build into a valid config.
 pub fn spawn_with_tls(
     listener: TcpListener,
     seed_peers: Vec<String>,
-    tls: Option<TlsConfig>,
-    topic_acl: Option<TopicAcl>,
+    options: NodeOptions,
 ) -> std::io::Result<Node> {
     let node_id = PeerId::new();
     let my_listen_addr = listener.local_addr().ok().map(|addr| addr.to_string());
     let (mut shared, discovered_rx) = Shared::new_with_discovery(node_id, my_listen_addr);
-    if let Some(tls) = tls {
+    if let Some(tls) = options.tls {
         let allowed_peers = tls.allowed_peers.clone();
         let (acceptor, connector) = tls.build()?;
         shared.tls_acceptor = Some(acceptor);
         shared.tls_connector = Some(connector);
         shared.allowed_peers = allowed_peers.map(Arc::new);
     }
-    shared.topic_acl = topic_acl.map(Arc::new);
+    shared.topic_acl = options.topic_acl.map(Arc::new);
+    shared.peer_topic_acl = options.peer_topic_acl.map(Arc::new);
     tokio::spawn(peering::spawn_discovery_dialer(
         discovered_rx,
         shared.clone(),

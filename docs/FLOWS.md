@@ -162,7 +162,8 @@ stateDiagram-v2
 
     state PeerSteadyState {
         [*] --> Relaying
-        Relaying --> Relaying: Subscribe/Unsubscribe (own or<br/>relayed interest) / Publish / PeerAnnounce
+        Relaying --> Relaying: Subscribe/Unsubscribe (own or<br/>relayed interest, --peer-topic-acl-<br/>permitted) / Publish / PeerAnnounce
+        Relaying --> Relaying: Subscribe/Publish rejected by<br/>--peer-topic-acl - Error sent,<br/>connection stays open
     }
 
     state ClientSteadyState {
@@ -178,8 +179,11 @@ stateDiagram-v2
 ```
 
 The key asymmetry between the two steady states: a peer-link rejection
-(`--allow-peer`) always closes the connection, while a client
-authorization rejection (`--topic-acl`) never does — a client denied
-on one topic may be entitled to others. See
-[ADR-0017](adr/0017-peer-allowlist-via-tls-fingerprint.md) and
-[ADR-0018](adr/0018-per-topic-client-authorization.md).
+(`--allow-peer`, at handshake time) always closes the connection,
+while a topic-authorization rejection - `--topic-acl` for a client,
+`--peer-topic-acl` for a peer link, once either is in its steady
+state - never does; a connection denied on one topic may be entitled
+to others. See
+[ADR-0017](adr/0017-peer-allowlist-via-tls-fingerprint.md),
+[ADR-0018](adr/0018-per-topic-client-authorization.md), and
+[ADR-0020](adr/0020-peer-scoped-topic-restriction.md).
