@@ -222,6 +222,84 @@ async fn multiple_subscribers_all_receive() {
 }
 
 #[tokio::test]
+async fn a_late_subscriber_is_replayed_a_publish_that_happened_before_it_subscribed() {
+    // No subscriber exists yet when this is published - see ADR-0021.
+    let addr = spawn_test_node().await;
+    let mut publisher = connect(addr).await;
+    let publish = Envelope::new(
+        PeerId::new(),
+        MessageKind::Publish {
+            topic: topic("weather.updates"),
+            payload: b"sunny".to_vec(),
+        },
+    );
+    send(&mut publisher, &publish).await;
+
+    let mut subscriber = connect(addr).await;
+    let sub = Envelope::new(
+        PeerId::new(),
+        MessageKind::Subscribe {
+            topic: topic("weather.updates"),
+        },
+    );
+    send(&mut subscriber, &sub).await;
+    recv(&mut subscriber).await; // subscribe ack
+
+    // The publish from before this connection even existed still
+    // arrives, replayed from the topic's buffer.
+    let delivered = recv(&mut subscriber).await;
+    assert_eq!(delivered.id, publish.id);
+    assert_eq!(delivered.kind, publish.kind);
+}
+
+#[tokio::test]
+async fn resubscribing_to_an_already_subscribed_topic_does_not_replay_again() {
+    let addr = spawn_test_node().await;
+    let mut subscriber = connect(addr).await;
+    let mut publisher = connect(addr).await;
+
+    let sub = Envelope::new(
+        PeerId::new(),
+        MessageKind::Subscribe {
+            topic: topic("weather.updates"),
+        },
+    );
+    send(&mut subscriber, &sub).await;
+    recv(&mut subscriber).await; // subscribe ack
+
+    let publish = Envelope::new(
+        PeerId::new(),
+        MessageKind::Publish {
+            topic: topic("weather.updates"),
+            payload: b"sunny".to_vec(),
+        },
+    );
+    send(&mut publisher, &publish).await;
+    let delivered = recv(&mut subscriber).await;
+    assert_eq!(delivered.id, publish.id);
+
+    // Subscribing again to the same topic on the same connection,
+    // without ever unsubscribing, is still a no-op - see PROTOCOL.md's
+    // Subscribe section. It must not spawn a second forwarder and
+    // replay the same publish a second time.
+    let resub = Envelope::new(
+        PeerId::new(),
+        MessageKind::Subscribe {
+            topic: topic("weather.updates"),
+        },
+    );
+    send(&mut subscriber, &resub).await;
+    let ack = recv(&mut subscriber).await;
+    assert_eq!(
+        ack.kind,
+        MessageKind::Ack {
+            in_reply_to: resub.id
+        }
+    );
+    assert!(recv_times_out(&mut subscriber).await);
+}
+
+#[tokio::test]
 async fn unsubscribed_client_does_not_receive_publish() {
     let addr = spawn_test_node().await;
     let mut client = connect(addr).await;

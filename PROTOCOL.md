@@ -15,9 +15,11 @@ discovery via gossip), [ADR-0016](docs/adr/0016-tls-transport-security.md)
 (TLS), [ADR-0017](docs/adr/0017-peer-allowlist-via-tls-fingerprint.md)
 (peer certificate allowlisting), and
 [ADR-0018](docs/adr/0018-per-topic-client-authorization.md) (per-topic
-client authorization), and
+client authorization),
 [ADR-0020](docs/adr/0020-peer-scoped-topic-restriction.md) (per-topic
-peer-link authorization). For diagrams of several of these flows, see
+peer-link authorization), and
+[ADR-0021](docs/adr/0021-message-replay-ring-buffer.md) (replay for
+late subscribers). For diagrams of several of these flows, see
 [docs/FLOWS.md](docs/FLOWS.md).
 
 **Status:** version 1, and explicitly unstable — see ADR-0014. Nothing
@@ -173,6 +175,14 @@ with an `Ack` once registered, or an `Error` instead if a
 Sending `Subscribe` for a topic this connection is already subscribed
 to is a no-op (still gets an `Ack`).
 
+Immediately after the `Ack`, this node also delivers - as ordinary
+`Publish` messages - whatever it currently holds in `topic`'s replay
+buffer, oldest first, so a client connecting after the fact can still
+catch up on recent history (see
+[ADR-0021](docs/adr/0021-message-replay-ring-buffer.md)). This only
+happens the first time a connection registers interest in `topic`; a
+no-op re-`Subscribe` above doesn't replay anything again.
+
 ### `Unsubscribe`
 
 ```
@@ -312,11 +322,16 @@ accepting side.
 Worth being explicit about what thoth-mesh does **not** currently
 guarantee:
 
-- **Best-effort, in-memory only.** There is no persistence. A
-  `Publish` reaches whoever is subscribed *at that moment*, on that
-  node or reachable through the mesh — nothing is stored for a
-  subscriber that connects afterward. See
-  [docs/ROADMAP.md](docs/ROADMAP.md) Phase 8.
+- **Best-effort, in-memory only - bounded replay, not durability.**
+  There is no persistence across a node restart. Live delivery still
+  reaches whoever is subscribed *at that moment*, on that node or
+  reachable through the mesh; a subscriber connecting afterward is
+  additionally replayed each topic's recent backlog (a bounded
+  in-memory ring buffer, capacity `DEFAULT_REPLAY_BUFFER_CAPACITY`,
+  currently 256, per topic) - see
+  [ADR-0021](docs/adr/0021-message-replay-ring-buffer.md). A subscriber
+  connecting after a topic's backlog has rolled past that capacity
+  still misses whatever fell off the oldest end.
 - **A slow subscriber can miss messages.** Delivery to each
   subscriber goes through a bounded channel; a subscriber that falls
   too far behind gets some of its messages silently dropped rather

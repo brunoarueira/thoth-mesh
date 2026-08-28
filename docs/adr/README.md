@@ -26,6 +26,7 @@ thoth-mesh, using the format described in
 | [0018](0018-per-topic-client-authorization.md) | Per-topic client authorization via TLS certificate fingerprint principals |
 | [0019](0019-metrics-endpoint-authentication.md) | Metrics endpoint authentication via shared-secret bearer token |
 | [0020](0020-peer-scoped-topic-restriction.md) | Peer-scoped topic restriction via a second `--peer-topic-acl` list |
+| [0021](0021-message-replay-ring-buffer.md) | Message replay for late subscribers via a bounded per-topic ring buffer |
 
 To add a new one, copy the format of an existing ADR, number it
 sequentially, and set its status to `Accepted` once the decision is

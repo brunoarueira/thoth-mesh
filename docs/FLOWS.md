@@ -70,6 +70,39 @@ the first place — deliberately not special-cased, since each
 connection's own forwarder map is already idempotent and that's what
 actually bounds the flood.
 
+## Late-subscriber replay
+
+A connection registering interest in a topic for the first time is
+handed that topic's buffered backlog, oldest first, immediately after
+its `Subscribe` is acknowledged — before it ever sees a live delivery.
+This applies identically whether the "connection" is an ordinary
+client or a peer link catching up via the interest-propagation flow
+above, since both spawn a forwarder through the same code path
+(ADR-0010). See
+[ADR-0021](adr/0021-message-replay-ring-buffer.md).
+
+```mermaid
+sequenceDiagram
+    participant Pub as Publisher
+    participant N as Node N
+    participant Sub as Late subscriber
+
+    Pub->>N: Publish { T, "sunny" }
+    Note over N: No subscriber for T yet -<br/>buffered in T's replay ring anyway
+    Note over Sub,N: Later: Sub connects and subscribes
+    Sub->>N: Subscribe { T }
+    N-->>Sub: Ack
+    N->>Sub: Publish { T, "sunny" } (replayed from<br/>the buffer, oldest first)
+    Note over Pub,N: Later still: a fresh publish
+    Pub->>N: Publish { T, "cloudy" }
+    N->>Sub: Publish { T, "cloudy" } (live delivery,<br/>not replay)
+```
+
+Replayed and live envelopes never overlap: `Broker::subscribe`
+snapshots the backlog and registers the live receiver as one atomic
+step, so a publish racing a subscribe lands in exactly one of the two
+paths, never both and never neither.
+
 ## Gossip peer discovery and the auto-dial tie-break
 
 A node only ever dials addresses it's told about (`--peer` or
