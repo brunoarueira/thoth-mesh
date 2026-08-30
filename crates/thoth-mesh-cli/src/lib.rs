@@ -134,7 +134,15 @@ async fn subscribe(
     sender: PeerId,
     topic: Topic,
 ) -> std::io::Result<()> {
-    let envelope = Envelope::new(sender, MessageKind::Subscribe { topic });
+    // The CLI only ever sends a literal filter today - ADR-0022's
+    // wildcard syntax isn't exposed on the command line yet (a
+    // follow-up PR), so this conversion is always the trivial case.
+    let envelope = Envelope::new(
+        sender,
+        MessageKind::Subscribe {
+            filter: topic.into(),
+        },
+    );
     send(conn, &envelope).await?;
     loop {
         let received = recv(conn).await?;

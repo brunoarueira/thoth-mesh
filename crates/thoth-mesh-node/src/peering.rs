@@ -236,10 +236,11 @@ mod tests {
 
         // Subscribe over the now-established peer link.
         let topic: thoth_mesh_core::Topic = "weather.updates".parse().unwrap();
+        let filter: thoth_mesh_core::TopicFilter = topic.clone().into();
         let sub = Envelope::new(
             their_id,
             MessageKind::Subscribe {
-                topic: topic.clone(),
+                filter: filter.clone(),
             },
         );
         async_framing::write_frame(&mut conn, &sub.to_bytes().unwrap())
@@ -267,7 +268,7 @@ mod tests {
         assert_eq!(
             Envelope::from_bytes(&echoed).unwrap().kind,
             MessageKind::Subscribe {
-                topic: topic.clone()
+                filter: filter.clone()
             }
         );
 
@@ -316,7 +317,8 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let shared = Shared::new(PeerId::new(), None);
         let topic: thoth_mesh_core::Topic = "weather.updates".parse().unwrap();
-        shared.interest.subscribe(topic.clone());
+        let filter: thoth_mesh_core::TopicFilter = topic.into();
+        shared.interest.subscribe(filter.clone());
 
         tokio::spawn(dial_peer(addr.to_string(), shared));
 
@@ -343,7 +345,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             Envelope::from_bytes(&bytes).unwrap().kind,
-            MessageKind::Subscribe { topic }
+            MessageKind::Subscribe { filter }
         );
     }
 

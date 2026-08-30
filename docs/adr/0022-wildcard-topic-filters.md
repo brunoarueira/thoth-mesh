@@ -158,6 +158,20 @@ The new `patterns` map has the same "never shrinks on its own" shape
 Consequences) - one more structure for issue #72 (bound per-node
 memory footprint) to catalogue, not addressed here.
 
+Unlike `topics`, `patterns` entries can't be created proactively by
+`publish` - ADR-0021's "a publish creates a topic's buffer even with
+zero subscribers" trick only works because `publish` already knows the
+one concrete `Topic` it's addressed to; there's no way to guess in
+advance which of the unbounded space of possible patterns a future
+subscriber might use. A pattern's replay buffer therefore only starts
+accumulating once something has actually subscribed to that exact
+pattern string - a publish that happens before *any* subscriber has
+ever used a given pattern is not retroactively matched into it once
+someone finally does, even though the equivalent is true for an exact
+topic. This is a genuine asymmetry between the two paths, not an
+oversight; it falls directly out of patterns being an open-ended set
+rather than a discoverable one.
+
 Pattern matching is a linear scan over distinct active patterns on
 every publish - fine at today's scale, a candidate for a prefix index
 if issue #71's scale work ever shows it matters.

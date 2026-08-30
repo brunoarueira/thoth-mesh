@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use thoth_mesh_core::async_framing;
-use thoth_mesh_core::{Envelope, MessageKind, PeerId, Topic};
+use thoth_mesh_core::{Envelope, MessageKind, PeerId, Topic, TopicFilter};
 use thoth_mesh_node::{NodeOptions, TopicAcl};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
@@ -80,6 +80,10 @@ fn topic(s: &str) -> Topic {
     s.parse().unwrap()
 }
 
+fn filter(s: &str) -> TopicFilter {
+    s.parse().unwrap()
+}
+
 /// Completes a bare `Hello`/`Hello`-reply handshake over `stream`, so
 /// the node on the other end registers it as a peer link (ADR-0009)
 /// rather than a client - the same distinction `--peer-topic-acl`
@@ -118,7 +122,7 @@ async fn a_listed_subscribe_and_publish_still_work_normally() {
     let sub = Envelope::new(
         PeerId::new(),
         MessageKind::Subscribe {
-            topic: topic("weather.updates"),
+            filter: topic("weather.updates").into(),
         },
     );
     send(&mut subscriber, &sub).await;
@@ -151,7 +155,7 @@ async fn subscribing_to_an_unlisted_topic_is_rejected_but_the_connection_stays_o
     let rejected = Envelope::new(
         PeerId::new(),
         MessageKind::Subscribe {
-            topic: topic("secret.topic"),
+            filter: topic("secret.topic").into(),
         },
     );
     send(&mut client, &rejected).await;
@@ -166,7 +170,7 @@ async fn subscribing_to_an_unlisted_topic_is_rejected_but_the_connection_stays_o
     let allowed = Envelope::new(
         PeerId::new(),
         MessageKind::Subscribe {
-            topic: topic("weather.updates"),
+            filter: topic("weather.updates").into(),
         },
     );
     send(&mut client, &allowed).await;
@@ -190,7 +194,7 @@ async fn publishing_without_permission_is_rejected_and_never_reaches_a_subscribe
     let sub = Envelope::new(
         PeerId::new(),
         MessageKind::Subscribe {
-            topic: topic("guarded.topic"),
+            filter: topic("guarded.topic").into(),
         },
     );
     send(&mut subscriber, &sub).await;
@@ -221,6 +225,44 @@ async fn publishing_without_permission_is_rejected_and_never_reaches_a_subscribe
     );
 }
 
+/// ADR-0022: a wildcard filter is refused outright wherever a
+/// `--topic-acl` is configured, regardless of what it would expand to
+/// - even one that would only ever match a topic this principal is
+/// actually granted `sub` on.
+#[tokio::test]
+async fn subscribing_to_a_wildcard_filter_is_rejected_when_a_topic_acl_is_configured() {
+    let addr = spawn_test_node_with_topic_acl(&["anonymous|sub|weather.updates"]).await;
+    let mut client = connect(addr).await;
+
+    let rejected = Envelope::new(
+        PeerId::new(),
+        MessageKind::Subscribe {
+            filter: filter("weather.+"),
+        },
+    );
+    send(&mut client, &rejected).await;
+    match recv(&mut client).await.kind {
+        MessageKind::Error { in_reply_to, .. } => assert_eq!(in_reply_to, Some(rejected.id)),
+        other => panic!("expected an Error, got {other:?}"),
+    }
+
+    // The connection stays open, same as any other ACL rejection - a
+    // literal subscribe it's actually entitled to still works.
+    let allowed = Envelope::new(
+        PeerId::new(),
+        MessageKind::Subscribe {
+            filter: topic("weather.updates").into(),
+        },
+    );
+    send(&mut client, &allowed).await;
+    assert_eq!(
+        recv(&mut client).await.kind,
+        MessageKind::Ack {
+            in_reply_to: allowed.id
+        }
+    );
+}
+
 /// ADR-0020: a peer link whose `--peer-topic-acl` grants it `sub` on a
 /// topic gets forwarded a matching publish, the same as a client with
 /// an equivalent `--topic-acl` grant would.
@@ -233,7 +275,7 @@ async fn a_peer_link_permitted_to_subscribe_receives_the_forwarded_publish() {
     let sub = Envelope::new(
         PeerId::new(),
         MessageKind::Subscribe {
-            topic: topic("weather.updates"),
+            filter: topic("weather.updates").into(),
         },
     );
     send(&mut peer, &sub).await;
@@ -274,7 +316,7 @@ async fn a_peer_link_denied_subscribe_is_rejected_and_never_forwarded_to() {
     let rejected = Envelope::new(
         PeerId::new(),
         MessageKind::Subscribe {
-            topic: topic("weather.updates"),
+            filter: topic("weather.updates").into(),
         },
     );
     send(&mut peer, &rejected).await;
@@ -299,6 +341,27 @@ async fn a_peer_link_denied_subscribe_is_rejected_and_never_forwarded_to() {
     );
 }
 
+/// ADR-0022's wildcard-ACL restriction applies to a peer link's
+/// `--peer-topic-acl` exactly as it does to a client's `--topic-acl`.
+#[tokio::test]
+async fn a_peer_links_wildcard_subscribe_is_rejected_when_a_peer_topic_acl_is_configured() {
+    let addr = spawn_test_node_with_peer_topic_acl(&["anonymous|sub|weather.updates"]).await;
+
+    let mut peer = connect(addr).await;
+    become_peer(&mut peer).await;
+    let rejected = Envelope::new(
+        PeerId::new(),
+        MessageKind::Subscribe {
+            filter: filter("weather.+"),
+        },
+    );
+    send(&mut peer, &rejected).await;
+    match recv(&mut peer).await.kind {
+        MessageKind::Error { in_reply_to, .. } => assert_eq!(in_reply_to, Some(rejected.id)),
+        other => panic!("expected an Error, got {other:?}"),
+    }
+}
+
 /// ADR-0020: a peer link granted `pub` on a topic can publish to it,
 /// and the publish reaches a locally-subscribed client exactly as a
 /// client's own publish would.
@@ -310,7 +373,7 @@ async fn a_peer_link_permitted_to_publish_is_delivered_to_a_subscriber() {
     let sub = Envelope::new(
         PeerId::new(),
         MessageKind::Subscribe {
-            topic: topic("weather.updates"),
+            filter: topic("weather.updates").into(),
         },
     );
     send(&mut subscriber, &sub).await;
@@ -348,7 +411,7 @@ async fn a_peer_link_denied_publish_is_rejected_and_never_reaches_a_subscriber()
     let sub = Envelope::new(
         PeerId::new(),
         MessageKind::Subscribe {
-            topic: topic("weather.updates"),
+            filter: topic("weather.updates").into(),
         },
     );
     send(&mut subscriber, &sub).await;
@@ -394,7 +457,7 @@ async fn a_peer_topic_acl_does_not_restrict_an_ordinary_client() {
     let sub = Envelope::new(
         PeerId::new(),
         MessageKind::Subscribe {
-            topic: topic("unrelated.topic"),
+            filter: topic("unrelated.topic").into(),
         },
     );
     send(&mut subscriber, &sub).await;

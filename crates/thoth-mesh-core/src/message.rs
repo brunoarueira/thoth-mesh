@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::filter::TopicFilter;
 use crate::peer::PeerId;
 use crate::topic::Topic;
 
@@ -45,12 +46,14 @@ pub struct PeerAdvert {
 /// The payload of an [`Envelope`](crate::Envelope).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MessageKind {
-    /// Publish a payload to a topic.
+    /// Publish a payload to a topic. Always a concrete [`Topic`], never
+    /// a filter - there's no such thing as publishing to a pattern.
     Publish { topic: Topic, payload: Vec<u8> },
-    /// Subscribe to a topic.
-    Subscribe { topic: Topic },
-    /// Unsubscribe from a topic.
-    Unsubscribe { topic: Topic },
+    /// Subscribe to a topic filter - a plain topic name, or one
+    /// containing MQTT-style wildcard segments (see ADR-0022).
+    Subscribe { filter: TopicFilter },
+    /// Unsubscribe from a topic filter previously subscribed to.
+    Unsubscribe { filter: TopicFilter },
     /// Acknowledge a previously received message.
     Ack { in_reply_to: MessageId },
     /// Report an error, optionally in response to a specific message.
@@ -102,9 +105,11 @@ mod tests {
                 payload: vec![1, 2, 3],
             },
             MessageKind::Subscribe {
-                topic: topic.clone(),
+                filter: topic.clone().into(),
             },
-            MessageKind::Unsubscribe { topic },
+            MessageKind::Unsubscribe {
+                filter: topic.into(),
+            },
             MessageKind::Ack {
                 in_reply_to: MessageId::new(),
             },

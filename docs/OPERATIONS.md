@@ -307,7 +307,10 @@ else on a connection not already known to be a peer link is refused).
   is off entirely, and still an option even with TLS on (ADR-0016
   never requires a client certificate).
 - `<action>`: `pub`, `sub`, or `pubsub` for both.
-- `<topic>`: an exact topic name — no wildcards.
+- `<topic>`: an exact topic name — no wildcards. A client's wildcard
+  `Subscribe` (see [Wildcard topic filters](#wildcard-topic-filters))
+  is refused outright once any `--topic-acl` entry exists, regardless
+  of `<topic>`.
 
 ```sh
 # Anyone (no certificate needed) may subscribe to a public status
@@ -390,6 +393,32 @@ end, silently — the same posture `PROTOCOL.md`'s
 accepts for a live subscriber that falls behind.
 `thothmesh_replayed_messages_total` (see [Metrics](#metrics)) counts
 how many envelopes have gone out via replay rather than live delivery.
+
+## Wildcard topic filters
+
+A `Subscribe` can name a pattern instead of an exact topic (see
+[ADR-0022](adr/0022-wildcard-topic-filters.md)): `+` matches exactly
+one `.`-delimited segment, and a trailing `#` matches zero or more
+remaining segments. `weather.+` matches `weather.updates` and
+`weather.forecast` but not `weather` itself; `weather.#` matches all
+three. This applies equally to a client and to a peer link's own
+interest — no CLI support yet (the reference `thoth-mesh` client only
+ever sends literal subscribes today), but any client speaking the wire
+protocol directly can use it.
+
+A subscription holding both a literal and an overlapping wildcard
+filter gets a publish delivered twice, once per subscription — they're
+independent, not deduplicated against each other.
+
+**Wildcard subscribes are refused wherever a topic ACL applies.** If
+`--topic-acl` (or, for a peer link, `--peer-topic-acl`) is configured
+at all, a wildcard `Subscribe` gets an `Error` unconditionally,
+regardless of what it would actually expand to — neither ACL
+mechanism understands patterns, and this codebase doesn't attempt to
+infer whether a pattern's expansion would be covered by an ACL entry.
+A literal subscribe is checked exactly as it always has been. If you
+need both a topic ACL and wildcard subscriptions, the wildcard side
+isn't available yet — subscribe to each concrete topic instead.
 
 ## Logging
 

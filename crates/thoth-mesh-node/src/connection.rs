@@ -4,11 +4,13 @@
 //! peer links (see ADR-0011), and peer addresses learned about, for
 //! discovery (see ADR-0015). `Subscribe`/`Publish` are authorized
 //! against a client-scoped `--topic-acl` (ADR-0018) or a peer-scoped
-//! `--peer-topic-acl` (ADR-0020), whichever applies to the connection.
-//! A freshly-spawned forwarder replays the topic's buffered backlog
-//! before it starts forwarding live deliveries, so a late subscriber
-//! (client or peer link alike) can catch up on recent history - see
-//! ADR-0021.
+//! `--peer-topic-acl` (ADR-0020), whichever applies to the connection -
+//! a wildcard `Subscribe` (ADR-0022) is refused outright wherever
+//! either applies, regardless of what it would expand to. A
+//! freshly-spawned forwarder replays the topic filter's buffered
+//! backlog before it starts forwarding live deliveries, so a late
+//! subscriber (client or peer link alike) can catch up on recent
+//! history - see ADR-0021.
 
 use std::collections::{HashMap, HashSet};
 use std::io::ErrorKind;
@@ -17,7 +19,9 @@ use std::sync::Arc;
 use thoth_mesh::{Interest, PeerDirectory, PeerInfo};
 use thoth_mesh_broker::Broker;
 use thoth_mesh_core::async_framing;
-use thoth_mesh_core::{Envelope, FramingError, MessageKind, PeerAdvert, PeerId, Topic};
+use thoth_mesh_core::{
+    Envelope, FramingError, MessageKind, PeerAdvert, PeerId, Topic, TopicFilter,
+};
 use thoth_mesh_tls::{MaybeTlsStream, fingerprint};
 use tokio::io::{WriteHalf, split};
 use tokio::sync::broadcast;
@@ -98,7 +102,7 @@ async fn run_connection(socket: MaybeTlsStream, shared: Shared, initial_peer: Op
     let mut reader = reader.compat();
     let mut writer = writer.compat_write();
     let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<Arc<Envelope>>(OUTGOING_CHANNEL_CAPACITY);
-    let mut forwarders: HashMap<Topic, JoinHandle<()>> = HashMap::new();
+    let mut forwarders: HashMap<TopicFilter, JoinHandle<()>> = HashMap::new();
     // Set once this connection is known to be a peer link - either
     // passed in already-known (dial side) or learned from an incoming
     // Hello (accept side) - so we know whose membership entry to
@@ -162,23 +166,25 @@ async fn run_connection(socket: MaybeTlsStream, shared: Shared, initial_peer: Op
                 };
 
                 match &envelope.kind {
-                    MessageKind::Subscribe { topic } => {
-                        let topic = topic.clone();
+                    MessageKind::Subscribe { filter } => {
+                        let filter = filter.clone();
                         // Client-scoped (ADR-0018) for a connection
                         // not yet known to be a peer link;
                         // peer-scoped (ADR-0020) once it is - the two
                         // lists are independent, and exactly one ever
-                        // applies to a given connection.
+                        // applies to a given connection. A wildcard
+                        // filter is refused outright wherever either
+                        // applies - see ADR-0022.
                         let is_peer = peer_identity.is_some();
-                        if !acl_permits(
+                        if !filter_acl_permits(
                             &topic_acl,
                             &peer_topic_acl,
                             is_peer,
                             principal,
-                            &topic,
+                            &filter,
                             Action::Subscribe,
                         ) {
-                            tracing::warn!(sender = ?envelope.sender, %topic, is_peer, "rejected: not on the configured topic ACL");
+                            tracing::warn!(sender = ?envelope.sender, %filter, is_peer, "rejected: not on the configured topic ACL");
                             if is_peer {
                                 metrics.record_peer_topic_acl_rejection();
                             } else {
@@ -188,7 +194,7 @@ async fn run_connection(socket: MaybeTlsStream, shared: Shared, initial_peer: Op
                                 node_id,
                                 MessageKind::Error {
                                     in_reply_to: Some(envelope.id),
-                                    message: format!("not authorized to subscribe to {topic}"),
+                                    message: format!("not authorized to subscribe to {filter}"),
                                 },
                             );
                             if !send_envelope(&mut writer, &error).await {
@@ -196,25 +202,25 @@ async fn run_connection(socket: MaybeTlsStream, shared: Shared, initial_peer: Op
                             }
                             continue;
                         }
-                        tracing::info!(sender = ?envelope.sender, %topic, "subscribed");
-                        let is_new_forwarder = !forwarders.contains_key(&topic);
-                        forwarders.entry(topic.clone()).or_insert_with(|| {
-                            spawn_forwarder(&broker, topic.clone(), outgoing_tx.clone(), metrics.clone())
+                        tracing::info!(sender = ?envelope.sender, %filter, "subscribed");
+                        let is_new_forwarder = !forwarders.contains_key(&filter);
+                        forwarders.entry(filter.clone()).or_insert_with(|| {
+                            spawn_forwarder(&broker, filter.clone(), outgoing_tx.clone(), metrics.clone())
                         });
-                        if is_new_forwarder && interest.subscribe(topic.clone()) {
-                            propagate_interest(&peer_links, node_id, topic, true);
+                        if is_new_forwarder && interest.subscribe(filter.clone()) {
+                            propagate_interest(&peer_links, node_id, filter, true);
                         }
                         let ack = Envelope::new(node_id, MessageKind::Ack { in_reply_to: envelope.id });
                         if !send_envelope(&mut writer, &ack).await {
                             break;
                         }
                     }
-                    MessageKind::Unsubscribe { topic } => {
-                        tracing::info!(sender = ?envelope.sender, %topic, "unsubscribed");
-                        if let Some(handle) = forwarders.remove(topic) {
+                    MessageKind::Unsubscribe { filter } => {
+                        tracing::info!(sender = ?envelope.sender, %filter, "unsubscribed");
+                        if let Some(handle) = forwarders.remove(filter) {
                             handle.abort();
-                            if interest.unsubscribe(topic) {
-                                propagate_interest(&peer_links, node_id, topic.clone(), false);
+                            if interest.unsubscribe(filter) {
+                                propagate_interest(&peer_links, node_id, filter.clone(), false);
                             }
                         }
                         let ack = Envelope::new(node_id, MessageKind::Ack { in_reply_to: envelope.id });
@@ -322,11 +328,11 @@ async fn run_connection(socket: MaybeTlsStream, shared: Shared, initial_peer: Op
         }
     }
 
-    for (topic, handle) in forwarders {
-        tracing::debug!(%topic, "stopping forwarder");
+    for (filter, handle) in forwarders {
+        tracing::debug!(%filter, "stopping forwarder");
         handle.abort();
-        if interest.unsubscribe(&topic) {
-            propagate_interest(&peer_links, node_id, topic, false);
+        if interest.unsubscribe(&filter) {
+            propagate_interest(&peer_links, node_id, filter, false);
         }
     }
 
@@ -357,15 +363,15 @@ fn register_peer_link(
     outgoing_tx: &mpsc::Sender<Arc<Envelope>>,
 ) {
     peer_links.register(peer_id, outgoing_tx.clone());
-    for topic in interest.snapshot() {
+    for filter in interest.snapshot() {
         let envelope = Arc::new(Envelope::new(
             node_id,
             MessageKind::Subscribe {
-                topic: topic.clone(),
+                filter: filter.clone(),
             },
         ));
         if outgoing_tx.try_send(envelope).is_err() {
-            tracing::warn!(%topic, "outgoing queue full, dropping interest catch-up for this topic");
+            tracing::warn!(%filter, "outgoing queue full, dropping interest catch-up for this filter");
         }
     }
 
@@ -463,14 +469,20 @@ fn propagate_peer(peer_links: &PeerLinks, node_id: PeerId, peer_id: PeerId, list
 }
 
 /// Tells every active peer link about a local topic-interest
-/// transition: `now_interested` selects `Subscribe` (a topic just
+/// transition: `now_interested` selects `Subscribe` (a filter just
 /// gained its first interested connection) or `Unsubscribe` (it just
-/// lost its last). See ADR-0011.
-fn propagate_interest(peer_links: &PeerLinks, node_id: PeerId, topic: Topic, now_interested: bool) {
+/// lost its last). See ADR-0011; a propagated filter may itself be a
+/// wildcard pattern (ADR-0022), handled with no special-casing.
+fn propagate_interest(
+    peer_links: &PeerLinks,
+    node_id: PeerId,
+    filter: TopicFilter,
+    now_interested: bool,
+) {
     let kind = if now_interested {
-        MessageKind::Subscribe { topic }
+        MessageKind::Subscribe { filter }
     } else {
-        MessageKind::Unsubscribe { topic }
+        MessageKind::Unsubscribe { filter }
     };
     peer_links.broadcast(Arc::new(Envelope::new(node_id, kind)));
 }
@@ -524,6 +536,33 @@ fn acl_permits(
     topic_acl_permits(acl, principal, topic, action)
 }
 
+/// Whether `principal` is allowed to `action` on `filter`, given
+/// whichever of `topic_acl`/`peer_topic_acl` applies (see
+/// [`acl_permits`]). Neither ACL is pattern-aware (ADR-0018/ADR-0020
+/// both check an exact `Topic`); a literal `filter` is checked exactly
+/// as [`acl_permits`] always has, but a genuine wildcard filter
+/// (ADR-0022) is refused outright whenever an ACL is configured for
+/// this connection's role, regardless of what it would expand to -
+/// deliberately conservative rather than inventing pattern-vs-pattern
+/// coverage semantics. `None` - no ACL configured for that role -
+/// still permits everything, wildcard or not, same as before
+/// ADR-0022.
+fn filter_acl_permits(
+    topic_acl: &Option<Arc<TopicAcl>>,
+    peer_topic_acl: &Option<Arc<TopicAcl>>,
+    is_peer: bool,
+    principal: Principal,
+    filter: &TopicFilter,
+    action: Action,
+) -> bool {
+    let acl = if is_peer { peer_topic_acl } else { topic_acl };
+    match (acl, filter.as_topic()) {
+        (None, _) => true,
+        (Some(_), None) => false,
+        (Some(acl), Some(topic)) => acl.permits(principal, &topic, action),
+    }
+}
+
 /// A [`FramingError::Io`] whose kind is `UnexpectedEof` is what a
 /// clean client disconnect looks like from the read side - not
 /// something worth a warning.
@@ -543,14 +582,14 @@ async fn send_envelope(
 
 fn spawn_forwarder(
     broker: &Arc<Broker>,
-    topic: Topic,
+    filter: TopicFilter,
     outgoing_tx: mpsc::Sender<Arc<Envelope>>,
     metrics: Metrics,
 ) -> JoinHandle<()> {
     let broker = Arc::clone(broker);
     tokio::spawn(
         async move {
-            let (backlog, mut rx) = broker.subscribe(topic).await;
+            let (backlog, mut rx) = broker.subscribe(filter).await;
             // Replay whatever this topic's buffer already held, oldest
             // first, before falling into the live loop below - see
             // ADR-0021. `Broker::subscribe` guarantees this can't miss

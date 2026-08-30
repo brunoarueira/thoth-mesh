@@ -17,9 +17,11 @@ discovery via gossip), [ADR-0016](docs/adr/0016-tls-transport-security.md)
 [ADR-0018](docs/adr/0018-per-topic-client-authorization.md) (per-topic
 client authorization),
 [ADR-0020](docs/adr/0020-peer-scoped-topic-restriction.md) (per-topic
-peer-link authorization), and
+peer-link authorization),
 [ADR-0021](docs/adr/0021-message-replay-ring-buffer.md) (replay for
-late subscribers). For diagrams of several of these flows, see
+late subscribers), and
+[ADR-0022](docs/adr/0022-wildcard-topic-filters.md) (wildcard topic
+filters). For diagrams of several of these flows, see
 [docs/FLOWS.md](docs/FLOWS.md).
 
 **Status:** version 1, and explicitly unstable — see ADR-0014. Nothing
@@ -125,10 +127,27 @@ error, not something that reaches application code:
 - At most 256 bytes.
 - Only ASCII alphanumerics plus `.`, `-`, `_`, and `/`.
 
-There's no hierarchy or wildcard semantics — two topics either match
-exactly or don't match at all (see
-[docs/ROADMAP.md](docs/ROADMAP.md) Phase 8 for wildcard matching as
-possible future work).
+A `Topic` names one concrete destination — what a `Publish` addresses.
+It carries no wildcard semantics of its own; matching against a
+subscriber's filter is `TopicFilter`'s job (below).
+
+### `TopicFilter`
+
+A UTF-8 string, encoded and validated the same way as `Topic` -
+`.`-delimited segments, same charset — except two segments carry
+special meaning ([ADR-0022](docs/adr/0022-wildcard-topic-filters.md)):
+
+- `+` matches exactly one segment in that position.
+- `#` matches zero or more remaining segments, and is only valid as
+  the filter's *last* segment.
+
+Every valid `Topic` string is therefore also a valid, purely-literal
+`TopicFilter` with identical matching behavior — `weather.updates`
+matches only itself, `weather.+` matches `weather.updates` and
+`weather.forecast` but not `weather` or `weather.updates.v2`, and
+`weather.#` matches `weather`, `weather.updates`, and
+`weather.updates.v2` alike. What a `Subscribe`/`Unsubscribe` carries;
+`Publish` always carries a concrete `Topic`, never a filter.
 
 ## Message kinds
 
@@ -166,30 +185,39 @@ reply. See [Delivery semantics](#delivery-semantics) for what
 ### `Subscribe`
 
 ```
-{"Subscribe": {"topic": <Topic>}}
+{"Subscribe": {"filter": <TopicFilter>}}
 ```
 
-Registers interest in `topic` on this connection. The node replies
-with an `Ack` once registered, or an `Error` instead if a
-`--topic-acl` (or, for a peer link, a `--peer-topic-acl`) refuses it.
-Sending `Subscribe` for a topic this connection is already subscribed
-to is a no-op (still gets an `Ack`).
+Registers interest in `filter` on this connection - a literal topic
+name or a wildcard pattern alike (ADR-0022). The node replies with an
+`Ack` once registered, or an `Error` instead if a `--topic-acl` (or,
+for a peer link, a `--peer-topic-acl`) refuses it. A wildcard `filter`
+is refused outright wherever either ACL is configured for this
+connection's role, regardless of what it would actually expand to -
+neither ACL is pattern-aware, and this codebase doesn't attempt to
+make one covering-pattern imply anything about another. Sending
+`Subscribe` for a filter this connection is already subscribed to is a
+no-op (still gets an `Ack`).
 
 Immediately after the `Ack`, this node also delivers - as ordinary
-`Publish` messages - whatever it currently holds in `topic`'s replay
+`Publish` messages - whatever it currently holds in a matching replay
 buffer, oldest first, so a client connecting after the fact can still
 catch up on recent history (see
 [ADR-0021](docs/adr/0021-message-replay-ring-buffer.md)). This only
-happens the first time a connection registers interest in `topic`; a
-no-op re-`Subscribe` above doesn't replay anything again.
+happens the first time a connection registers interest in `filter`; a
+no-op re-`Subscribe` above doesn't replay anything again. A wildcard
+filter's replay buffer only starts accumulating once *that exact
+filter string* has been subscribed to at least once - unlike a literal
+topic, there's no way to pre-buffer for a pattern nobody has used yet
+(see ADR-0022's Consequences).
 
 ### `Unsubscribe`
 
 ```
-{"Unsubscribe": {"topic": <Topic>}}
+{"Unsubscribe": {"filter": <TopicFilter>}}
 ```
 
-Removes interest in `topic` on this connection, acknowledged the same
+Removes interest in `filter` on this connection, acknowledged the same
 way as `Subscribe`.
 
 ### `Ack`
@@ -348,3 +376,9 @@ guarantee:
 - **No delivery confirmation for `Publish`.** Unlike `Subscribe`/
   `Unsubscribe`, nothing acknowledges a `Publish` — not receipt by the
   node it was sent to, and not delivery to any subscriber.
+- **A connection with overlapping subscriptions gets more than one
+  delivery.** A literal `Subscribe` and a wildcard `Subscribe` that
+  both happen to match the same published topic are independent
+  subscriptions (ADR-0022) — a connection holding both receives the
+  matching `Publish` once per subscription, not deduplicated down to
+  one.

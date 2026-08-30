@@ -57,9 +57,11 @@ mod tests {
                 payload: vec![1, 2, 3],
             },
             MessageKind::Subscribe {
-                topic: topic.clone(),
+                filter: topic.clone().into(),
             },
-            MessageKind::Unsubscribe { topic },
+            MessageKind::Unsubscribe {
+                filter: topic.into(),
+            },
             MessageKind::Ack {
                 in_reply_to: MessageId::new(),
             },

@@ -173,7 +173,7 @@ mod tests {
             let envelope = Envelope::new(
                 PeerId::new(),
                 MessageKind::Subscribe {
-                    topic: "weather.updates".parse().unwrap(),
+                    filter: "weather.updates".parse().unwrap(),
                 },
             );
             let mut preloaded = Vec::new();

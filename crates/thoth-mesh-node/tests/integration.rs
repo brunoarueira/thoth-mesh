@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use thoth_mesh_core::async_framing;
-use thoth_mesh_core::{Envelope, MessageKind, PeerId, Topic};
+use thoth_mesh_core::{Envelope, MessageKind, PeerId, Topic, TopicFilter};
 use thoth_mesh_node::test_support::eventually;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
@@ -51,6 +51,10 @@ async fn recv_times_out(stream: &mut Compat<TcpStream>) -> bool {
 
 fn topic(s: &str) -> Topic {
     s.parse::<Topic>().unwrap()
+}
+
+fn filter(s: &str) -> TopicFilter {
+    s.parse::<TopicFilter>().unwrap()
 }
 
 /// Publishes fresh envelopes against `publish_addr` (a new connection
@@ -116,7 +120,7 @@ async fn subscribe_receives_ack() {
     let sub = Envelope::new(
         PeerId::new(),
         MessageKind::Subscribe {
-            topic: topic("weather.updates"),
+            filter: topic("weather.updates").into(),
         },
     );
     send(&mut client, &sub).await;
@@ -138,7 +142,7 @@ async fn unsubscribe_receives_ack() {
     let sub = Envelope::new(
         PeerId::new(),
         MessageKind::Subscribe {
-            topic: topic("weather.updates"),
+            filter: topic("weather.updates").into(),
         },
     );
     send(&mut client, &sub).await;
@@ -147,7 +151,7 @@ async fn unsubscribe_receives_ack() {
     let unsub = Envelope::new(
         PeerId::new(),
         MessageKind::Unsubscribe {
-            topic: topic("weather.updates"),
+            filter: topic("weather.updates").into(),
         },
     );
     send(&mut client, &unsub).await;
@@ -170,7 +174,7 @@ async fn publish_delivers_to_subscriber() {
     let sub = Envelope::new(
         PeerId::new(),
         MessageKind::Subscribe {
-            topic: topic("weather.updates"),
+            filter: topic("weather.updates").into(),
         },
     );
     send(&mut subscriber, &sub).await;
@@ -201,7 +205,7 @@ async fn multiple_subscribers_all_receive() {
         let sub = Envelope::new(
             PeerId::new(),
             MessageKind::Subscribe {
-                topic: topic("weather.updates"),
+                filter: topic("weather.updates").into(),
             },
         );
         send(client, &sub).await;
@@ -239,7 +243,7 @@ async fn a_late_subscriber_is_replayed_a_publish_that_happened_before_it_subscri
     let sub = Envelope::new(
         PeerId::new(),
         MessageKind::Subscribe {
-            topic: topic("weather.updates"),
+            filter: topic("weather.updates").into(),
         },
     );
     send(&mut subscriber, &sub).await;
@@ -261,7 +265,7 @@ async fn resubscribing_to_an_already_subscribed_topic_does_not_replay_again() {
     let sub = Envelope::new(
         PeerId::new(),
         MessageKind::Subscribe {
-            topic: topic("weather.updates"),
+            filter: topic("weather.updates").into(),
         },
     );
     send(&mut subscriber, &sub).await;
@@ -285,7 +289,7 @@ async fn resubscribing_to_an_already_subscribed_topic_does_not_replay_again() {
     let resub = Envelope::new(
         PeerId::new(),
         MessageKind::Subscribe {
-            topic: topic("weather.updates"),
+            filter: topic("weather.updates").into(),
         },
     );
     send(&mut subscriber, &resub).await;
@@ -308,7 +312,7 @@ async fn unsubscribed_client_does_not_receive_publish() {
     let sub = Envelope::new(
         PeerId::new(),
         MessageKind::Subscribe {
-            topic: topic("weather.updates"),
+            filter: topic("weather.updates").into(),
         },
     );
     send(&mut client, &sub).await;
@@ -317,7 +321,7 @@ async fn unsubscribed_client_does_not_receive_publish() {
     let unsub = Envelope::new(
         PeerId::new(),
         MessageKind::Unsubscribe {
-            topic: topic("weather.updates"),
+            filter: topic("weather.updates").into(),
         },
     );
     send(&mut client, &unsub).await;
@@ -344,7 +348,7 @@ async fn distinct_topics_do_not_cross_deliver() {
     let sub = Envelope::new(
         PeerId::new(),
         MessageKind::Subscribe {
-            topic: topic("weather.updates"),
+            filter: topic("weather.updates").into(),
         },
     );
     send(&mut subscriber, &sub).await;
@@ -360,6 +364,92 @@ async fn distinct_topics_do_not_cross_deliver() {
     send(&mut publisher, &publish).await;
 
     assert!(recv_times_out(&mut subscriber).await);
+}
+
+#[tokio::test]
+async fn a_wildcard_subscriber_receives_a_matching_publish() {
+    // ADR-0022: a `+` filter matches any single segment in that
+    // position.
+    let addr = spawn_test_node().await;
+    let mut subscriber = connect(addr).await;
+    let mut publisher = connect(addr).await;
+
+    let sub = Envelope::new(
+        PeerId::new(),
+        MessageKind::Subscribe {
+            filter: filter("weather.+"),
+        },
+    );
+    send(&mut subscriber, &sub).await;
+    recv(&mut subscriber).await; // subscribe ack
+
+    let publish = Envelope::new(
+        PeerId::new(),
+        MessageKind::Publish {
+            topic: topic("weather.updates"),
+            payload: b"sunny".to_vec(),
+        },
+    );
+    send(&mut publisher, &publish).await;
+
+    let delivered = recv(&mut subscriber).await;
+    assert_eq!(delivered.kind, publish.kind);
+}
+
+#[tokio::test]
+async fn a_wildcard_subscriber_does_not_receive_a_non_matching_publish() {
+    let addr = spawn_test_node().await;
+    let mut subscriber = connect(addr).await;
+    let mut publisher = connect(addr).await;
+
+    let sub = Envelope::new(
+        PeerId::new(),
+        MessageKind::Subscribe {
+            filter: filter("weather.+"),
+        },
+    );
+    send(&mut subscriber, &sub).await;
+    recv(&mut subscriber).await; // subscribe ack
+
+    let publish = Envelope::new(
+        PeerId::new(),
+        MessageKind::Publish {
+            topic: topic("traffic.updates"),
+            payload: b"jam".to_vec(),
+        },
+    );
+    send(&mut publisher, &publish).await;
+
+    assert!(recv_times_out(&mut subscriber).await);
+}
+
+#[tokio::test]
+async fn an_exact_and_a_matching_wildcard_subscriber_on_the_same_connection_both_deliver() {
+    // Two independent subscriptions (ADR-0022) - the connection should
+    // see the matching publish twice, once per subscription.
+    let addr = spawn_test_node().await;
+    let mut subscriber = connect(addr).await;
+    let mut publisher = connect(addr).await;
+
+    for sub_filter in [filter("weather.updates"), filter("weather.+")] {
+        let sub = Envelope::new(PeerId::new(), MessageKind::Subscribe { filter: sub_filter });
+        send(&mut subscriber, &sub).await;
+        recv(&mut subscriber).await; // subscribe ack
+    }
+
+    let publish = Envelope::new(
+        PeerId::new(),
+        MessageKind::Publish {
+            topic: topic("weather.updates"),
+            payload: b"sunny".to_vec(),
+        },
+    );
+    send(&mut publisher, &publish).await;
+
+    let first = recv(&mut subscriber).await;
+    let second = recv(&mut subscriber).await;
+    assert_eq!(first.kind, publish.kind);
+    assert_eq!(second.kind, publish.kind);
 }
 
 #[tokio::test]
@@ -477,7 +567,7 @@ async fn dial_side_peer_link_forwards_local_publishes_once_subscribed() {
     let sub = Envelope::new(
         peer_id,
         MessageKind::Subscribe {
-            topic: topic("weather.updates"),
+            filter: topic("weather.updates").into(),
         },
     );
     send(&mut peer, &sub).await;
@@ -497,7 +587,7 @@ async fn dial_side_peer_link_forwards_local_publishes_once_subscribed() {
     assert_eq!(
         echoed.kind,
         MessageKind::Subscribe {
-            topic: topic("weather.updates")
+            filter: topic("weather.updates").into()
         }
     );
 
@@ -513,6 +603,56 @@ async fn dial_side_peer_link_forwards_local_publishes_once_subscribed() {
     send(&mut publisher, &publish).await;
 
     // It should be forwarded down the dialed peer link.
+    let delivered = recv(&mut peer).await;
+    assert_eq!(delivered.id, publish.id);
+}
+
+#[tokio::test]
+async fn a_peer_links_wildcard_interest_propagates_and_receives_a_matching_publish() {
+    // Same shape as the exact-topic version above, but the peer's
+    // interest is a pattern (ADR-0022) - interest propagation and
+    // forwarding don't special-case that at all.
+    let peer_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let peer_addr = peer_listener.local_addr().unwrap();
+
+    let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_a = listener_a.local_addr().unwrap();
+    let _node_a = thoth_mesh_node::spawn(listener_a, vec![peer_addr.to_string()]);
+
+    let (socket, _) = timeout(TEST_TIMEOUT, peer_listener.accept())
+        .await
+        .expect("timed out waiting for node A to dial")
+        .unwrap();
+    let mut peer = socket.compat();
+
+    timeout(TEST_TIMEOUT, async_framing::read_frame(&mut peer))
+        .await
+        .expect("timed out waiting for node A's Hello")
+        .unwrap();
+    let peer_id = PeerId::new();
+    let hello_reply = Envelope::new(peer_id, MessageKind::Hello { listen_addr: None });
+    send(&mut peer, &hello_reply).await;
+
+    let sub = Envelope::new(
+        peer_id,
+        MessageKind::Subscribe {
+            filter: filter("weather.+"),
+        },
+    );
+    send(&mut peer, &sub).await;
+    recv(&mut peer).await; // subscribe ack
+    recv(&mut peer).await; // interest echo (ADR-0011)
+
+    let mut publisher = connect(addr_a).await;
+    let publish = Envelope::new(
+        PeerId::new(),
+        MessageKind::Publish {
+            topic: topic("weather.updates"),
+            payload: b"sunny".to_vec(),
+        },
+    );
+    send(&mut publisher, &publish).await;
+
     let delivered = recv(&mut peer).await;
     assert_eq!(delivered.id, publish.id);
 }
@@ -543,7 +683,7 @@ async fn multi_hop_interest_propagates_across_a_chain_of_peers() {
     let sub = Envelope::new(
         PeerId::new(),
         MessageKind::Subscribe {
-            topic: topic("weather.updates"),
+            filter: topic("weather.updates").into(),
         },
     );
     send(&mut subscriber, &sub).await;
@@ -587,7 +727,7 @@ async fn loop_prevention_stops_a_publish_from_bouncing_forever() {
         let sub = Envelope::new(
             PeerId::new(),
             MessageKind::Subscribe {
-                topic: topic("weather.updates"),
+                filter: topic("weather.updates").into(),
             },
         );
         send(client, &sub).await;
