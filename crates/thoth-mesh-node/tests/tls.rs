@@ -186,7 +186,7 @@ async fn two_tls_nodes_federate_and_a_tls_client_publishes_and_subscribes() {
     let sub = Envelope::new(
         thoth_mesh_core::PeerId::new(),
         MessageKind::Subscribe {
-            topic: topic("weather.updates"),
+            filter: topic("weather.updates").into(),
         },
     );
     send(&mut subscriber, &sub).await;
@@ -413,7 +413,7 @@ async fn topic_acl_distinguishes_principals_by_certificate_fingerprint() {
     let sub = Envelope::new(
         thoth_mesh_core::PeerId::new(),
         MessageKind::Subscribe {
-            topic: topic("sensors.data"),
+            filter: topic("sensors.data").into(),
         },
     );
     send(&mut subscriber, &sub).await;
