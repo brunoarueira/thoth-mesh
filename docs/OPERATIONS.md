@@ -133,11 +133,14 @@ thothmesh_topic_acl_rejections_total 0
 thothmesh_metrics_auth_rejections_total 0
 # TYPE thothmesh_peer_topic_acl_rejections_total counter
 thothmesh_peer_topic_acl_rejections_total 0
+# TYPE thothmesh_replayed_messages_total counter
+thothmesh_replayed_messages_total 0
 ```
 
-Six metrics today (ADR-0013, plus `topic_acl_rejections_total` added
-by ADR-0018, `metrics_auth_rejections_total` added by ADR-0019, and
-`peer_topic_acl_rejections_total` added by ADR-0020):
+Seven metrics today (ADR-0013, plus `topic_acl_rejections_total` added
+by ADR-0018, `metrics_auth_rejections_total` added by ADR-0019,
+`peer_topic_acl_rejections_total` added by ADR-0020, and
+`replayed_messages_total` added by ADR-0021):
 
 | Metric | Type | Meaning |
 | --- | --- | --- |
@@ -147,6 +150,7 @@ by ADR-0018, `metrics_auth_rejections_total` added by ADR-0019, and
 | `thothmesh_topic_acl_rejections_total` | counter | `Subscribe`/`Publish` attempts refused by a [`--topic-acl`](#per-topic-client-authorization). Zero unless one is configured. |
 | `thothmesh_metrics_auth_rejections_total` | counter | Scrapes refused by a [`--metrics-token-file`](#metrics-authentication). Zero unless one is configured. |
 | `thothmesh_peer_topic_acl_rejections_total` | counter | `Subscribe`/`Publish` attempts from a peer link refused by a [`--peer-topic-acl`](#peer-scoped-topic-authorization). Zero unless one is configured. |
+| `thothmesh_replayed_messages_total` | counter | Envelopes delivered to a newly-subscribed connection from a topic's [replay buffer](#message-replay) rather than live. Zero on a node where every subscriber connects before any publish it cares about. |
 
 Point a Prometheus `scrape_configs` target at `--metrics-addr` the
 same way you would any other exporter; there's no special
@@ -362,6 +366,31 @@ rejection bumps `thothmesh_peer_topic_acl_rejections_total` (see
 `thothmesh_topic_acl_rejections_total` so a misbehaving peer is
 distinguishable from a misbehaving client at a glance.
 
+## Message replay
+
+Every topic keeps a bounded, in-memory ring buffer of its most
+recently published envelopes — 256 by default, not currently
+configurable via a flag (see
+[ADR-0021](adr/0021-message-replay-ring-buffer.md)). A connection
+subscribing to a topic for the first time is replayed that buffer,
+oldest first, immediately after its `Subscribe` is acknowledged — no
+extra step needed on the client's part, and no wire-protocol change:
+replayed envelopes arrive as ordinary `Publish` messages. This applies
+equally to an ordinary client and to a peer link catching up on
+interest via `--peer` (a peer's own `Subscribe`, sent to catch it up on
+this node's aggregate interest, spawns a forwarder exactly the way a
+client's does).
+
+This is **not** durability across a restart — the buffer is in-memory
+only and empties on every node restart, the same as everything else
+`Broker` tracks. A subscriber connecting after a topic's buffer has
+rolled past its capacity still misses whatever fell off the oldest
+end, silently — the same posture `PROTOCOL.md`'s
+[Delivery semantics](../PROTOCOL.md#delivery-semantics) already
+accepts for a live subscriber that falls behind.
+`thothmesh_replayed_messages_total` (see [Metrics](#metrics)) counts
+how many envelopes have gone out via replay rather than live delivery.
+
 ## Logging
 
 Both binaries use `tracing`. Control verbosity with `RUST_LOG`
@@ -406,10 +435,11 @@ Worth knowing before running this anywhere that matters:
   token for the whole endpoint, not a per-scraper identity, and with
   no token file configured, anyone who can reach the port still gets
   the current render, same as before ADR-0019.
-- **No persistence.** A `Publish` reaches whoever is subscribed at
-  that moment; nothing is stored for a subscriber that connects
-  later, and there's no message replay. See
-  [docs/ROADMAP.md](ROADMAP.md) Phase 8.
+- **No persistence across a restart.** [Message replay](#message-replay)
+  (ADR-0021) lets a subscriber that connects after a publish catch up
+  on recent history, but only within a bounded in-memory buffer that's
+  gone the moment a node restarts — there's still no durable,
+  on-disk store. See [docs/ROADMAP.md](ROADMAP.md) Phase 8.
 - **No config file.** Every flag is set on the command line each
   time; there's no `thoth-mesh.toml` or similar yet. See
   [docs/ROADMAP.md](ROADMAP.md) Phase 10.

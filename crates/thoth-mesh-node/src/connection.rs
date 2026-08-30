@@ -5,6 +5,10 @@
 //! discovery (see ADR-0015). `Subscribe`/`Publish` are authorized
 //! against a client-scoped `--topic-acl` (ADR-0018) or a peer-scoped
 //! `--peer-topic-acl` (ADR-0020), whichever applies to the connection.
+//! A freshly-spawned forwarder replays the topic's buffered backlog
+//! before it starts forwarding live deliveries, so a late subscriber
+//! (client or peer link alike) can catch up on recent history - see
+//! ADR-0021.
 
 use std::collections::{HashMap, HashSet};
 use std::io::ErrorKind;
@@ -546,7 +550,19 @@ fn spawn_forwarder(
     let broker = Arc::clone(broker);
     tokio::spawn(
         async move {
-            let mut rx = broker.subscribe(topic).await;
+            let (backlog, mut rx) = broker.subscribe(topic).await;
+            // Replay whatever this topic's buffer already held, oldest
+            // first, before falling into the live loop below - see
+            // ADR-0021. `Broker::subscribe` guarantees this can't miss
+            // or duplicate anything a concurrent publish sends.
+            if !backlog.is_empty() {
+                metrics.record_replayed_messages(backlog.len() as u64);
+            }
+            for envelope in backlog {
+                if outgoing_tx.send(envelope).await.is_err() {
+                    return;
+                }
+            }
             loop {
                 match rx.recv().await {
                     Ok(envelope) => {

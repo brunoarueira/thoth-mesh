@@ -26,6 +26,11 @@ pub struct Metrics {
     /// Counted separately from `topic_acl_rejections` so an operator
     /// can tell a misbehaving peer apart from a misbehaving client.
     peer_topic_acl_rejections: Arc<AtomicU64>,
+    /// Envelopes delivered to a newly-spawned forwarder from a topic's
+    /// replay buffer (ADR-0021), rather than live. Distinct from
+    /// `Broker::messages_published`, which counts distinct publishes,
+    /// not deliveries.
+    replayed_messages: Arc<AtomicU64>,
 }
 
 impl Metrics {
@@ -60,6 +65,12 @@ impl Metrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Records that `count` envelopes were delivered to a newly-spawned
+    /// forwarder from a topic's replay buffer (ADR-0021).
+    pub fn record_replayed_messages(&self, count: u64) {
+        self.replayed_messages.fetch_add(count, Ordering::Relaxed);
+    }
+
     fn forwarder_lag_total(&self) -> u64 {
         self.forwarder_lag.load(Ordering::Relaxed)
     }
@@ -74,6 +85,10 @@ impl Metrics {
 
     fn peer_topic_acl_rejections_total(&self) -> u64 {
         self.peer_topic_acl_rejections.load(Ordering::Relaxed)
+    }
+
+    fn replayed_messages_total(&self) -> u64 {
+        self.replayed_messages.load(Ordering::Relaxed)
     }
 }
 
@@ -92,13 +107,16 @@ pub fn render_prometheus(membership: &Membership, broker: &Broker, metrics: &Met
          # TYPE thothmesh_metrics_auth_rejections_total counter\n\
          thothmesh_metrics_auth_rejections_total {}\n\
          # TYPE thothmesh_peer_topic_acl_rejections_total counter\n\
-         thothmesh_peer_topic_acl_rejections_total {}\n",
+         thothmesh_peer_topic_acl_rejections_total {}\n\
+         # TYPE thothmesh_replayed_messages_total counter\n\
+         thothmesh_replayed_messages_total {}\n",
         membership.connected_count(),
         broker.messages_published(),
         metrics.forwarder_lag_total(),
         metrics.topic_acl_rejections_total(),
         metrics.metrics_auth_rejections_total(),
         metrics.peer_topic_acl_rejections_total(),
+        metrics.replayed_messages_total(),
     )
 }
 
@@ -150,7 +168,15 @@ mod tests {
     }
 
     #[test]
-    fn render_prometheus_includes_all_six_metrics() {
+    fn record_replayed_messages_accumulates() {
+        let metrics = Metrics::new();
+        metrics.record_replayed_messages(3);
+        metrics.record_replayed_messages(5);
+        assert_eq!(metrics.replayed_messages_total(), 8);
+    }
+
+    #[test]
+    fn render_prometheus_includes_all_seven_metrics() {
         let membership = Membership::new();
         membership.mark_connected(thoth_mesh_core::PeerId::new(), None);
         let broker = Broker::new();
@@ -159,6 +185,7 @@ mod tests {
         metrics.record_topic_acl_rejection();
         metrics.record_metrics_auth_rejection();
         metrics.record_peer_topic_acl_rejection();
+        metrics.record_replayed_messages(2);
 
         let rendered = render_prometheus(&membership, &broker, &metrics);
 
@@ -168,5 +195,6 @@ mod tests {
         assert!(rendered.contains("thothmesh_topic_acl_rejections_total 1"));
         assert!(rendered.contains("thothmesh_metrics_auth_rejections_total 1"));
         assert!(rendered.contains("thothmesh_peer_topic_acl_rejections_total 1"));
+        assert!(rendered.contains("thothmesh_replayed_messages_total 2"));
     }
 }
