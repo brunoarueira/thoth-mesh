@@ -33,3 +33,17 @@ pub enum TopicError {
     #[error("topic contains an invalid character: {0:?}")]
     InvalidChar(char),
 }
+
+/// An invalid [`TopicFilter`](crate::TopicFilter) was constructed. See
+/// ADR-0022.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum TopicFilterError {
+    #[error("topic filter must not be empty")]
+    Empty,
+    #[error("topic filter exceeds the maximum length of {max} bytes (got {len})")]
+    TooLong { len: usize, max: usize },
+    #[error("topic filter contains an invalid character: {0:?}")]
+    InvalidChar(char),
+    #[error("the multi-level wildcard '#' is only valid as the filter's final segment")]
+    MultiLevelWildcardNotLast,
+}

@@ -21,7 +21,7 @@ pub const MAX_TOPIC_LEN: usize = 256;
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Topic(String);
 
-fn is_valid_topic_char(c: char) -> bool {
+pub(crate) fn is_valid_topic_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '/')
 }
 

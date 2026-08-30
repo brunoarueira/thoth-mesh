@@ -27,6 +27,7 @@ thoth-mesh, using the format described in
 | [0019](0019-metrics-endpoint-authentication.md) | Metrics endpoint authentication via shared-secret bearer token |
 | [0020](0020-peer-scoped-topic-restriction.md) | Peer-scoped topic restriction via a second `--peer-topic-acl` list |
 | [0021](0021-message-replay-ring-buffer.md) | Message replay for late subscribers via a bounded per-topic ring buffer |
+| [0022](0022-wildcard-topic-filters.md) | Wildcard/pattern topic matching via MQTT-style topic filters |
 
 To add a new one, copy the format of an existing ADR, number it
 sequentially, and set its status to `Accepted` once the decision is
