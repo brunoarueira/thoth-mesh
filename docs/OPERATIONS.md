@@ -402,9 +402,14 @@ one `.`-delimited segment, and a trailing `#` matches zero or more
 remaining segments. `weather.+` matches `weather.updates` and
 `weather.forecast` but not `weather` itself; `weather.#` matches all
 three. This applies equally to a client and to a peer link's own
-interest — no CLI support yet (the reference `thoth-mesh` client only
-ever sends literal subscribes today), but any client speaking the wire
-protocol directly can use it.
+interest.
+
+```sh
+# Subscribe to any single-segment child of weather.*
+cargo run -p thoth-mesh-cli -- subscribe "weather.+"
+# Subscribe to weather.* and everything under it, any number of levels deep
+cargo run -p thoth-mesh-cli -- subscribe "weather.#"
+```
 
 A subscription holding both a literal and an overlapping wildcard
 filter gets a publish delivered twice, once per subscription — they're

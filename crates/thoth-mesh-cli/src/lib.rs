@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use thoth_mesh_core::{Envelope, MessageKind, PeerId, Topic, async_framing};
+use thoth_mesh_core::{Envelope, MessageKind, PeerId, Topic, TopicFilter, async_framing};
 use thoth_mesh_tls::{MaybeTlsStream, TlsConnector, client_config, load_certs, load_private_key};
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncReadCompatExt};
@@ -55,21 +55,29 @@ pub enum Command {
         /// Payload to send, as UTF-8 text.
         payload: String,
     },
-    /// Subscribe to a topic and print delivered messages until
+    /// Subscribe to a topic filter and print delivered messages until
     /// interrupted (Ctrl-C).
     Subscribe {
-        /// Topic to subscribe to.
-        topic: String,
+        /// Topic filter to subscribe to - a literal topic name, or an
+        /// MQTT-style wildcard pattern (`+` matches one segment, a
+        /// trailing `#` matches the rest; see ADR-0022).
+        filter: String,
     },
 }
 
 /// Runs the CLI: connects to `cli.addr` and executes `cli.command`.
 pub async fn run(cli: Cli) -> std::io::Result<()> {
-    let topic_arg = match &cli.command {
-        Command::Publish { topic, .. } => topic,
-        Command::Subscribe { topic } => topic,
-    };
-    let topic = parse_topic(topic_arg)?;
+    // Validated up front, before dialing anything - a malformed topic
+    // or filter should fail immediately, not only after a possibly
+    // slow connect/TLS handshake.
+    match &cli.command {
+        Command::Publish { topic, .. } => {
+            parse_topic(topic)?;
+        }
+        Command::Subscribe { filter } => {
+            parse_filter(filter)?;
+        }
+    }
 
     let connector = build_connector(&cli)?;
     let tcp = TcpStream::connect(&cli.addr).await?;
@@ -83,7 +91,8 @@ pub async fn run(cli: Cli) -> std::io::Result<()> {
     let sender = PeerId::new();
 
     match cli.command {
-        Command::Publish { payload, .. } => {
+        Command::Publish { topic, payload } => {
+            let topic = parse_topic(&topic)?;
             let envelope = Envelope::new(
                 sender,
                 MessageKind::Publish {
@@ -93,19 +102,22 @@ pub async fn run(cli: Cli) -> std::io::Result<()> {
             );
             send(&mut conn, &envelope).await
         }
-        Command::Subscribe { .. } => subscribe_and_print(&mut conn, sender, topic).await,
+        Command::Subscribe { filter } => {
+            let filter = parse_filter(&filter)?;
+            subscribe_and_print(&mut conn, sender, filter).await
+        }
     }
 }
 
-/// Sends a `Subscribe` for `topic`, waits for its ack, then prints
+/// Sends a `Subscribe` for `filter`, waits for its ack, then prints
 /// each delivered message until interrupted (Ctrl-C).
 async fn subscribe_and_print(
     conn: &mut Compat<MaybeTlsStream>,
     sender: PeerId,
-    topic: Topic,
+    filter: TopicFilter,
 ) -> std::io::Result<()> {
-    subscribe(conn, sender, topic.clone()).await?;
-    println!("Subscribed to {topic}. Waiting for messages (Ctrl-C to stop)...");
+    subscribe(conn, sender, filter.clone()).await?;
+    println!("Subscribed to {filter}. Waiting for messages (Ctrl-C to stop)...");
 
     loop {
         tokio::select! {
@@ -121,10 +133,11 @@ fn print_if_publish(envelope: Envelope) {
     }
 }
 
-/// Sends a `Subscribe` for `topic` and waits for the matching `Ack` -
-/// or, if the node refuses it (e.g. a `--topic-acl`, see ADR-0018),
-/// the matching `Error`, surfaced as an `Err` rather than waiting
-/// forever for an `Ack` that will never come.
+/// Sends a `Subscribe` for `filter` and waits for the matching `Ack` -
+/// or, if the node refuses it (e.g. a `--topic-acl`, see ADR-0018, or
+/// a wildcard `filter` with one configured, see ADR-0022), the
+/// matching `Error`, surfaced as an `Err` rather than waiting forever
+/// for an `Ack` that will never come.
 ///
 /// This is the actual protocol logic behind `subscribe_and_print`,
 /// factored out so tests can drive it directly without simulating
@@ -132,17 +145,9 @@ fn print_if_publish(envelope: Envelope) {
 async fn subscribe(
     conn: &mut Compat<MaybeTlsStream>,
     sender: PeerId,
-    topic: Topic,
+    filter: TopicFilter,
 ) -> std::io::Result<()> {
-    // The CLI only ever sends a literal filter today - ADR-0022's
-    // wildcard syntax isn't exposed on the command line yet (a
-    // follow-up PR), so this conversion is always the trivial case.
-    let envelope = Envelope::new(
-        sender,
-        MessageKind::Subscribe {
-            filter: topic.into(),
-        },
-    );
+    let envelope = Envelope::new(sender, MessageKind::Subscribe { filter });
     send(conn, &envelope).await?;
     loop {
         let received = recv(conn).await?;
@@ -191,6 +196,15 @@ fn parse_topic(s: &str) -> std::io::Result<Topic> {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("invalid topic {s:?}: {err}"),
+        )
+    })
+}
+
+fn parse_filter(s: &str) -> std::io::Result<TopicFilter> {
+    s.parse().map_err(|err| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid topic filter {s:?}: {err}"),
         )
     })
 }
@@ -286,7 +300,7 @@ mod tests {
         // time out.
         timeout(
             TEST_TIMEOUT,
-            subscribe(&mut client, PeerId::new(), topic.clone()),
+            subscribe(&mut client, PeerId::new(), topic.clone().into()),
         )
         .await
         .expect("timed out waiting for the subscribe ack")
@@ -322,6 +336,80 @@ mod tests {
     #[test]
     fn parse_topic_rejects_invalid_topics() {
         assert!(parse_topic("").is_err());
+    }
+
+    #[tokio::test]
+    async fn run_rejects_an_invalid_filter_before_connecting() {
+        // Nothing listens on this address - if run() tried to connect
+        // before validating its argument, this would time out or fail
+        // with a connection error instead of InvalidInput.
+        let cli = Cli {
+            addr: "127.0.0.1:1".to_owned(),
+            tls_ca: None,
+            tls_cert: None,
+            tls_key: None,
+            command: Command::Subscribe {
+                filter: "weather.#.updates".to_owned(),
+            },
+        };
+        let err = timeout(TEST_TIMEOUT, run(cli))
+            .await
+            .expect("run() should fail validation before ever touching the network")
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn parse_filter_rejects_invalid_filters() {
+        assert!(parse_filter("").is_err());
+        assert!(parse_filter("weather.#.updates").is_err());
+    }
+
+    #[test]
+    fn parse_filter_accepts_a_wildcard_pattern() {
+        assert!(parse_filter("weather.+").is_ok());
+        assert!(parse_filter("weather.#").is_ok());
+    }
+
+    #[tokio::test]
+    async fn subscribe_with_a_wildcard_filter_receives_a_matching_publish() {
+        // The CLI's own Command::Subscribe now accepts ADR-0022's
+        // wildcard syntax, not just a literal topic name.
+        let addr = spawn_test_node().await;
+        let mut client = connect(addr).await;
+        let filter: TopicFilter = "weather.+".parse().unwrap();
+
+        timeout(TEST_TIMEOUT, subscribe(&mut client, PeerId::new(), filter))
+            .await
+            .expect("timed out waiting for the subscribe ack")
+            .unwrap();
+
+        let mut publisher = connect(addr).await;
+        let topic: Topic = "weather.updates".parse().unwrap();
+        send(
+            &mut publisher,
+            &Envelope::new(
+                PeerId::new(),
+                MessageKind::Publish {
+                    topic: topic.clone(),
+                    payload: b"sunny".to_vec(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+
+        let delivered = timeout(TEST_TIMEOUT, recv(&mut client))
+            .await
+            .expect("timed out waiting for the publish")
+            .unwrap();
+        assert_eq!(
+            delivered.kind,
+            MessageKind::Publish {
+                topic,
+                payload: b"sunny".to_vec(),
+            }
+        );
     }
 
     #[tokio::test]
