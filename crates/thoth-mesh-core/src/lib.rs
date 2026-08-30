@@ -7,13 +7,15 @@
 pub mod async_framing;
 mod envelope;
 mod error;
+mod filter;
 mod framing;
 mod message;
 mod peer;
 mod topic;
 
 pub use envelope::{Envelope, PROTOCOL_VERSION};
-pub use error::{DecodeError, EncodeError, FramingError, TopicError};
+pub use error::{DecodeError, EncodeError, FramingError, TopicError, TopicFilterError};
+pub use filter::TopicFilter;
 pub use framing::{MAX_FRAME_LEN, read_frame, write_frame};
 pub use message::{MessageId, MessageKind, PeerAdvert};
 pub use peer::PeerId;
