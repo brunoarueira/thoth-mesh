@@ -20,11 +20,57 @@ This produces two binaries under `target/release/`:
 - `thoth-mesh` — the CLI client, for publishing, subscribing, and
   (later) admin.
 
-There's no packaged distribution yet (see
-[docs/ROADMAP.md](ROADMAP.md) Phase 9) — build from source for now.
-The examples below use `cargo run -p <crate> --` in place of the
-built binary path; drop the `--release` flag while iterating, add it
-back for anything you're leaving running for a while.
+Or install the published releases directly, without a checkout:
+
+```sh
+cargo install thoth-mesh-node
+cargo install thoth-mesh-cli   # installs the `thoth-mesh` binary
+```
+
+For a container image, see [Docker](#docker) below. The examples in
+this walkthrough use `cargo run -p <crate> --` in place of the built
+binary path; drop the `--release` flag while iterating, add it back
+for anything you're leaving running for a while.
+
+## Docker
+
+A multi-stage `Dockerfile` at the repo root builds both binaries into
+a minimal, non-root runtime image (see
+[ADR-0023](adr/0023-packaging-docker-and-systemd.md)):
+
+```sh
+docker build -t thoth-mesh .
+```
+
+Run it:
+
+```sh
+docker run -d --name thoth-mesh-node -p 49500:49500 thoth-mesh
+```
+
+The image's default `CMD` binds to `0.0.0.0:49500`, not
+`127.0.0.1:49500` — a node bound to loopback inside the container
+would be unreachable through `-p`, from outside the container's
+network namespace entirely. Append flags to override or extend it
+(this replaces `CMD` outright, same as any Docker image):
+
+```sh
+docker run -d --name thoth-mesh-node -p 49500:49500 -p 9090:9090 \
+  -v "$(pwd)/certs:/certs:ro" \
+  thoth-mesh \
+  --addr 0.0.0.0:49500 --metrics-addr 0.0.0.0:9090 \
+  --peer other-node:49500 \
+  --tls-cert /certs/node-cert.pem --tls-key /certs/node-key.pem --tls-ca /certs/ca-cert.pem
+```
+
+The runtime image is `gcr.io/distroless/cc-debian12` — no shell, so
+there's no `docker exec -it ... sh`, but the CLI is in the same image
+and can still be invoked directly by path:
+
+```sh
+docker exec thoth-mesh-node /usr/local/bin/thoth-mesh \
+  --addr 127.0.0.1:49500 publish demo.topic "hello from inside"
+```
 
 ## Single-node quickstart
 
