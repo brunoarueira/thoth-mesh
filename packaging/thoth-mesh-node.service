@@ -1,0 +1,60 @@
+# Example systemd unit for thoth-mesh-node. Not installed
+# automatically - copy to /etc/systemd/system/thoth-mesh-node.service,
+# adjust ExecStart's binary path if it's not /usr/local/bin, and set
+# up /etc/thoth-mesh/node.env (see thoth-mesh-node.env.example)
+# alongside it. See ADR-0023 and docs/OPERATIONS.md's "systemd"
+# section for the reasoning behind these choices.
+
+[Unit]
+Description=thoth-mesh federated pub/sub node
+Documentation=https://github.com/brunoarueira/thoth-mesh
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# systemd allocates and tears down an ephemeral, unprivileged user for
+# this unit's lifetime - no useradd/groupadd step, nothing left behind
+# if the service is later removed.
+DynamicUser=yes
+
+# thoth-mesh-node takes CLI flags, not environment variables, for its
+# configuration - there's no env-var surface to bind Environment=
+# directives to directly. An *unquoted* $NODE_ARGS in ExecStart= is
+# word-split by systemd the same way a shell would (unlike ${NODE_ARGS},
+# which is not) - see thoth-mesh-node.env.example.
+EnvironmentFile=-/etc/thoth-mesh/node.env
+ExecStart=/usr/local/bin/thoth-mesh-node $NODE_ARGS
+
+# The daemon already has its own connection-level reconnect/backoff
+# for peer links (ADR-0012) - this is the outer layer for the process
+# itself dying (panic, OOM-killed, etc.), not a replacement for that.
+Restart=on-failure
+RestartSec=2
+
+# Hardening: no-cost for a network daemon that reads a handful of
+# cert/key files and opens listening sockets, nothing filesystem-
+# mutating beyond what those need.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+# Empty: this daemon doesn't need any Linux capability to bind a
+# non-privileged port (>1024, the default and every documented example
+# in docs/OPERATIONS.md). If you bind --addr/--metrics-addr below 1024,
+# replace this with CapabilityBoundingSet=CAP_NET_BIND_SERVICE and add
+# AmbientCapabilities=CAP_NET_BIND_SERVICE.
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target
