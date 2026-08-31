@@ -1,0 +1,7 @@
+target
+.git
+.github
+.code-review-graph
+.claude
+docs
+*.md
