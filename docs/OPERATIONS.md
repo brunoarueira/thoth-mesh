@@ -27,10 +27,11 @@ cargo install thoth-mesh-node
 cargo install thoth-mesh-cli   # installs the `thoth-mesh` binary
 ```
 
-For a container image, see [Docker](#docker) below. The examples in
-this walkthrough use `cargo run -p <crate> --` in place of the built
-binary path; drop the `--release` flag while iterating, add it back
-for anything you're leaving running for a while.
+For a container image or a systemd service, see [Docker](#docker) and
+[systemd](#systemd) below. The examples in this walkthrough use
+`cargo run -p <crate> --` in place of the built binary path; drop the
+`--release` flag while iterating, add it back for anything you're
+leaving running for a while.
 
 ## Docker
 
@@ -71,6 +72,43 @@ and can still be invoked directly by path:
 docker exec thoth-mesh-node /usr/local/bin/thoth-mesh \
   --addr 127.0.0.1:49500 publish demo.topic "hello from inside"
 ```
+
+## systemd
+
+An example unit, `packaging/thoth-mesh-node.service`, and an example
+`EnvironmentFile`, `packaging/thoth-mesh-node.env.example` (see
+[ADR-0023](adr/0023-packaging-docker-and-systemd.md)). Not installed
+automatically — copy both, adjust the binary path in `ExecStart=` if
+it isn't `/usr/local/bin`, and edit the env file for your actual
+flags:
+
+```sh
+sudo cp packaging/thoth-mesh-node.service /etc/systemd/system/
+sudo mkdir -p /etc/thoth-mesh
+sudo cp packaging/thoth-mesh-node.env.example /etc/thoth-mesh/node.env
+sudo "$EDITOR" /etc/thoth-mesh/node.env   # at minimum, set --addr
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now thoth-mesh-node
+```
+
+`journalctl -u thoth-mesh-node -f` follows its logs, same `tracing`
+output as running it directly (see [Logging](#logging)).
+
+The unit runs as `DynamicUser=yes` — an ephemeral, unprivileged user
+systemd allocates and tears down with the unit's lifetime, not a
+manually-created account — plus a standard hardening bundle
+(`ProtectSystem=strict`, `NoNewPrivileges=yes`, and friends; see the
+unit file's own comments for the full list and why each is safe for
+this daemon specifically). Since `thoth-mesh-node` takes CLI flags,
+not environment variables, for its configuration, the env file sets a
+single `NODE_ARGS` that `ExecStart=` word-splits the same way a shell
+would — see the unit and env-file comments for why that specific
+`$NODE_ARGS` (unquoted) syntax matters.
+
+If you bind `--addr`/`--metrics-addr` to a port below 1024, the
+default `CapabilityBoundingSet=` (empty) refuses to start — the unit
+file comments where to add `CAP_NET_BIND_SERVICE` instead.
 
 ## Single-node quickstart
 
