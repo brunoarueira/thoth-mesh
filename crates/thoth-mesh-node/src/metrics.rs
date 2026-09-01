@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use thoth_mesh::Membership;
+use thoth_mesh::{Membership, PeerDirectory};
 use thoth_mesh_broker::Broker;
 
 /// The one metric that isn't already naturally owned by an existing
@@ -111,7 +111,12 @@ impl Metrics {
 
 /// Renders the current node metrics as Prometheus text exposition
 /// format - a `# TYPE` line plus a `name value` line per metric.
-pub fn render_prometheus(membership: &Membership, broker: &Broker, metrics: &Metrics) -> String {
+pub fn render_prometheus(
+    membership: &Membership,
+    broker: &Broker,
+    discover: &PeerDirectory,
+    metrics: &Metrics,
+) -> String {
     format!(
         "# TYPE thothmesh_peers_connected gauge\n\
          thothmesh_peers_connected {}\n\
@@ -134,7 +139,9 @@ pub fn render_prometheus(membership: &Membership, broker: &Broker, metrics: &Met
          # TYPE thothmesh_pattern_evictions_total counter\n\
          thothmesh_pattern_evictions_total {}\n\
          # TYPE thothmesh_membership_evictions_total counter\n\
-         thothmesh_membership_evictions_total {}\n",
+         thothmesh_membership_evictions_total {}\n\
+         # TYPE thothmesh_peer_directory_evictions_total counter\n\
+         thothmesh_peer_directory_evictions_total {}\n",
         membership.connected_count(),
         broker.messages_published(),
         metrics.forwarder_lag_total(),
@@ -146,6 +153,7 @@ pub fn render_prometheus(membership: &Membership, broker: &Broker, metrics: &Met
         broker.topic_evictions(),
         broker.pattern_evictions(),
         membership.disconnected_evictions(),
+        discover.evictions(),
     )
 }
 
@@ -213,10 +221,11 @@ mod tests {
     }
 
     #[test]
-    fn render_prometheus_includes_all_eleven_metrics() {
+    fn render_prometheus_includes_all_twelve_metrics() {
         let membership = Membership::new();
         membership.mark_connected(thoth_mesh_core::PeerId::new(), None);
         let broker = Broker::new();
+        let discover = PeerDirectory::new();
         let metrics = Metrics::new();
         metrics.record_forwarder_lag(7);
         metrics.record_topic_acl_rejection();
@@ -225,7 +234,7 @@ mod tests {
         metrics.record_replayed_messages(2);
         metrics.record_lag_recovered(5);
 
-        let rendered = render_prometheus(&membership, &broker, &metrics);
+        let rendered = render_prometheus(&membership, &broker, &discover, &metrics);
 
         assert!(rendered.contains("thothmesh_peers_connected 1"));
         assert!(rendered.contains("thothmesh_messages_published_total 0"));
@@ -238,8 +247,10 @@ mod tests {
         // present.
         assert!(rendered.contains("thothmesh_topic_evictions_total 0"));
         assert!(rendered.contains("thothmesh_pattern_evictions_total 0"));
-        // Same reasoning, for Membership's disconnected-peer cap.
+        // Same reasoning, for Membership's disconnected-peer cap and
+        // PeerDirectory's cap.
         assert!(rendered.contains("thothmesh_membership_evictions_total 0"));
+        assert!(rendered.contains("thothmesh_peer_directory_evictions_total 0"));
         assert!(rendered.contains("thothmesh_replayed_messages_total 2"));
         assert!(rendered.contains("thothmesh_lag_recovered_total 5"));
     }

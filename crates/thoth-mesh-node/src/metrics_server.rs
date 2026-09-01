@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use thoth_mesh::Membership;
+use thoth_mesh::{Membership, PeerDirectory};
 use thoth_mesh_broker::Broker;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -27,6 +27,7 @@ pub async fn serve_metrics(
     listener: TcpListener,
     membership: Membership,
     broker: Arc<Broker>,
+    discover: PeerDirectory,
     metrics: Metrics,
     token: Option<Arc<str>>,
 ) -> std::io::Result<()> {
@@ -35,11 +36,19 @@ pub async fn serve_metrics(
         let (socket, _) = listener.accept().await?;
         let membership = membership.clone();
         let broker = Arc::clone(&broker);
+        let discover = discover.clone();
         let metrics = metrics.clone();
         let token = token.clone();
         tokio::spawn(async move {
-            if let Err(err) =
-                handle_scrape(socket, &membership, &broker, &metrics, token.as_deref()).await
+            if let Err(err) = handle_scrape(
+                socket,
+                &membership,
+                &broker,
+                &discover,
+                &metrics,
+                token.as_deref(),
+            )
+            .await
             {
                 tracing::debug!(%err, "metrics connection ended");
             }
@@ -56,6 +65,7 @@ async fn handle_scrape(
     socket: TcpStream,
     membership: &Membership,
     broker: &Broker,
+    discover: &PeerDirectory,
     metrics: &Metrics,
     token: Option<&str>,
 ) -> std::io::Result<()> {
@@ -102,7 +112,7 @@ async fn handle_scrape(
         }
     }
 
-    let body = render_prometheus(membership, broker, metrics);
+    let body = render_prometheus(membership, broker, discover, metrics);
     let response = format!(
         "HTTP/1.1 200 OK\r\n\
          Content-Type: text/plain; version=0.0.4\r\n\
@@ -149,7 +159,14 @@ mod tests {
         let metrics = Metrics::new();
         metrics.record_forwarder_lag(2);
 
-        tokio::spawn(serve_metrics(listener, membership, broker, metrics, None));
+        tokio::spawn(serve_metrics(
+            listener,
+            membership,
+            broker,
+            PeerDirectory::new(),
+            metrics,
+            None,
+        ));
 
         let mut stream = TcpStream::connect(addr).await.unwrap();
         stream
@@ -177,6 +194,7 @@ mod tests {
             listener,
             Membership::new(),
             Arc::new(Broker::new()),
+            PeerDirectory::new(),
             Metrics::new(),
             None,
         ));
@@ -198,6 +216,7 @@ mod tests {
             listener,
             Membership::new(),
             Arc::new(Broker::new()),
+            PeerDirectory::new(),
             Metrics::new(),
             None,
         ));
@@ -221,6 +240,7 @@ mod tests {
             listener,
             Membership::new(),
             Arc::new(Broker::new()),
+            PeerDirectory::new(),
             metrics.clone(),
             Some(Arc::from("secret-token")),
         ));
@@ -247,6 +267,7 @@ mod tests {
             listener,
             Membership::new(),
             Arc::new(Broker::new()),
+            PeerDirectory::new(),
             metrics.clone(),
             Some(Arc::from("secret-token")),
         ));
@@ -280,6 +301,7 @@ mod tests {
             listener,
             Membership::new(),
             Arc::new(Broker::new()),
+            PeerDirectory::new(),
             Metrics::new(),
             Some(Arc::from("secret-token")),
         ));

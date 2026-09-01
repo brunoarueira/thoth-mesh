@@ -227,14 +227,17 @@ thothmesh_topic_evictions_total 0
 thothmesh_pattern_evictions_total 0
 # TYPE thothmesh_membership_evictions_total counter
 thothmesh_membership_evictions_total 0
+# TYPE thothmesh_peer_directory_evictions_total counter
+thothmesh_peer_directory_evictions_total 0
 ```
 
-Eleven metrics today (ADR-0013, plus `topic_acl_rejections_total`
+Twelve metrics today (ADR-0013, plus `topic_acl_rejections_total`
 added by ADR-0018, `metrics_auth_rejections_total` added by ADR-0019,
 `peer_topic_acl_rejections_total` added by ADR-0020,
 `replayed_messages_total` added by ADR-0021, `lag_recovered_total`
 added by ADR-0024, and `topic_evictions_total`/`pattern_evictions_total`/
-`membership_evictions_total` added by ADR-0025):
+`membership_evictions_total`/`peer_directory_evictions_total` added by
+ADR-0025):
 
 | Metric | Type | Meaning |
 | --- | --- | --- |
@@ -249,6 +252,7 @@ added by ADR-0024, and `topic_evictions_total`/`pattern_evictions_total`/
 | `thothmesh_topic_evictions_total` | counter | Exact-match topics reclaimed for sitting over capacity with no live subscriber (see [Bounded memory footprint](#bounded-memory-footprint)). Zero on a node whose distinct-topic count over its lifetime stays under the cap. |
 | `thothmesh_pattern_evictions_total` | counter | Same as `topic_evictions_total`, for wildcard pattern subscriptions - tracked separately since they're two independent caps. |
 | `thothmesh_membership_evictions_total` | counter | Disconnected peers this node stopped remembering an address for, once over the cap (see [Bounded memory footprint](#bounded-memory-footprint)). A currently-*connected* peer is never counted here. |
+| `thothmesh_peer_directory_evictions_total` | counter | Peers this node stops remembering as dialable, once over the cap - distinct from `membership_evictions_total`: this is every peer ever learned about (gossip or handshake), not just ones this node itself connected to. |
 
 Point a Prometheus `scrape_configs` target at `--metrics-addr` the
 same way you would any other exporter; there's no special
@@ -542,6 +546,19 @@ value generated at every node startup (`PROTOCOL.md`), so a mesh whose
 actual size never changes still sees a new distinct ID every time any
 node in it restarts - without this cap, a long-running node would
 remember every such identity forever.
+
+The same shape covers every peer address this node has ever learned,
+whether from a direct handshake or from gossip about a peer of a peer
+(the `discover` registry behind `--peer` auto-dialing, see
+[ADR-0015](adr/0015-dynamic-peer-discovery-gossip.md)) - also capped
+at 4096, oldest reclaimed first, but refreshed every time a peer is
+re-recorded (a repeat gossip mention or handshake): a peer that keeps
+getting talked about stays fresh, one that's actually gone ages toward
+eviction. `thothmesh_peer_directory_evictions_total` counts this
+happening - distinct from `thothmesh_membership_evictions_total`,
+since this registry has no connected/disconnected concept at all and
+tracks every peer ever heard of, not just ones this node itself
+connected to.
 
 None of these caps are configurable via a flag in v1, consistent with
 every other capacity in this codebase (the replay buffer, the
