@@ -132,7 +132,9 @@ pub fn render_prometheus(membership: &Membership, broker: &Broker, metrics: &Met
          # TYPE thothmesh_topic_evictions_total counter\n\
          thothmesh_topic_evictions_total {}\n\
          # TYPE thothmesh_pattern_evictions_total counter\n\
-         thothmesh_pattern_evictions_total {}\n",
+         thothmesh_pattern_evictions_total {}\n\
+         # TYPE thothmesh_membership_evictions_total counter\n\
+         thothmesh_membership_evictions_total {}\n",
         membership.connected_count(),
         broker.messages_published(),
         metrics.forwarder_lag_total(),
@@ -143,6 +145,7 @@ pub fn render_prometheus(membership: &Membership, broker: &Broker, metrics: &Met
         metrics.lag_recovered_total(),
         broker.topic_evictions(),
         broker.pattern_evictions(),
+        membership.disconnected_evictions(),
     )
 }
 
@@ -210,7 +213,7 @@ mod tests {
     }
 
     #[test]
-    fn render_prometheus_includes_all_ten_metrics() {
+    fn render_prometheus_includes_all_eleven_metrics() {
         let membership = Membership::new();
         membership.mark_connected(thoth_mesh_core::PeerId::new(), None);
         let broker = Broker::new();
@@ -235,6 +238,8 @@ mod tests {
         // present.
         assert!(rendered.contains("thothmesh_topic_evictions_total 0"));
         assert!(rendered.contains("thothmesh_pattern_evictions_total 0"));
+        // Same reasoning, for Membership's disconnected-peer cap.
+        assert!(rendered.contains("thothmesh_membership_evictions_total 0"));
         assert!(rendered.contains("thothmesh_replayed_messages_total 2"));
         assert!(rendered.contains("thothmesh_lag_recovered_total 5"));
     }
