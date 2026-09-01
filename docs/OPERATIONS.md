@@ -225,14 +225,16 @@ thothmesh_lag_recovered_total 0
 thothmesh_topic_evictions_total 0
 # TYPE thothmesh_pattern_evictions_total counter
 thothmesh_pattern_evictions_total 0
+# TYPE thothmesh_membership_evictions_total counter
+thothmesh_membership_evictions_total 0
 ```
 
-Ten metrics today (ADR-0013, plus `topic_acl_rejections_total` added
-by ADR-0018, `metrics_auth_rejections_total` added by ADR-0019,
+Eleven metrics today (ADR-0013, plus `topic_acl_rejections_total`
+added by ADR-0018, `metrics_auth_rejections_total` added by ADR-0019,
 `peer_topic_acl_rejections_total` added by ADR-0020,
 `replayed_messages_total` added by ADR-0021, `lag_recovered_total`
-added by ADR-0024, and `topic_evictions_total`/`pattern_evictions_total`
-added by ADR-0025):
+added by ADR-0024, and `topic_evictions_total`/`pattern_evictions_total`/
+`membership_evictions_total` added by ADR-0025):
 
 | Metric | Type | Meaning |
 | --- | --- | --- |
@@ -246,6 +248,7 @@ added by ADR-0025):
 | `thothmesh_lag_recovered_total` | counter | Envelopes recovered from a topic's replay buffer for a forwarder that fell behind mid-stream (see [Lagged-forwarder recovery](#lagged-forwarder-recovery)), rather than lost. |
 | `thothmesh_topic_evictions_total` | counter | Exact-match topics reclaimed for sitting over capacity with no live subscriber (see [Bounded memory footprint](#bounded-memory-footprint)). Zero on a node whose distinct-topic count over its lifetime stays under the cap. |
 | `thothmesh_pattern_evictions_total` | counter | Same as `topic_evictions_total`, for wildcard pattern subscriptions - tracked separately since they're two independent caps. |
+| `thothmesh_membership_evictions_total` | counter | Disconnected peers this node stopped remembering an address for, once over the cap (see [Bounded memory footprint](#bounded-memory-footprint)). A currently-*connected* peer is never counted here. |
 
 Point a Prometheus `scrape_configs` target at `--metrics-addr` the
 same way you would any other exporter; there's no special
@@ -526,7 +529,21 @@ pattern with **no subscriber left** is capped at 4096 tracked entries;
 once over, the least-recently-touched one with nothing currently
 listening is reclaimed. `thothmesh_topic_evictions_total`/
 `thothmesh_pattern_evictions_total` (see [Metrics](#metrics)) count
-this happening. Not configurable via a flag in v1, consistent with
+this happening.
+
+Peer membership is bounded the same way: a currently-*connected*
+peer's entry is never a candidate - it's live, wanted state, already
+bounded by how many real sockets this node can hold open - but a
+**disconnected** peer (kept only as a last-known address in case it
+reconnects) is capped at 4096 entries, oldest reclaimed first once
+over. `thothmesh_membership_evictions_total` counts this happening.
+This matters more than it might look: a peer's ID is a fresh random
+value generated at every node startup (`PROTOCOL.md`), so a mesh whose
+actual size never changes still sees a new distinct ID every time any
+node in it restarts - without this cap, a long-running node would
+remember every such identity forever.
+
+None of these caps are configurable via a flag in v1, consistent with
 every other capacity in this codebase (the replay buffer, the
 duplicate-message cache).
 
