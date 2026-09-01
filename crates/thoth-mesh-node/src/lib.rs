@@ -127,12 +127,14 @@ pub async fn run_with_tls(
         let metrics_listener = TcpListener::bind(&metrics_addr).await?;
         let membership = shared.membership.clone();
         let broker = Arc::clone(&shared.broker);
+        let discover = shared.discover.clone();
         let metrics = shared.metrics.clone();
         tokio::spawn(async move {
             if let Err(err) = metrics_server::serve_metrics(
                 metrics_listener,
                 membership,
                 broker,
+                discover,
                 metrics,
                 metrics_token,
             )
