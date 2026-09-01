@@ -3,7 +3,9 @@
 //! See ADR-0006 for the design rationale, ADR-0011 for the
 //! duplicate-envelope dedup this crate now also does, ADR-0021 for the
 //! per-topic replay buffer that lets a late subscriber catch up on
-//! recent history, and ADR-0022 for wildcard topic filters.
+//! recent history, ADR-0022 for wildcard topic filters, and ADR-0024
+//! for why the replay buffer is sized larger than the broadcast
+//! channel it sits alongside.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -24,10 +26,18 @@ pub const DEFAULT_TOPIC_CHANNEL_CAPACITY: usize = 256;
 pub const DEFAULT_DEDUP_CAPACITY: usize = 4096;
 
 /// How many recent envelopes each topic's replay buffer keeps for a
-/// late subscriber to catch up on (see ADR-0021) - sized the same as
-/// [`DEFAULT_TOPIC_CHANNEL_CAPACITY`] and, like it, not currently
-/// configurable via a CLI flag.
-pub const DEFAULT_REPLAY_BUFFER_CAPACITY: usize = 256;
+/// late subscriber to catch up on (see ADR-0021), and, since ADR-0024,
+/// for a lagged forwarder to recover from too. Deliberately *larger*
+/// than [`DEFAULT_TOPIC_CHANNEL_CAPACITY`] - see ADR-0024's Decision
+/// for why this gap has to exist for lag recovery to ever find
+/// anything: a `broadcast::Receiver` only reports `Lagged` once its
+/// unread messages have already fallen outside the broadcast channel's
+/// own `DEFAULT_TOPIC_CHANNEL_CAPACITY`-sized window, so a buffer sized
+/// the same as that channel (as this constant originally was under
+/// ADR-0021, before recovery existed) would have already evicted the
+/// exact same range by the time recovery could look for it. Not
+/// currently configurable via a CLI flag.
+pub const DEFAULT_REPLAY_BUFFER_CAPACITY: usize = 1024;
 
 /// An in-process pub/sub broker: routes published envelopes to the
 /// subscribers registered for their topic.

@@ -29,6 +29,7 @@ thoth-mesh, using the format described in
 | [0021](0021-message-replay-ring-buffer.md) | Message replay for late subscribers via a bounded per-topic ring buffer |
 | [0022](0022-wildcard-topic-filters.md) | Wildcard/pattern topic matching via MQTT-style topic filters |
 | [0023](0023-packaging-docker-and-systemd.md) | Packaging: a multi-stage Docker image and a hardened systemd unit |
+| [0024](0024-lagged-forwarder-recovery.md) | Recovering a lagged forwarder from the replay buffer |
 
 To add a new one, copy the format of an existing ADR, number it
 sequentially, and set its status to `Accepted` once the decision is

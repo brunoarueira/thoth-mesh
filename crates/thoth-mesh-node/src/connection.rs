@@ -10,7 +10,10 @@
 //! freshly-spawned forwarder replays the topic filter's buffered
 //! backlog before it starts forwarding live deliveries, so a late
 //! subscriber (client or peer link alike) can catch up on recent
-//! history - see ADR-0021.
+//! history - see ADR-0021. A forwarder that falls behind mid-stream
+//! and lags its broadcast receiver recovers what it can from that
+//! same buffer rather than accepting silent loss outright - see
+//! ADR-0024.
 
 use std::collections::{HashMap, HashSet};
 use std::io::ErrorKind;
@@ -20,7 +23,7 @@ use thoth_mesh::{Interest, PeerDirectory, PeerInfo};
 use thoth_mesh_broker::Broker;
 use thoth_mesh_core::async_framing;
 use thoth_mesh_core::{
-    Envelope, FramingError, MessageKind, PeerAdvert, PeerId, Topic, TopicFilter,
+    Envelope, FramingError, MessageId, MessageKind, PeerAdvert, PeerId, Topic, TopicFilter,
 };
 use thoth_mesh_tls::{MaybeTlsStream, fingerprint};
 use tokio::io::{WriteHalf, split};
@@ -589,7 +592,7 @@ fn spawn_forwarder(
     let broker = Arc::clone(broker);
     tokio::spawn(
         async move {
-            let (backlog, mut rx) = broker.subscribe(filter).await;
+            let (backlog, mut rx) = broker.subscribe(filter.clone()).await;
             // Replay whatever this topic's buffer already held, oldest
             // first, before falling into the live loop below - see
             // ADR-0021. `Broker::subscribe` guarantees this can't miss
@@ -597,22 +600,75 @@ fn spawn_forwarder(
             if !backlog.is_empty() {
                 metrics.record_replayed_messages(backlog.len() as u64);
             }
+            // The `MessageId` of the last envelope actually sent, from
+            // either source below - what ADR-0024's lag recovery
+            // correlates against, without the broker needing to track
+            // per-forwarder position itself.
+            let mut last_delivered: Option<MessageId> = None;
             for envelope in backlog {
+                let id = envelope.id;
                 if outgoing_tx.send(envelope).await.is_err() {
                     return;
                 }
+                last_delivered = Some(id);
             }
             loop {
                 match rx.recv().await {
                     Ok(envelope) => {
+                        let id = envelope.id;
                         if outgoing_tx.send(envelope).await.is_err() {
                             break;
                         }
+                        last_delivered = Some(id);
                     }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        tracing::warn!(skipped, "forwarder lagged, dropped messages");
+                        tracing::warn!(skipped, "forwarder lagged, attempting recovery from replay buffer");
                         metrics.record_forwarder_lag(skipped);
-                        continue;
+
+                        // Re-subscribing reuses ADR-0021's atomic
+                        // buffer-snapshot-plus-receiver-registration
+                        // guarantee instead of a second, parallel
+                        // mechanism for peeking the buffer - see
+                        // ADR-0024.
+                        let (fresh_backlog, fresh_rx) = broker.subscribe(filter.clone()).await;
+                        rx = fresh_rx;
+
+                        let recovered: Vec<Arc<Envelope>> = match last_delivered {
+                            // Nothing was ever delivered live, so the
+                            // whole fresh backlog is safe to send -
+                            // there's nothing it could duplicate.
+                            None => fresh_backlog,
+                            Some(last_id) => {
+                                match fresh_backlog.iter().position(|e| e.id == last_id) {
+                                    Some(idx) => {
+                                        fresh_backlog.into_iter().skip(idx + 1).collect()
+                                    }
+                                    None => {
+                                        // The gap outran the buffer -
+                                        // an unrecoverable loss, same
+                                        // as before ADR-0024. Replaying
+                                        // any of the fresh backlog here
+                                        // risks re-delivering something
+                                        // this forwarder already got
+                                        // live before lagging.
+                                        tracing::warn!(
+                                            "lag recovery gap exceeded the replay buffer, some messages are unrecoverably lost"
+                                        );
+                                        Vec::new()
+                                    }
+                                }
+                            }
+                        };
+                        if !recovered.is_empty() {
+                            metrics.record_lag_recovered(recovered.len() as u64);
+                        }
+                        for envelope in recovered {
+                            let id = envelope.id;
+                            if outgoing_tx.send(envelope).await.is_err() {
+                                return;
+                            }
+                            last_delivered = Some(id);
+                        }
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
@@ -625,6 +681,118 @@ fn spawn_forwarder(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
+    use std::time::Duration;
+
+    /// Publishes `count` sequential envelopes to `topic` - `payload` is
+    /// the 4-byte big-endian index, so a test can decode delivery order
+    /// back out without caring about `MessageId`s.
+    async fn publish_sequence(broker: &Broker, topic: &Topic, count: u32) {
+        for i in 0..count {
+            let envelope = Envelope::new(
+                PeerId::new(),
+                MessageKind::Publish {
+                    topic: topic.clone(),
+                    payload: i.to_be_bytes().to_vec(),
+                },
+            );
+            broker.publish(topic, Arc::new(envelope)).await;
+        }
+    }
+
+    fn sequence_of(envelope: &Envelope) -> u32 {
+        let MessageKind::Publish { payload, .. } = &envelope.kind else {
+            panic!("expected a Publish envelope, got {:?}", envelope.kind);
+        };
+        u32::from_be_bytes(payload[..4].try_into().unwrap())
+    }
+
+    /// A `Lagged` gap that fits within the replay buffer's extra
+    /// headroom over the broadcast channel's own capacity (see
+    /// ADR-0024's sizing rationale) is fully recovered - a forwarder
+    /// blocked on a tiny, undrained outgoing channel while several
+    /// hundred envelopes are published still ends up seeing every one
+    /// of them, in order, with nothing duplicated.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lagged_forwarder_recovers_a_gap_within_the_buffers_headroom() {
+        let broker = Arc::new(Broker::new());
+        let topic = Topic::from_str("weather.updates").unwrap();
+        let filter: TopicFilter = topic.clone().into();
+        const CHANNEL_CAPACITY: usize = 8;
+        const TOTAL: u32 = 500;
+
+        let (outgoing_tx, mut outgoing_rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let _handle = spawn_forwarder(&broker, filter, outgoing_tx, Metrics::new());
+        // Give the forwarder's initial `Broker::subscribe` a moment to
+        // register before anything is published, so what follows is a
+        // genuine live-then-lag sequence rather than a race against a
+        // still-empty broker.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Nobody drains `outgoing_rx` during this - the forwarder fills
+        // the channel, blocks on the next send, and stops polling its
+        // broadcast receiver entirely until draining starts below.
+        publish_sequence(&broker, &topic, TOTAL).await;
+
+        let mut received = Vec::with_capacity(TOTAL as usize);
+        while received.len() < TOTAL as usize {
+            let envelope = tokio::time::timeout(Duration::from_secs(5), outgoing_rx.recv())
+                .await
+                .expect("timed out waiting for a delivery")
+                .expect("forwarder's outgoing channel closed early");
+            received.push(sequence_of(&envelope));
+        }
+
+        assert_eq!(
+            received,
+            (0..TOTAL).collect::<Vec<_>>(),
+            "every envelope should have arrived exactly once, in order"
+        );
+    }
+
+    /// A gap larger than the replay buffer's headroom is still only
+    /// *partially* recoverable, exactly as ADR-0024 documents: whatever
+    /// the outgoing channel already absorbed before blocking still
+    /// arrives, but the unrecoverable remainder is dropped rather than
+    /// guessed at - never re-delivering something already sent live.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lagged_forwarder_beyond_the_buffers_headroom_loses_the_unrecoverable_remainder() {
+        let broker = Arc::new(Broker::new());
+        let topic = Topic::from_str("weather.updates").unwrap();
+        let filter: TopicFilter = topic.clone().into();
+        const CHANNEL_CAPACITY: usize = 8;
+        const TOTAL: u32 = 2000;
+
+        let (outgoing_tx, mut outgoing_rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let _handle = spawn_forwarder(&broker, filter, outgoing_tx, Metrics::new());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        publish_sequence(&broker, &topic, TOTAL).await;
+
+        let mut received = Vec::new();
+        // Nothing more arrives once this times out - recovery already
+        // gave up on the unrecoverable remainder.
+        while let Ok(Some(envelope)) =
+            tokio::time::timeout(Duration::from_millis(500), outgoing_rx.recv()).await
+        {
+            received.push(sequence_of(&envelope));
+        }
+
+        for pair in received.windows(2) {
+            assert!(
+                pair[0] < pair[1],
+                "delivery should never reorder or duplicate: {received:?}"
+            );
+        }
+        assert!(
+            (received.len() as u32) < TOTAL,
+            "a gap this large should exceed the buffer's headroom: {received:?}"
+        );
+        assert!(
+            !received.is_empty(),
+            "whatever fit in the outgoing channel before it blocked should still arrive"
+        );
+    }
 
     #[test]
     fn unexpected_eof_is_a_clean_disconnect() {
