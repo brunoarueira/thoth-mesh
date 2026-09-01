@@ -3,11 +3,13 @@
 //! See ADR-0006 for the design rationale, ADR-0011 for the
 //! duplicate-envelope dedup this crate now also does, ADR-0021 for the
 //! per-topic replay buffer that lets a late subscriber catch up on
-//! recent history, ADR-0022 for wildcard topic filters, and ADR-0024
-//! for why the replay buffer is sized larger than the broadcast
-//! channel it sits alongside.
+//! recent history, ADR-0022 for wildcard topic filters, ADR-0024 for
+//! why the replay buffer is sized larger than the broadcast channel it
+//! sits alongside, and ADR-0025 for why `topics`/`patterns` are each
+//! capped, never evicting an entry with a live subscriber.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::Hash;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -39,6 +41,16 @@ pub const DEFAULT_DEDUP_CAPACITY: usize = 4096;
 /// currently configurable via a CLI flag.
 pub const DEFAULT_REPLAY_BUFFER_CAPACITY: usize = 1024;
 
+/// How many distinct entries [`Broker`]'s `topics` map and `patterns`
+/// map each keep, independently, before the least-recently-touched
+/// entry with no live subscriber is reclaimed (see ADR-0025). A
+/// `TopicChannel` with at least one live [`broadcast::Receiver`] is
+/// never a candidate, no matter how long it's gone untouched - this
+/// bounds accumulated cruft (topics or patterns nobody's listened to
+/// in a long time), not currently-live subscriptions, which stay
+/// unbounded on purpose. Not currently configurable via a CLI flag.
+pub const DEFAULT_TOPIC_MAP_CAPACITY: usize = 4096;
+
 /// An in-process pub/sub broker: routes published envelopes to the
 /// subscribers registered for their topic.
 ///
@@ -53,14 +65,20 @@ pub const DEFAULT_REPLAY_BUFFER_CAPACITY: usize = 1024;
 /// cyclic peer mesh from circulating forever (see ADR-0011).
 #[derive(Debug)]
 pub struct Broker {
-    topics: RwLock<HashMap<Topic, Arc<TopicChannel>>>,
+    topics: RwLock<TopicMap<Topic>>,
     /// Wildcard filter subscriptions (ADR-0022) - kept separate from
     /// `topics` so the exact-match path above is completely unchanged
     /// (same type, same lookup, same cost) for the common
     /// non-wildcard case.
-    patterns: RwLock<HashMap<TopicFilter, Arc<TopicChannel>>>,
+    patterns: RwLock<TopicMap<TopicFilter>>,
     seen: Mutex<SeenIds>,
     messages_published: AtomicU64,
+    /// How many `topics` entries have been reclaimed for being over
+    /// [`DEFAULT_TOPIC_MAP_CAPACITY`] with no live subscriber (see
+    /// ADR-0025).
+    topic_evictions: AtomicU64,
+    /// Same as `topic_evictions`, for `patterns`.
+    pattern_evictions: AtomicU64,
 }
 
 impl Default for Broker {
@@ -70,6 +88,8 @@ impl Default for Broker {
             patterns: RwLock::default(),
             seen: Mutex::new(SeenIds::new(DEFAULT_DEDUP_CAPACITY)),
             messages_published: AtomicU64::new(0),
+            topic_evictions: AtomicU64::new(0),
+            pattern_evictions: AtomicU64::new(0),
         }
     }
 }
@@ -103,19 +123,11 @@ impl Broker {
         let channel = match filter.as_topic() {
             Some(topic) => {
                 let mut topics = self.topics.write().await;
-                Arc::clone(
-                    topics
-                        .entry(topic)
-                        .or_insert_with(|| Arc::new(TopicChannel::new())),
-                )
+                topics.get_or_insert(topic, &self.topic_evictions)
             }
             None => {
                 let mut patterns = self.patterns.write().await;
-                Arc::clone(
-                    patterns
-                        .entry(filter)
-                        .or_insert_with(|| Arc::new(TopicChannel::new())),
-                )
+                patterns.get_or_insert(filter, &self.pattern_evictions)
             }
         };
         channel.subscribe()
@@ -148,11 +160,7 @@ impl Broker {
 
         let exact_channel = {
             let mut topics = self.topics.write().await;
-            Arc::clone(
-                topics
-                    .entry(topic.clone())
-                    .or_insert_with(|| Arc::new(TopicChannel::new())),
-            )
+            topics.get_or_insert(topic.clone(), &self.topic_evictions)
         };
         let mut delivered = exact_channel.publish(Arc::clone(&envelope));
 
@@ -161,7 +169,11 @@ impl Broker {
         // patterns), not O(subscribers), since same-pattern
         // subscribers already share one `TopicChannel`. A linear scan
         // is the deliberate v1 answer (see ADR-0022); a prefix index
-        // is worth it only once this is shown to matter at scale.
+        // is worth it only once this is shown to matter at scale. Kept
+        // as a read lock deliberately (see ADR-0025) - a match here
+        // doesn't refresh that pattern's eviction recency, so a burst
+        // of publishes doesn't serialize behind pattern-map
+        // contention the way it didn't before that ADR.
         let patterns = self.patterns.read().await;
         for (filter, channel) in patterns.iter() {
             if filter.matches(topic) {
@@ -175,6 +187,104 @@ impl Broker {
     /// through this broker since it was created - see ADR-0013.
     pub fn messages_published(&self) -> u64 {
         self.messages_published.load(Ordering::Relaxed)
+    }
+
+    /// How many `topics` entries have been reclaimed for sitting over
+    /// [`DEFAULT_TOPIC_MAP_CAPACITY`] with no live subscriber (see
+    /// ADR-0025).
+    pub fn topic_evictions(&self) -> u64 {
+        self.topic_evictions.load(Ordering::Relaxed)
+    }
+
+    /// Same as [`topic_evictions`](Self::topic_evictions), for
+    /// `patterns`.
+    pub fn pattern_evictions(&self) -> u64 {
+        self.pattern_evictions.load(Ordering::Relaxed)
+    }
+}
+
+/// A `HashMap<K, Arc<TopicChannel>>` paired with a `VecDeque<K>`
+/// tracking touch order, so the least-recently-touched entry can be
+/// found when [`DEFAULT_TOPIC_MAP_CAPACITY`] is exceeded (see
+/// ADR-0025). Both live under the map's own lock in [`Broker`], so
+/// there's no separate lock-ordering question between the two.
+#[derive(Debug)]
+struct TopicMap<K> {
+    map: HashMap<K, Arc<TopicChannel>>,
+    order: VecDeque<K>,
+}
+
+impl<K> Default for TopicMap<K> {
+    fn default() -> Self {
+        Self {
+            map: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+}
+
+impl<K: Eq + Hash + Clone> TopicMap<K> {
+    /// Gets `key`'s channel, creating it if this is the first time
+    /// `key` has ever been seen. Either way, `key` becomes the most
+    /// recently touched entry; a fresh insert additionally enforces
+    /// the capacity, reclaiming the least-recently-touched entry with
+    /// no live subscriber if the map is now over it (see
+    /// [`evict_over_capacity`](Self::evict_over_capacity)).
+    fn get_or_insert(&mut self, key: K, evictions: &AtomicU64) -> Arc<TopicChannel> {
+        if let Some(channel) = self.map.get(&key) {
+            let channel = Arc::clone(channel);
+            self.touch(&key);
+            return channel;
+        }
+        let channel = Arc::new(TopicChannel::new());
+        self.map.insert(key.clone(), Arc::clone(&channel));
+        self.order.push_back(key);
+        self.evict_over_capacity(evictions);
+        channel
+    }
+
+    /// Moves `key` to the back of the touch-order queue, if present -
+    /// a no-op otherwise. `O(capacity)` in the worst case (a linear
+    /// scan of `order`), acceptable here since it only runs once per
+    /// `subscribe`/`publish` call to an *existing* entry, not per
+    /// envelope.
+    fn touch(&mut self, key: &K) {
+        if let Some(pos) = self.order.iter().position(|queued| queued == key) {
+            if let Some(entry) = self.order.remove(pos) {
+                self.order.push_back(entry);
+            }
+        }
+    }
+
+    /// Reclaims the least-recently-touched entry with no live
+    /// subscriber, if the map is over [`DEFAULT_TOPIC_MAP_CAPACITY`]
+    /// and such an entry exists. Scans forward from the front of
+    /// `order` rather than assuming the front itself is evictable - an
+    /// entry with a live [`broadcast::Receiver`] is never a candidate,
+    /// even if that means staying over capacity this time (see
+    /// ADR-0025). Evicts at most one entry per call - `get_or_insert`
+    /// only ever grows the map by one at a time, so one eviction is
+    /// enough to stay at capacity whenever an evictable entry exists
+    /// at all.
+    fn evict_over_capacity(&mut self, evictions: &AtomicU64) {
+        if self.map.len() <= DEFAULT_TOPIC_MAP_CAPACITY {
+            return;
+        }
+        let map = &self.map;
+        let Some(pos) = self.order.iter().position(|key| {
+            map.get(key)
+                .is_some_and(|channel| channel.sender.receiver_count() == 0)
+        }) else {
+            return;
+        };
+        if let Some(key) = self.order.remove(pos) {
+            self.map.remove(&key);
+            evictions.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&K, &Arc<TopicChannel>)> {
+        self.map.iter()
     }
 }
 
@@ -578,6 +688,97 @@ mod tests {
         assert_eq!(rx.recv().await.unwrap(), sunny);
         assert_eq!(rx.recv().await.unwrap(), heavy);
         assert!(rx.try_recv().is_err());
+    }
+
+    /// Subscribes to `topic`, then immediately drops the receiver -
+    /// leaves a `TopicChannel` behind with a live buffer but zero
+    /// receivers, exactly the eviction-eligible shape ADR-0025 targets.
+    async fn subscribe_then_abandon(broker: &Broker, topic: Topic) {
+        drop(broker.subscribe(topic.into()).await);
+    }
+
+    #[tokio::test]
+    async fn topics_over_capacity_evicts_the_oldest_entry_with_no_live_subscriber() {
+        let broker = Broker::new();
+        let evicted = Topic::from_str("topic.0").unwrap();
+        subscribe_then_abandon(&broker, evicted.clone()).await;
+
+        // Fill up to (and one past) capacity with distinct topics -
+        // `evicted` is the least-recently-touched entry throughout,
+        // and has no live receiver, so it's the one reclaimed.
+        for i in 1..=DEFAULT_TOPIC_MAP_CAPACITY {
+            subscribe_then_abandon(&broker, Topic::from_str(&format!("topic.{i}")).unwrap()).await;
+        }
+
+        assert_eq!(broker.topic_evictions(), 1);
+        // A fresh subscribe to the evicted topic gets an empty
+        // backlog, same as if it had never been touched before - its
+        // prior (empty, in this test) history is gone along with it.
+        let (backlog, _rx) = broker.subscribe(evicted.into()).await;
+        assert!(backlog.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_topic_with_a_live_subscriber_is_never_evicted_even_over_capacity() {
+        let broker = Broker::new();
+        let protected = Topic::from_str("topic.protected").unwrap();
+        // Held for the rest of the test - this receiver is what makes
+        // `protected` ineligible for eviction.
+        let _rx = subscribe_live(&broker, protected.clone()).await;
+
+        for i in 0..=DEFAULT_TOPIC_MAP_CAPACITY {
+            subscribe_then_abandon(&broker, Topic::from_str(&format!("topic.{i}")).unwrap()).await;
+        }
+
+        // Nothing else was eligible either (every other entry in this
+        // test is also abandoned) - eviction did happen, just never
+        // against `protected`, which a non-empty backlog after a
+        // publish (rather than a topic reset back to empty) confirms.
+        assert!(broker.topic_evictions() >= 1);
+        let envelope = publish_envelope(&protected, b"still here");
+        assert_eq!(broker.publish(&protected, envelope).await, 1);
+    }
+
+    #[tokio::test]
+    async fn re_touching_an_entry_protects_it_from_being_the_next_eviction() {
+        let broker = Broker::new();
+        let refreshed = Topic::from_str("topic.refreshed").unwrap();
+        subscribe_then_abandon(&broker, refreshed.clone()).await;
+
+        // Fill to just below capacity with other topics.
+        for i in 1..DEFAULT_TOPIC_MAP_CAPACITY {
+            subscribe_then_abandon(&broker, Topic::from_str(&format!("topic.{i}")).unwrap()).await;
+        }
+        assert_eq!(broker.topic_evictions(), 0);
+
+        // Touch `refreshed` again, moving it to the back of the queue
+        // - `topic.1` (untouched since its own insert) is now the
+        // least-recently-touched entry instead.
+        subscribe_then_abandon(&broker, refreshed.clone()).await;
+        subscribe_then_abandon(&broker, Topic::from_str("topic.one_more").unwrap()).await;
+
+        assert_eq!(broker.topic_evictions(), 1);
+        let (backlog, _rx) = broker.subscribe(refreshed.into()).await;
+        assert!(
+            backlog.is_empty(),
+            "refreshed should still exist (empty backlog, not evicted)"
+        );
+    }
+
+    #[tokio::test]
+    async fn patterns_are_capped_and_evicted_independently_of_topics() {
+        let broker = Broker::new();
+        let evicted = filter("evicted.+");
+        drop(broker.subscribe(evicted.clone()).await);
+
+        for i in 0..DEFAULT_TOPIC_MAP_CAPACITY {
+            drop(broker.subscribe(filter(&format!("pattern.{i}.+"))).await);
+        }
+
+        assert_eq!(broker.pattern_evictions(), 1);
+        assert_eq!(broker.topic_evictions(), 0, "topics is a separate cap");
+        let (backlog, _rx) = broker.subscribe(evicted).await;
+        assert!(backlog.is_empty());
     }
 
     #[test]
