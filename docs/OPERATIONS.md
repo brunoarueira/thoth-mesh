@@ -221,13 +221,18 @@ thothmesh_peer_topic_acl_rejections_total 0
 thothmesh_replayed_messages_total 0
 # TYPE thothmesh_lag_recovered_total counter
 thothmesh_lag_recovered_total 0
+# TYPE thothmesh_topic_evictions_total counter
+thothmesh_topic_evictions_total 0
+# TYPE thothmesh_pattern_evictions_total counter
+thothmesh_pattern_evictions_total 0
 ```
 
-Eight metrics today (ADR-0013, plus `topic_acl_rejections_total` added
+Ten metrics today (ADR-0013, plus `topic_acl_rejections_total` added
 by ADR-0018, `metrics_auth_rejections_total` added by ADR-0019,
 `peer_topic_acl_rejections_total` added by ADR-0020,
-`replayed_messages_total` added by ADR-0021, and `lag_recovered_total`
-added by ADR-0024):
+`replayed_messages_total` added by ADR-0021, `lag_recovered_total`
+added by ADR-0024, and `topic_evictions_total`/`pattern_evictions_total`
+added by ADR-0025):
 
 | Metric | Type | Meaning |
 | --- | --- | --- |
@@ -239,6 +244,8 @@ added by ADR-0024):
 | `thothmesh_peer_topic_acl_rejections_total` | counter | `Subscribe`/`Publish` attempts from a peer link refused by a [`--peer-topic-acl`](#peer-scoped-topic-authorization). Zero unless one is configured. |
 | `thothmesh_replayed_messages_total` | counter | Envelopes delivered to a newly-subscribed connection from a topic's [replay buffer](#message-replay) rather than live. Zero on a node where every subscriber connects before any publish it cares about. |
 | `thothmesh_lag_recovered_total` | counter | Envelopes recovered from a topic's replay buffer for a forwarder that fell behind mid-stream (see [Lagged-forwarder recovery](#lagged-forwarder-recovery)), rather than lost. |
+| `thothmesh_topic_evictions_total` | counter | Exact-match topics reclaimed for sitting over capacity with no live subscriber (see [Bounded memory footprint](#bounded-memory-footprint)). Zero on a node whose distinct-topic count over its lifetime stays under the cap. |
+| `thothmesh_pattern_evictions_total` | counter | Same as `topic_evictions_total`, for wildcard pattern subscriptions - tracked separately since they're two independent caps. |
 
 Point a Prometheus `scrape_configs` target at `--metrics-addr` the
 same way you would any other exporter; there's no special
@@ -505,6 +512,23 @@ before this existed. `thothmesh_lag_recovered_total` (see
 this way — comparing it against `thothmesh_forwarder_lag_total` shows
 how much of a node's reported lag is being absorbed versus genuinely
 lost.
+
+## Bounded memory footprint
+
+A node's live mesh state is entirely in-memory, with no persistence
+layer (see [Message replay](#message-replay) above for the one form of
+history that does get kept) - several of the structures holding it are
+audited and capped in [ADR-0025](adr/0025-bound-per-node-memory-footprint.md)
+so a long-running node's memory use doesn't grow without limit.
+Currently-subscribed topics and patterns are never bounded themselves
+- that's live, wanted state - but an exact-match topic or wildcard
+pattern with **no subscriber left** is capped at 4096 tracked entries;
+once over, the least-recently-touched one with nothing currently
+listening is reclaimed. `thothmesh_topic_evictions_total`/
+`thothmesh_pattern_evictions_total` (see [Metrics](#metrics)) count
+this happening. Not configurable via a flag in v1, consistent with
+every other capacity in this codebase (the replay buffer, the
+duplicate-message cache).
 
 ## Wildcard topic filters
 
