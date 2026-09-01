@@ -31,6 +31,13 @@ pub struct Metrics {
     /// `Broker::messages_published`, which counts distinct publishes,
     /// not deliveries.
     replayed_messages: Arc<AtomicU64>,
+    /// Envelopes recovered from a topic's replay buffer after a
+    /// forwarder lagged mid-stream (ADR-0024) - distinct from
+    /// `replayed_messages` (a newly-spawned forwarder's initial
+    /// catch-up) and from `forwarder_lag` (the raw skip count
+    /// `tokio::sync::broadcast` reports, which can differ from how
+    /// much was actually recoverable).
+    lag_recovered: Arc<AtomicU64>,
 }
 
 impl Metrics {
@@ -71,6 +78,12 @@ impl Metrics {
         self.replayed_messages.fetch_add(count, Ordering::Relaxed);
     }
 
+    /// Records that `count` envelopes were recovered from a topic's
+    /// replay buffer after a forwarder lagged mid-stream (ADR-0024).
+    pub fn record_lag_recovered(&self, count: u64) {
+        self.lag_recovered.fetch_add(count, Ordering::Relaxed);
+    }
+
     fn forwarder_lag_total(&self) -> u64 {
         self.forwarder_lag.load(Ordering::Relaxed)
     }
@@ -89,6 +102,10 @@ impl Metrics {
 
     fn replayed_messages_total(&self) -> u64 {
         self.replayed_messages.load(Ordering::Relaxed)
+    }
+
+    fn lag_recovered_total(&self) -> u64 {
+        self.lag_recovered.load(Ordering::Relaxed)
     }
 }
 
@@ -109,7 +126,9 @@ pub fn render_prometheus(membership: &Membership, broker: &Broker, metrics: &Met
          # TYPE thothmesh_peer_topic_acl_rejections_total counter\n\
          thothmesh_peer_topic_acl_rejections_total {}\n\
          # TYPE thothmesh_replayed_messages_total counter\n\
-         thothmesh_replayed_messages_total {}\n",
+         thothmesh_replayed_messages_total {}\n\
+         # TYPE thothmesh_lag_recovered_total counter\n\
+         thothmesh_lag_recovered_total {}\n",
         membership.connected_count(),
         broker.messages_published(),
         metrics.forwarder_lag_total(),
@@ -117,6 +136,7 @@ pub fn render_prometheus(membership: &Membership, broker: &Broker, metrics: &Met
         metrics.metrics_auth_rejections_total(),
         metrics.peer_topic_acl_rejections_total(),
         metrics.replayed_messages_total(),
+        metrics.lag_recovered_total(),
     )
 }
 
@@ -176,7 +196,15 @@ mod tests {
     }
 
     #[test]
-    fn render_prometheus_includes_all_seven_metrics() {
+    fn record_lag_recovered_accumulates() {
+        let metrics = Metrics::new();
+        metrics.record_lag_recovered(4);
+        metrics.record_lag_recovered(6);
+        assert_eq!(metrics.lag_recovered_total(), 10);
+    }
+
+    #[test]
+    fn render_prometheus_includes_all_eight_metrics() {
         let membership = Membership::new();
         membership.mark_connected(thoth_mesh_core::PeerId::new(), None);
         let broker = Broker::new();
@@ -186,6 +214,7 @@ mod tests {
         metrics.record_metrics_auth_rejection();
         metrics.record_peer_topic_acl_rejection();
         metrics.record_replayed_messages(2);
+        metrics.record_lag_recovered(5);
 
         let rendered = render_prometheus(&membership, &broker, &metrics);
 
@@ -196,5 +225,6 @@ mod tests {
         assert!(rendered.contains("thothmesh_metrics_auth_rejections_total 1"));
         assert!(rendered.contains("thothmesh_peer_topic_acl_rejections_total 1"));
         assert!(rendered.contains("thothmesh_replayed_messages_total 2"));
+        assert!(rendered.contains("thothmesh_lag_recovered_total 5"));
     }
 }

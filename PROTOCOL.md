@@ -356,15 +356,21 @@ guarantee:
   reachable through the mesh; a subscriber connecting afterward is
   additionally replayed each topic's recent backlog (a bounded
   in-memory ring buffer, capacity `DEFAULT_REPLAY_BUFFER_CAPACITY`,
-  currently 256, per topic) - see
+  currently 1024, per topic) - see
   [ADR-0021](docs/adr/0021-message-replay-ring-buffer.md). A subscriber
   connecting after a topic's backlog has rolled past that capacity
   still misses whatever fell off the oldest end.
-- **A slow subscriber can miss messages.** Delivery to each
-  subscriber goes through a bounded channel; a subscriber that falls
-  too far behind gets some of its messages silently dropped rather
-  than the sender blocking or the connection failing. There's no
-  wire-level signal to a client when this happens.
+- **A slow subscriber can miss messages - but recovers what it can.**
+  Delivery to each subscriber goes through a bounded channel; a
+  subscriber that falls too far behind has the gap recovered from the
+  same per-topic replay buffer a late subscriber catches up from
+  (ADR-0021), rather than the sender blocking or the connection
+  failing - see [ADR-0024](docs/adr/0024-lagged-forwarder-recovery.md).
+  This is bounded, not guaranteed: a gap wider than the buffer's
+  headroom above the live channel's own capacity still drops the
+  oldest messages in it silently. There's no wire-level signal to a
+  client either way - recovered messages arrive as ordinary `Publish`
+  messages, indistinguishable from a live delivery.
 - **De-duplication, not exactly-once.** An envelope crossing more
   than one hop of a cyclic mesh keeps its original `MessageId`
   end-to-end, and each node remembers a bounded number of recently

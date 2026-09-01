@@ -219,22 +219,26 @@ thothmesh_metrics_auth_rejections_total 0
 thothmesh_peer_topic_acl_rejections_total 0
 # TYPE thothmesh_replayed_messages_total counter
 thothmesh_replayed_messages_total 0
+# TYPE thothmesh_lag_recovered_total counter
+thothmesh_lag_recovered_total 0
 ```
 
-Seven metrics today (ADR-0013, plus `topic_acl_rejections_total` added
+Eight metrics today (ADR-0013, plus `topic_acl_rejections_total` added
 by ADR-0018, `metrics_auth_rejections_total` added by ADR-0019,
-`peer_topic_acl_rejections_total` added by ADR-0020, and
-`replayed_messages_total` added by ADR-0021):
+`peer_topic_acl_rejections_total` added by ADR-0020,
+`replayed_messages_total` added by ADR-0021, and `lag_recovered_total`
+added by ADR-0024):
 
 | Metric | Type | Meaning |
 | --- | --- | --- |
 | `thothmesh_peers_connected` | gauge | Peer links currently up (not client connections). |
 | `thothmesh_messages_published_total` | counter | `Publish` messages this node has processed since startup. |
-| `thothmesh_forwarder_lag_total` | counter | Envelopes silently dropped because a subscriber's delivery channel fell behind (see [`PROTOCOL.md`](../PROTOCOL.md#delivery-semantics)). Nonzero here means a consumer is too slow, not that the node is misbehaving. |
+| `thothmesh_forwarder_lag_total` | counter | Envelopes a subscriber's delivery channel skipped because it fell behind (see [`PROTOCOL.md`](../PROTOCOL.md#delivery-semantics)). Nonzero here means a consumer is too slow, not that the node is misbehaving - compare against `lag_recovered_total` to see how much of this was actually recovered rather than lost. |
 | `thothmesh_topic_acl_rejections_total` | counter | `Subscribe`/`Publish` attempts refused by a [`--topic-acl`](#per-topic-client-authorization). Zero unless one is configured. |
 | `thothmesh_metrics_auth_rejections_total` | counter | Scrapes refused by a [`--metrics-token-file`](#metrics-authentication). Zero unless one is configured. |
 | `thothmesh_peer_topic_acl_rejections_total` | counter | `Subscribe`/`Publish` attempts from a peer link refused by a [`--peer-topic-acl`](#peer-scoped-topic-authorization). Zero unless one is configured. |
 | `thothmesh_replayed_messages_total` | counter | Envelopes delivered to a newly-subscribed connection from a topic's [replay buffer](#message-replay) rather than live. Zero on a node where every subscriber connects before any publish it cares about. |
+| `thothmesh_lag_recovered_total` | counter | Envelopes recovered from a topic's replay buffer for a forwarder that fell behind mid-stream (see [Lagged-forwarder recovery](#lagged-forwarder-recovery)), rather than lost. |
 
 Point a Prometheus `scrape_configs` target at `--metrics-addr` the
 same way you would any other exporter; there's no special
@@ -456,7 +460,7 @@ distinguishable from a misbehaving client at a glance.
 ## Message replay
 
 Every topic keeps a bounded, in-memory ring buffer of its most
-recently published envelopes — 256 by default, not currently
+recently published envelopes — 1024 by default, not currently
 configurable via a flag (see
 [ADR-0021](adr/0021-message-replay-ring-buffer.md)). A connection
 subscribing to a topic for the first time is replayed that buffer,
@@ -477,6 +481,30 @@ end, silently — the same posture `PROTOCOL.md`'s
 accepts for a live subscriber that falls behind.
 `thothmesh_replayed_messages_total` (see [Metrics](#metrics)) counts
 how many envelopes have gone out via replay rather than live delivery.
+
+## Lagged-forwarder recovery
+
+A subscriber that's already receiving live deliveries can still fall
+behind mid-stream if it (or the network to it) is slow enough for long
+enough — the node reports this to itself as a `Lagged` error on that
+subscriber's internal channel. Rather than just dropping whatever was
+missed, the node recovers as much of the gap as it can from the same
+per-topic replay buffer described above (see
+[ADR-0024](adr/0024-lagged-forwarder-recovery.md)) — no client-visible
+difference from an ordinary `Publish` either way.
+
+This only works because the replay buffer deliberately holds *more*
+history than the live delivery channel's own capacity (256) - a
+buffer sized the same as that channel would already have evicted
+whatever a lag event skipped, by the time recovery could look for it.
+The gap between the two (1024 vs. 256) is how much of a burst a
+lagged subscriber can fully recover from; a gap wider than that still
+permanently loses whatever fell off the buffer's oldest end, same as
+before this existed. `thothmesh_lag_recovered_total` (see
+[Metrics](#metrics)) counts how many envelopes were actually recovered
+this way — comparing it against `thothmesh_forwarder_lag_total` shows
+how much of a node's reported lag is being absorbed versus genuinely
+lost.
 
 ## Wildcard topic filters
 
