@@ -580,6 +580,15 @@ dial beyond that simply waits its turn rather than firing immediately
 attempt that actually ran took, not by time spent queued. This cap
 isn't configurable via a flag in v1 either.
 
+Bounding concurrency alone isn't enough if a stalled peer can hold its
+dial slot forever: a peer that accepts the TCP connection but never
+finishes TLS, or completes TLS but never sends its `Hello`, would
+otherwise tie up one of the 16 slots indefinitely. [ADR-0027](adr/0027-dial-connect-and-handshake-timeout.md)
+bounds the connect-and-handshake phase itself to 10 seconds - generous
+for a real network path, but well short of the OS's own TCP connect
+timeout - after which the attempt is abandoned and its slot freed, the
+same as any other failed dial. Not configurable via a flag in v1.
+
 ## Wildcard topic filters
 
 A `Subscribe` can name a pattern instead of an exact topic (see

@@ -7,7 +7,7 @@
 
 use std::time::Duration;
 
-use thoth_mesh::dial_handshake;
+use thoth_mesh::{PeerInfo, dial_handshake};
 use thoth_mesh_tls::MaybeTlsStream;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -30,6 +30,14 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// evidence the peer is actually reachable, resetting the backoff
 /// delay instead of doubling it.
 const MIN_HEALTHY_DURATION: Duration = Duration::from_secs(5);
+
+/// How long the connect+TLS+handshake phase of a dial attempt may run
+/// before it's abandoned - generous for a real network path, but well
+/// short of the OS's own TCP connect timeout, so this is the one that
+/// actually fires. Bounds how long a stalled peer can hold one of
+/// [`crate::shared::DEFAULT_MAX_CONCURRENT_DIALS`]'s dial slots - see
+/// ADR-0027.
+const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Spawns one background task per entry in `seed_peers`, each dialing
 /// that address, handshaking, routing messages over the connection
@@ -111,39 +119,24 @@ async fn dial_peer(peer_addr: String, shared: Shared) {
             .await
             .expect("dial semaphore is never closed");
 
-        let tcp = match TcpStream::connect(&peer_addr).await {
-            Ok(stream) => stream,
-            Err(err) => {
-                tracing::warn!(%err, "failed to connect to seed peer");
-                return;
-            }
-        };
-        // A peer dialing another peer always identifies itself - the
-        // same cert/key this node uses to identify itself on accept
-        // - and always verifies the far end's server cert (ADR-0016).
-        let stream = match &shared.tls_connector {
-            Some(connector) => match MaybeTlsStream::connect(connector, tcp, &peer_addr).await {
-                Ok(stream) => stream,
-                Err(err) => {
-                    tracing::warn!(%err, "TLS handshake with seed peer failed");
-                    return;
-                }
-            },
-            None => MaybeTlsStream::Plain(tcp),
-        };
-        let mut conn = stream.compat();
-
-        let info =
-            match dial_handshake(&mut conn, shared.node_id, shared.my_listen_addr.clone()).await {
-                Ok(info) => info,
-                Err(err) => {
-                    tracing::warn!(%err, "handshake with seed peer failed");
+        // Bounded so a peer that's merely stalled - accepts the TCP
+        // connection but never finishes TLS or the handshake - can't
+        // hold this permit (and thus one of the node's limited dial
+        // slots) forever. See ADR-0027.
+        let established =
+            match tokio::time::timeout(DIAL_TIMEOUT, connect_and_handshake(&peer_addr, &shared))
+                .await
+            {
+                Ok(Some(established)) => established,
+                Ok(None) => return, // connect/TLS/handshake failed; already logged below
+                Err(_) => {
+                    tracing::warn!(timeout = ?DIAL_TIMEOUT, "dial to seed peer timed out");
                     return;
                 }
             };
         tracing::info!(
-            peer_id = ?info.peer_id,
-            peer_listen_addr = ?info.listen_addr,
+            peer_id = ?established.info.peer_id,
+            peer_listen_addr = ?established.info.listen_addr,
             "connected to seed peer"
         );
 
@@ -153,18 +146,69 @@ async fn dial_peer(peer_addr: String, shared: Shared) {
         // hold a dial slot for that long (ADR-0026).
         drop(permit);
 
-        // Recover the raw stream (no data loss - Compat adds no
-        // buffering of its own) and hand off to the same dispatch
-        // loop the accept side uses, with the peer identity we
-        // already know from the handshake (see ADR-0010).
         // handle_connection marks the peer connected and registers
         // its link together, right as the dispatch loop starts (see
         // ADR-0011) - not here, so the two can't race apart.
-        let stream = conn.into_inner();
-        connection::handle_connection(stream, shared, Some(info)).await;
+        connection::handle_connection(established.stream, shared, Some(established.info)).await;
     }
     .instrument(span)
     .await
+}
+
+/// The result of a dial attempt that made it all the way through the
+/// handshake: the raw stream, ready to hand off to
+/// [`connection::handle_connection`], and the peer identity learned
+/// from the handshake.
+struct EstablishedDial {
+    stream: MaybeTlsStream,
+    info: PeerInfo,
+}
+
+/// The connect+TLS+handshake phase of a dial attempt, factored out of
+/// [`dial_peer`] so it can be wrapped in a single timeout (ADR-0027)
+/// rather than one per step. Returns `None` on any failure - already
+/// logged via `tracing::warn!` at the point it happened, so the caller
+/// doesn't need to log again, just decide what to do next (nothing,
+/// today - `dial_peer_with_reconnect`'s backoff loop handles it the
+/// same as any other failed attempt).
+async fn connect_and_handshake(peer_addr: &str, shared: &Shared) -> Option<EstablishedDial> {
+    let tcp = match TcpStream::connect(peer_addr).await {
+        Ok(stream) => stream,
+        Err(err) => {
+            tracing::warn!(%err, "failed to connect to seed peer");
+            return None;
+        }
+    };
+    // A peer dialing another peer always identifies itself - the
+    // same cert/key this node uses to identify itself on accept
+    // - and always verifies the far end's server cert (ADR-0016).
+    let stream = match &shared.tls_connector {
+        Some(connector) => match MaybeTlsStream::connect(connector, tcp, peer_addr).await {
+            Ok(stream) => stream,
+            Err(err) => {
+                tracing::warn!(%err, "TLS handshake with seed peer failed");
+                return None;
+            }
+        },
+        None => MaybeTlsStream::Plain(tcp),
+    };
+    let mut conn = stream.compat();
+
+    let info = match dial_handshake(&mut conn, shared.node_id, shared.my_listen_addr.clone()).await
+    {
+        Ok(info) => info,
+        Err(err) => {
+            tracing::warn!(%err, "handshake with seed peer failed");
+            return None;
+        }
+    };
+
+    // Recover the raw stream - no data loss, Compat adds no buffering
+    // of its own.
+    Some(EstablishedDial {
+        stream: conn.into_inner(),
+        info,
+    })
 }
 
 #[cfg(test)]
@@ -324,6 +368,38 @@ mod tests {
         timeout(TEST_TIMEOUT, dial_peer(addr.to_string(), shared))
             .await
             .expect("dial_peer should return promptly on connection refused");
+    }
+
+    #[tokio::test]
+    async fn dial_peer_times_out_if_the_handshake_never_completes() {
+        // The listener accepts the TCP connection - so the dial gets
+        // past connect() - but never sends a Hello reply, so
+        // dial_handshake stalls waiting for one indefinitely. Without
+        // ADR-0027's timeout, this attempt (and the dial slot it
+        // holds) would hang forever.
+        tokio::time::pause();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shared = Shared::new(PeerId::new(), None);
+
+        let dial_task = tokio::spawn(dial_peer(addr.to_string(), shared));
+
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut conn = socket.compat();
+        // Read (and discard) the Hello our dial sends, so we know
+        // it's genuinely stalled waiting for a reply, not just slow
+        // to connect.
+        async_framing::read_frame(&mut conn).await.unwrap();
+
+        // Fast-forward virtual time past DIAL_TIMEOUT without actually
+        // waiting - the stalled attempt should give up and dial_peer
+        // should return.
+        tokio::time::advance(DIAL_TIMEOUT + Duration::from_millis(1)).await;
+
+        dial_task
+            .await
+            .expect("dial_peer should return once its connect+handshake phase times out");
     }
 
     #[tokio::test]
