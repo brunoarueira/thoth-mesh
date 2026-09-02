@@ -95,6 +95,7 @@ async fn run_connection(socket: MaybeTlsStream, shared: Shared, initial_peer: Op
         metrics,
         discover,
         discovered_tx,
+        dial_semaphore: _,
         tls_acceptor: _,
         tls_connector: _,
         allowed_peers,

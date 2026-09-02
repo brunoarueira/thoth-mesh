@@ -99,6 +99,18 @@ fn next_backoff(previous: Duration, connection_uptime: Duration) -> Duration {
 async fn dial_peer(peer_addr: String, shared: Shared) {
     let span = tracing::info_span!("peer", addr = %peer_addr);
     async move {
+        // Bounds how many connect+handshake attempts run at once,
+        // across both seed peers and gossip-discovered ones (ADR-0026).
+        // Held only for the connecting phase, never for the connection's
+        // established lifetime - dropped explicitly below, before the
+        // handoff to handle_connection.
+        let permit = shared
+            .dial_semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("dial semaphore is never closed");
+
         let tcp = match TcpStream::connect(&peer_addr).await {
             Ok(stream) => stream,
             Err(err) => {
@@ -134,6 +146,12 @@ async fn dial_peer(peer_addr: String, shared: Shared) {
             peer_listen_addr = ?info.listen_addr,
             "connected to seed peer"
         );
+
+        // The attempt has succeeded through to a completed handshake -
+        // release the permit before handing off to handle_connection,
+        // which runs for the connection's entire lifetime and must not
+        // hold a dial slot for that long (ADR-0026).
+        drop(permit);
 
         // Recover the raw stream (no data loss - Compat adds no
         // buffering of its own) and hand off to the same dispatch

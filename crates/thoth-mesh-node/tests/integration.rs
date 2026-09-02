@@ -799,6 +799,59 @@ async fn gossip_discovers_a_peer_of_a_peer_and_dials_it() {
 }
 
 #[tokio::test]
+async fn a_full_mesh_bootstrap_converges_despite_the_dial_concurrency_bound() {
+    // ADR-0026's worst case, constructed directly: every node
+    // configured via `--peer` with every *other* node's address means
+    // every possible pairwise dial is attempted at once, right from
+    // startup - no gossip needed to trigger it. This only converges if
+    // dials queued behind the per-node semaphore actually get their
+    // turn rather than starving; a generous timeout well beyond
+    // test_support::eventually's, since this scenario spins up far
+    // more background dial/handshake work than any other test here.
+    const NODE_COUNT: usize = 20;
+    const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(30);
+
+    let mut listeners = Vec::with_capacity(NODE_COUNT);
+    let mut addrs = Vec::with_capacity(NODE_COUNT);
+    for _ in 0..NODE_COUNT {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        addrs.push(listener.local_addr().unwrap().to_string());
+        listeners.push(listener);
+    }
+
+    let nodes: Vec<_> = listeners
+        .into_iter()
+        .enumerate()
+        .map(|(i, listener)| {
+            let seed_peers = addrs
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| *j != i)
+                .map(|(_, addr)| addr.clone())
+                .collect();
+            thoth_mesh_node::spawn(listener, seed_peers)
+        })
+        .collect();
+
+    let deadline = tokio::time::Instant::now() + CONVERGENCE_TIMEOUT;
+    loop {
+        let converged = nodes.iter().all(|node| {
+            nodes
+                .iter()
+                .all(|other| node.id == other.id || node.membership.is_reachable(other.id))
+        });
+        if converged {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "a {NODE_COUNT}-node full-mesh bootstrap did not fully converge within {CONVERGENCE_TIMEOUT:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
 async fn malformed_frame_closes_connection() {
     let addr = spawn_test_node().await;
     let mut client = connect(addr).await;
