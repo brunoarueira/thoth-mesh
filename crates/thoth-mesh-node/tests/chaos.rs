@@ -142,3 +142,49 @@ async fn a_restarted_peer_reconnects_as_a_new_identity_with_no_leftover_duplicat
         "subscriber received more than one delivery for the post-restart publish"
     );
 }
+
+#[tokio::test]
+async fn a_partition_heals_and_both_sides_reconverge() {
+    // A partition, not a death: B stays up throughout - its identity,
+    // accept_loop, and (were there any) its own peer_dials are all
+    // untouched. Only the one link between A and B is severed, and
+    // from B's side specifically, so A's own dial_peer_with_reconnect
+    // loop (ADR-0012) is never itself touched either - it has to
+    // notice the drop and redial entirely on its own, the exact
+    // mechanism this scenario exists to prove. Unlike scenario 1's
+    // restart, the identity on both sides is the same throughout. See
+    // ADR-0028.
+    let listener_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_b = listener_b.local_addr().unwrap();
+    let node_b = thoth_mesh_node::spawn(listener_b, Vec::new());
+
+    let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let node_a = thoth_mesh_node::spawn(listener_a, vec![addr_b.to_string()]);
+
+    eventually(|| node_a.membership.is_reachable(node_b.id)).await;
+    eventually(|| node_b.membership.is_reachable(node_a.id)).await;
+
+    // Sever B's side of the link only - B's accept_loop, listening for
+    // A's next dial attempt, is left running untouched. (B's own
+    // membership view of A may lag briefly here, since aborting skips
+    // B's normal disconnect cleanup for this one connection - it's
+    // corrected the moment A's redial lands a fresh accepted
+    // connection below, which is what this test actually asserts.)
+    for handle in node_b.accepted_connections.lock().unwrap().drain(..) {
+        handle.abort();
+    }
+
+    // A observes this the same way any dropped connection is noticed
+    // - a normal read failure inside handle_connection, returning
+    // control to the still-alive dial_peer_with_reconnect loop that's
+    // been running around it the whole time.
+    eventually(|| !node_a.membership.is_reachable(node_b.id)).await;
+
+    // The partition heals on its own: A's retry loop redials the same
+    // address, and B - still up, still listening - accepts it as a
+    // fresh connection. Both sides converge back to the same reachable
+    // view they had before the partition, the same two identities
+    // throughout.
+    eventually(|| node_a.membership.is_reachable(node_b.id)).await;
+    eventually(|| node_b.membership.is_reachable(node_a.id)).await;
+}
