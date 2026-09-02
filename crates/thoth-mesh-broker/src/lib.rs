@@ -249,10 +249,10 @@ impl<K: Eq + Hash + Clone> TopicMap<K> {
     /// `subscribe`/`publish` call to an *existing* entry, not per
     /// envelope.
     fn touch(&mut self, key: &K) {
-        if let Some(pos) = self.order.iter().position(|queued| queued == key) {
-            if let Some(entry) = self.order.remove(pos) {
-                self.order.push_back(entry);
-            }
+        if let Some(pos) = self.order.iter().position(|queued| queued == key)
+            && let Some(entry) = self.order.remove(pos)
+        {
+            self.order.push_back(entry);
         }
     }
 
@@ -361,10 +361,10 @@ impl SeenIds {
             return false;
         }
         self.order.push_back(id);
-        if self.order.len() > self.capacity {
-            if let Some(oldest) = self.order.pop_front() {
-                self.set.remove(&oldest);
-            }
+        if self.order.len() > self.capacity
+            && let Some(oldest) = self.order.pop_front()
+        {
+            self.set.remove(&oldest);
         }
         true
     }

@@ -79,10 +79,10 @@ async fn handle_scrape(
         if bytes_read == 0 || line == "\r\n" || line == "\n" {
             break;
         }
-        if let Some((name, value)) = line.split_once(':') {
-            if name.eq_ignore_ascii_case("authorization") {
-                authorization = Some(value.trim().to_string());
-            }
+        if let Some((name, value)) = line.split_once(':')
+            && name.eq_ignore_ascii_case("authorization")
+        {
+            authorization = Some(value.trim().to_string());
         }
     }
 

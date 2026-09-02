@@ -12,7 +12,10 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+# Keep in sync with .github/workflows/ci.yml's `msrv` job, which
+# builds and tests against this exact version - nothing else catches
+# it drifting stale again (see ADR-0023's context, and #90).
+rust-version = "1.88"
 authors = ["Bruno Arueira <contato@brunoarueira.com>"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/brunoarueira/thoth-mesh"

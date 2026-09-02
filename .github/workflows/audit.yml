@@ -44,11 +44,3 @@ jobs:
         uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          # RUSTSEC-2026-0009: DoS via stack exhaustion parsing
-          # attacker-controlled RFC 2822 dates in the `time` crate.
-          # Pulled in only as a dev-dependency (rcgen, used solely to
-          # generate throwaway test certs - never parses external
-          # input), and every patched release (>=0.3.47) requires Rust
-          # 1.88, above this workspace's 1.85 MSRV. Revisit once MSRV
-          # moves, or rcgen no longer needs an unpatched `time`.
-          ignore: RUSTSEC-2026-0009

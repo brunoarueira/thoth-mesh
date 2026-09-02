@@ -122,11 +122,11 @@ impl Membership {
         status.connected = false;
         if was_connected {
             state.disconnected_order.push_back(peer_id);
-            if state.disconnected_order.len() > DEFAULT_MEMBERSHIP_DISCONNECTED_CAPACITY {
-                if let Some(oldest) = state.disconnected_order.pop_front() {
-                    state.peers.remove(&oldest);
-                    self.disconnected_evictions.fetch_add(1, Ordering::Relaxed);
-                }
+            if state.disconnected_order.len() > DEFAULT_MEMBERSHIP_DISCONNECTED_CAPACITY
+                && let Some(oldest) = state.disconnected_order.pop_front()
+            {
+                state.peers.remove(&oldest);
+                self.disconnected_evictions.fetch_add(1, Ordering::Relaxed);
             }
         }
         // Same as in mark_connected: don't hold the lock while logging.
