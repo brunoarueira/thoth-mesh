@@ -32,6 +32,7 @@ thoth-mesh, using the format described in
 | [0024](0024-lagged-forwarder-recovery.md) | Recovering a lagged forwarder from the replay buffer |
 | [0025](0025-bound-per-node-memory-footprint.md) | Bounding per-node memory footprint at mesh scale |
 | [0026](0026-bound-concurrent-peer-dials.md) | Bounding concurrent outbound peer dials |
+| [0027](0027-dial-connect-and-handshake-timeout.md) | Timing out the dial connect-and-handshake phase |
 
 To add a new one, copy the format of an existing ADR, number it
 sequentially, and set its status to `Accepted` once the decision is
