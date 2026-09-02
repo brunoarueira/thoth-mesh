@@ -35,6 +35,7 @@ thoth-mesh, using the format described in
 | [0027](0027-dial-connect-and-handshake-timeout.md) | Timing out the dial connect-and-handshake phase |
 | [0028](0028-chaos-partition-test-coverage.md) | Chaos/partition test coverage for reconnect, dedup, and loop prevention |
 | [0029](0029-split-connection-read-and-write-loops.md) | Splitting a connection's read and write loops into separate tasks |
+| [0030](0030-mesh-benchmark-suite.md) | A benchmark suite for throughput and latency across N mesh hops |
 
 To add a new one, copy the format of an existing ADR, number it
 sequentially, and set its status to `Accepted` once the decision is
