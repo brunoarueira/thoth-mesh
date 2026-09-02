@@ -83,11 +83,11 @@ impl PeerDirectory {
             state.order.retain(|id| *id != peer_id);
             state.order.push_back(peer_id);
         }
-        if state.order.len() > DEFAULT_PEER_DIRECTORY_CAPACITY {
-            if let Some(oldest) = state.order.pop_front() {
-                state.known.remove(&oldest);
-                self.evictions.fetch_add(1, Ordering::Relaxed);
-            }
+        if state.order.len() > DEFAULT_PEER_DIRECTORY_CAPACITY
+            && let Some(oldest) = state.order.pop_front()
+        {
+            state.known.remove(&oldest);
+            self.evictions.fetch_add(1, Ordering::Relaxed);
         }
         is_new
     }
