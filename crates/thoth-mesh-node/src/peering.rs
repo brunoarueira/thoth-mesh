@@ -105,6 +105,18 @@ fn next_backoff(previous: Duration, connection_uptime: Duration) -> Duration {
 }
 
 async fn dial_peer(peer_addr: String, shared: Shared) {
+    dial_peer_with_timeout(peer_addr, shared, DIAL_TIMEOUT).await
+}
+
+/// [`dial_peer`], with the connect+handshake budget as a parameter
+/// rather than always [`DIAL_TIMEOUT`] - exists so a test can prove
+/// the timeout actually fires using a short *real* duration, rather
+/// than needing `tokio::time::pause`/`advance` paired with a genuine
+/// socket connect on the same runtime, a combination that reliably
+/// deadlocks (see the timeout test below - discovered while adding
+/// it, not a hypothetical). `dial_peer` itself always uses the real
+/// constant; this is never reachable from anything other than a test.
+async fn dial_peer_with_timeout(peer_addr: String, shared: Shared, dial_timeout: Duration) {
     let span = tracing::info_span!("peer", addr = %peer_addr);
     async move {
         // Bounds how many connect+handshake attempts run at once,
@@ -124,13 +136,13 @@ async fn dial_peer(peer_addr: String, shared: Shared) {
         // hold this permit (and thus one of the node's limited dial
         // slots) forever. See ADR-0027.
         let established =
-            match tokio::time::timeout(DIAL_TIMEOUT, connect_and_handshake(&peer_addr, &shared))
+            match tokio::time::timeout(dial_timeout, connect_and_handshake(&peer_addr, &shared))
                 .await
             {
                 Ok(Some(established)) => established,
                 Ok(None) => return, // connect/TLS/handshake failed; already logged below
                 Err(_) => {
-                    tracing::warn!(timeout = ?DIAL_TIMEOUT, "dial to seed peer timed out");
+                    tracing::warn!(timeout = ?dial_timeout, "dial to seed peer timed out");
                     return;
                 }
             };
@@ -377,29 +389,44 @@ mod tests {
         // dial_handshake stalls waiting for one indefinitely. Without
         // ADR-0027's timeout, this attempt (and the dial slot it
         // holds) would hang forever.
-        tokio::time::pause();
-
+        //
+        // Uses dial_peer_with_timeout with a short *real* duration,
+        // deliberately not tokio::time::pause/advance: pausing virtual
+        // time on the same runtime that's also doing a genuine socket
+        // connect() reliably deadlocked in that connect - confirmed by
+        // instrumenting it while writing this test, not a hypothetical
+        // worry. A short real timeout exercises the identical
+        // timeout/permit-release logic without that hazard.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let shared = Shared::new(PeerId::new(), None);
+        let dial_timeout = Duration::from_millis(100);
 
-        let dial_task = tokio::spawn(dial_peer(addr.to_string(), shared));
+        let dial_task = tokio::spawn(dial_peer_with_timeout(
+            addr.to_string(),
+            shared,
+            dial_timeout,
+        ));
 
-        let (socket, _) = listener.accept().await.unwrap();
+        let (socket, _) = timeout(TEST_TIMEOUT, listener.accept())
+            .await
+            .expect("timed out waiting for the dial")
+            .unwrap();
         let mut conn = socket.compat();
         // Read (and discard) the Hello our dial sends, so we know
         // it's genuinely stalled waiting for a reply, not just slow
         // to connect.
-        async_framing::read_frame(&mut conn).await.unwrap();
-
-        // Fast-forward virtual time past DIAL_TIMEOUT without actually
-        // waiting - the stalled attempt should give up and dial_peer
-        // should return.
-        tokio::time::advance(DIAL_TIMEOUT + Duration::from_millis(1)).await;
-
-        dial_task
+        timeout(TEST_TIMEOUT, async_framing::read_frame(&mut conn))
             .await
-            .expect("dial_peer should return once its connect+handshake phase times out");
+            .expect("timed out waiting for the Hello")
+            .unwrap();
+
+        // Never reply - dial_peer_with_timeout's own timeout should
+        // give up on its own well within TEST_TIMEOUT.
+        timeout(TEST_TIMEOUT, dial_task)
+            .await
+            .expect("dial_peer_with_timeout should return once its timeout elapses")
+            .expect("dial_peer_with_timeout task should not panic");
     }
 
     #[tokio::test]
