@@ -564,6 +564,22 @@ None of these caps are configurable via a flag in v1, consistent with
 every other capacity in this codebase (the replay buffer, the
 duplicate-message cache).
 
+## Bounded dial concurrency
+
+A node dials every seed peer (`--peer`) and every gossip-discovered
+peer address it decides to auto-dial as an independent background
+task, with no limit on how many run at once by default - a fresh
+N-node bootstrap, or a partition healing and re-announcing many peers
+at once, could otherwise open dozens or hundreds of TCP connect and
+TLS handshake attempts in the same instant. [ADR-0026](adr/0026-bound-concurrent-peer-dials.md)
+bounds this: at most 16 dials (the connect-and-handshake phase only,
+never an established link's lifetime) run concurrently per node,
+shared across seed peers and gossip-discovered addresses alike. A
+dial beyond that simply waits its turn rather than firing immediately
+- reconnect backoff is unaffected, since it's driven by how long an
+attempt that actually ran took, not by time spent queued. This cap
+isn't configurable via a flag in v1 either.
+
 ## Wildcard topic filters
 
 A `Subscribe` can name a pattern instead of an exact topic (see

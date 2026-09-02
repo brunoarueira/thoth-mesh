@@ -10,11 +10,17 @@ use thoth_mesh::{Interest, Membership, PeerDirectory};
 use thoth_mesh_broker::Broker;
 use thoth_mesh_core::PeerId;
 use thoth_mesh_tls::{TlsAcceptor, TlsConnector};
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 
 use crate::metrics::Metrics;
 use crate::peer_links::PeerLinks;
 use crate::topic_acl::TopicAcl;
+
+/// How many outbound dial attempts (`peering::dial_peer`'s connect
+/// and handshake phase) can be in flight at once, across both
+/// configured seed peers and gossip-discovered ones - see ADR-0026.
+/// Not currently configurable via a CLI flag.
+pub const DEFAULT_MAX_CONCURRENT_DIALS: usize = 16;
 
 /// Everything a connection task needs beyond its own socket and
 /// whatever it learns from the peer on the other end.
@@ -34,6 +40,10 @@ pub struct Shared {
     /// worth auto-dialing. `peering::spawn_discovery_dialer` owns the
     /// receiving end. Not read from directly outside `connection.rs`.
     pub(crate) discovered_tx: mpsc::UnboundedSender<String>,
+    /// Bounds concurrent outbound dial *attempts* (connect + handshake
+    /// only, never an established link's lifetime) at
+    /// [`DEFAULT_MAX_CONCURRENT_DIALS`] - see ADR-0026.
+    pub(crate) dial_semaphore: Arc<Semaphore>,
     /// TLS config for the accept side, if TLS is enabled (see
     /// ADR-0016). `None` - the default - means every accepted
     /// connection stays plaintext, unchanged from before this ADR.
@@ -123,6 +133,7 @@ impl Shared {
             metrics: Metrics::new(),
             discover: PeerDirectory::new(),
             discovered_tx,
+            dial_semaphore: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_DIALS)),
             tls_acceptor: None,
             tls_connector: None,
             allowed_peers: None,
