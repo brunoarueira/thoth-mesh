@@ -146,7 +146,7 @@ pub async fn run_with_tls(
     }
 
     peering::spawn_seed_peers(seed_peers, shared.clone());
-    accept_loop(listener, shared).await
+    accept_loop(listener, shared, None).await
 }
 
 /// Serves connections on an already-bound listener until an
@@ -187,7 +187,7 @@ pub async fn serve_with_tls(
         shared.clone(),
     ));
     peering::spawn_seed_peers(seed_peers, shared.clone());
-    accept_loop(listener, shared).await
+    accept_loop(listener, shared, None).await
 }
 
 /// A node spawned via [`spawn`], along with the handles tests need to
@@ -201,6 +201,13 @@ pub struct Node {
     pub discover: PeerDirectory,
     pub accept_loop: JoinHandle<std::io::Result<()>>,
     pub peer_dials: Vec<JoinHandle<()>>,
+    /// Every accepted connection's handle, added to as this node
+    /// accepts them - unlike `peer_dials`, this also covers
+    /// connections the *other* side dialed in. Aborting `accept_loop`
+    /// alone only stops accepting *new* connections; a test simulating
+    /// this node fully dying (see ADR-0028's chaos coverage) needs to
+    /// abort these too, or an already-accepted peer link stays up.
+    pub accepted_connections: Arc<std::sync::Mutex<Vec<JoinHandle<()>>>>,
 }
 
 /// Like [`serve`], but returns immediately with a [`Node`] instead of
@@ -243,13 +250,19 @@ pub fn spawn_with_tls(
     let membership = shared.membership.clone();
     let discover = shared.discover.clone();
     let peer_dials = peering::spawn_seed_peers(seed_peers, shared.clone());
-    let accept_loop = tokio::spawn(accept_loop(listener, shared));
+    let accepted_connections = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let accept_loop = tokio::spawn(accept_loop(
+        listener,
+        shared,
+        Some(Arc::clone(&accepted_connections)),
+    ));
     Ok(Node {
         id: node_id,
         membership,
         discover,
         accept_loop,
         peer_dials,
+        accepted_connections,
     })
 }
 
@@ -277,7 +290,21 @@ pub mod test_support {
     }
 }
 
-async fn accept_loop(listener: TcpListener, shared: Shared) -> std::io::Result<()> {
+/// `connections` - only ever `Some` from [`spawn_with_tls`] - collects
+/// each accepted connection's `JoinHandle` so a test can fully sever
+/// every link this node is party to (see [`Node::accepted_connections`]),
+/// not just the ones it dialed itself. `None` from every production
+/// entry point (`run_with_tls`/`serve_with_tls`): an ordinary
+/// long-running node has no test to abort a connection for, and never
+/// collecting the handles at all - rather than collecting and never
+/// draining them - avoids growing an unbounded list of finished
+/// handles over its lifetime (the same bounded-footprint posture
+/// ADR-0025 already established elsewhere).
+async fn accept_loop(
+    listener: TcpListener,
+    shared: Shared,
+    connections: Option<Arc<std::sync::Mutex<Vec<JoinHandle<()>>>>>,
+) -> std::io::Result<()> {
     tracing::info!(
         node_id = ?shared.node_id,
         addr = ?shared.my_listen_addr,
@@ -294,7 +321,7 @@ async fn accept_loop(listener: TcpListener, shared: Shared) -> std::io::Result<(
         };
         tracing::debug!(%peer_addr, "accepted connection");
         let shared = shared.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             // TLS, if enabled, wraps every accepted connection before
             // anything else touches it - client or peer alike, since
             // which this is isn't known until a Hello arrives, over
@@ -311,5 +338,8 @@ async fn accept_loop(listener: TcpListener, shared: Shared) -> std::io::Result<(
             };
             connection::handle_connection(socket, shared, None).await;
         });
+        if let Some(connections) = &connections {
+            connections.lock().unwrap().push(handle);
+        }
     }
 }
