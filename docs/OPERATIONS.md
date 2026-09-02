@@ -645,6 +645,68 @@ RUST_LOG=thoth_mesh_node=debug,thoth_mesh=trace cargo run -p thoth-mesh-node --
 The CLI (`thoth-mesh`) doesn't currently expose a log-level flag —
 its output is just what it prints for the command you ran.
 
+## Benchmarking
+
+`bench_mesh` (see [ADR-0030](adr/0030-mesh-benchmark-suite.md)) measures
+message throughput and end-to-end latency across a sweep of mesh hop
+counts — 0 (a single node, no peer link at all) through 8, chaining
+that many extra nodes the same way the multi-hop integration test
+does. Run it with:
+
+```sh
+cargo run --release --example bench_mesh -p thoth-mesh-node
+```
+
+`--release` matters here — this workspace's release profile (LTO,
+codegen-units = 1) meaningfully changes the numbers a debug build
+wouldn't represent honestly. A captured run — Apple M2, 16GB RAM,
+macOS 26.4.1, one sample per row, not an average (see the ADR for why
+this stays a manually-run, point-in-time report rather than a
+CI-tracked regression suite). Disclosed because it's the industry norm
+for a benchmark result to say what it ran on — everything here is over
+loopback, so the numbers are really measuring per-message overhead
+(syscalls, scheduling, CBOR encode/decode) more than raw compute, and
+that profile is sensitive to the OS's networking stack (kqueue here,
+epoll on Linux — where CI, and most production deployments, actually
+run) at least as much as to the hardware. Don't read these as
+portable to other machines, operating systems, or even a quieter run
+of this same one:
+
+```
+thoth-mesh bench_mesh - 5000 messages, 64-byte payload, per hop count
+
+ hops   delivered    msgs/sec   min (ms)   p50 (ms)   p95 (ms)   max (ms)
+    0   5000/5000      111997          0          1          2          3
+    1   3976/5000        n/a*          0         17         20         21
+    2   5000/5000       45373          2         22         25         26
+    4   5000/5000       20540          2         56         99        101
+    8   5000/5000        5980          4        185        348        369
+
+* msgs/sec omitted: this row's elapsed window only covers messages that arrived
+before the pipeline gave up on the rest - not a rate comparable to a row that
+delivered everything.
+```
+
+`delivered` can come in under the 5,000 sent: the publisher writes as
+fast as the connection allows with no pacing, and that can outrun a
+downstream forwarder's per-topic broadcast channel badly enough that
+the resulting lag exceeds the replay buffer (ADR-0024) — some messages
+are then unrecoverably lost, a real, already-accepted consequence of
+that design, not a bug in the benchmark. When that happens, `msgs/sec`
+prints as `n/a*` rather than a number — a lossy row's elapsed window
+only covers however far the pipeline got before giving up, and
+recovery replays are fast in-memory catch-up bursts, so that truncated
+window can look faster than a complete row's despite delivering less
+overall (see the ADR for the full reasoning). Don't compare a `n/a*`
+row's throughput to another row's; the `delivered`/`sent` ratio and the
+latency columns are still meaningful. `RUST_LOG`-style filtering isn't
+wired up for this tool; it always logs at `warn`, which is enough to
+see `forwarder lagged` / `lag recovery gap exceeded` when loss
+happens.
+
+Numbers here are a rough shape, not a guarantee — one sample per row,
+no repetition or statistical averaging.
+
 ## Current limitations
 
 Worth knowing before running this anywhere that matters:
