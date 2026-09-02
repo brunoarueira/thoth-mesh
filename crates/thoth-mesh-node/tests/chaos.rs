@@ -36,6 +36,23 @@ fn topic(s: &str) -> Topic {
     s.parse::<Topic>().unwrap()
 }
 
+/// Like `test_support::eventually`, but with a caller-chosen timeout
+/// instead of that helper's fixed 2s - for a wait that has to span at
+/// least one `peering::next_backoff`-driven retry delay, whose actual
+/// wall-clock timing (not just the nominal 500ms/1s/2s.. schedule) can
+/// stretch further than 2s under CI's typically slower, more
+/// contended scheduling than a local run.
+async fn eventually_within(timeout: Duration, mut cond: impl FnMut() -> bool) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while !cond() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "condition was not met within {timeout:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 #[tokio::test]
 async fn a_restarted_peer_reconnects_as_a_new_identity_with_no_leftover_duplicate() {
     // B dies mid-mesh and comes back - as a *new* identity, since
@@ -187,4 +204,90 @@ async fn a_partition_heals_and_both_sides_reconverge() {
     // throughout.
     eventually(|| node_a.membership.is_reachable(node_b.id)).await;
     eventually(|| node_b.membership.is_reachable(node_a.id)).await;
+}
+
+#[tokio::test]
+async fn a_gossip_discovered_peer_that_is_down_keeps_retrying_until_it_comes_up() {
+    // A peer can be *announced* (ADR-0015) without ever being
+    // reachable - up when the announcer learned it, but down,
+    // unreachable, or gone by the time this node tries to dial it.
+    // Auto-dial reuses dial_peer_with_reconnect verbatim, so this
+    // should degrade to the same backoff/retry a configured --peer
+    // that never comes up already gets (`dial_peer_with_reconnect_
+    // retries_until_the_seed_peer_comes_up` in peering.rs) - proven
+    // here rather than left as an assumption from code reuse. See
+    // ADR-0028.
+    let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_a = listener_a.local_addr().unwrap();
+    let node_a = thoth_mesh_node::spawn(listener_a, Vec::new());
+
+    let listener_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_b = listener_b.local_addr().unwrap();
+    let node_b = thoth_mesh_node::spawn(listener_b, vec![addr_a.to_string()]);
+
+    eventually(|| node_a.membership.is_reachable(node_b.id)).await;
+    eventually(|| node_b.membership.is_reachable(node_a.id)).await;
+
+    // Reserve a real address for "C" without anything actually
+    // listening on it yet - genuinely unreachable, not hypothetical.
+    let listener_c = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_c = listener_c.local_addr().unwrap();
+    drop(listener_c);
+
+    // A raw connection stands in for C dialing into B just long enough
+    // to say Hello and claim addr_c as its listen address - exactly
+    // what a real, momentarily-reachable C would have sent - before
+    // promptly disappearing again. B records and propagates it via the
+    // ordinary announce path (ADR-0015) before ever noticing the
+    // disconnect, so this reaches A exactly as a genuine gossiped
+    // address would.
+    let mut fake_c = connect(addr_b).await;
+    // we_should_dial compares PeerIds to pick exactly one side to
+    // auto-dial a newly-learned peer - keep generating until it picks
+    // A, so this test deterministically exercises A's retry loop
+    // rather than leaving that to chance.
+    let peer_id_c = loop {
+        let candidate = PeerId::new();
+        if node_a.id < candidate {
+            break candidate;
+        }
+    };
+    let hello = Envelope::new(
+        peer_id_c,
+        MessageKind::Hello {
+            listen_addr: Some(addr_c.to_string()),
+        },
+    );
+    send(&mut fake_c, &hello).await;
+    recv(&mut fake_c).await; // B's own Hello reply
+    drop(fake_c);
+
+    // A has now learned about C via gossip through B and should be
+    // auto-dialing addr_c - and retrying with backoff rather than
+    // giving up, since nothing is listening there yet. There's no
+    // direct signal to poll for "still retrying"; this and the next
+    // step prove it together - if the retry loop had given up instead
+    // of backing off forever, C coming up after this delay would never
+    // be discovered.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // C comes up for real, at the exact address that was gossiped -
+    // A's retry loop, never itself touched, finds it on a subsequent
+    // attempt. This depends on at least one backoff delay actually
+    // elapsing (peering::next_backoff, not exported here) on top of
+    // however long CI's scheduling happens to add on a given run, so
+    // it gets a much more generous timeout than the default
+    // `eventually` - a real observed CI flake at the default 2s, not
+    // a hypothetical margin.
+    let listener_c_real = TcpListener::bind(addr_c).await.unwrap();
+    let node_c = thoth_mesh_node::spawn(listener_c_real, Vec::new());
+
+    eventually_within(Duration::from_secs(15), || {
+        node_a.membership.is_reachable(node_c.id)
+    })
+    .await;
+    eventually_within(Duration::from_secs(15), || {
+        node_c.membership.is_reachable(node_a.id)
+    })
+    .await;
 }
