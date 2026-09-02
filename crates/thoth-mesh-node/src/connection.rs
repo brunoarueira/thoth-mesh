@@ -104,8 +104,28 @@ async fn run_connection(socket: MaybeTlsStream, shared: Shared, initial_peer: Op
     } = shared;
     let (reader, writer) = split(socket);
     let mut reader = reader.compat();
-    let mut writer = writer.compat_write();
-    let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<Arc<Envelope>>(OUTGOING_CHANNEL_CAPACITY);
+    let writer = writer.compat_write();
+    let (outgoing_tx, outgoing_rx) = mpsc::channel::<Arc<Envelope>>(OUTGOING_CHANNEL_CAPACITY);
+    // Reading and writing run as two independent tasks sharing only
+    // outgoing_tx/outgoing_rx, rather than one task alternating
+    // between them via tokio::select! - the natural first design, but
+    // a broken one: async_framing::read_frame reads a frame in two
+    // sequential steps (length prefix, then payload), and select! can
+    // only cancel a losing branch between polls, not partway through
+    // one atomically. Cancelling the read after the length prefix is
+    // already consumed from the stream - but before the payload read
+    // starts - permanently desyncs every frame after it, since those
+    // bytes can't be put back. Splitting means the read loop below
+    // never races anything and always runs a read_frame call to
+    // completion. See ADR-0029.
+    //
+    // Wrapped so aborting *this* task (as a test simulating this
+    // connection dying does, via Node::accepted_connections) also
+    // aborts the writer task - a plain JoinHandle would just be
+    // dropped without stopping the task it refers to, leaving the
+    // write half of the socket alive on its own even though nothing
+    // is reading from this side any more.
+    let writer_task = AbortOnDrop(tokio::spawn(write_loop(writer, outgoing_rx)));
     let mut forwarders: HashMap<TopicFilter, JoinHandle<()>> = HashMap::new();
     // Set once this connection is known to be a peer link - either
     // passed in already-known (dial side) or learned from an incoming
@@ -131,7 +151,9 @@ async fn run_connection(socket: MaybeTlsStream, shared: Shared, initial_peer: Op
                     message: "peer certificate not on the --allow-peer allowlist".to_owned(),
                 },
             );
-            let _ = send_envelope(&mut writer, &error).await;
+            let _ = outgoing_tx.send(Arc::new(error)).await;
+            drop(outgoing_tx);
+            let _ = writer_task.await;
             return;
         }
         peer_identity = Some(peer_id);
@@ -148,186 +170,201 @@ async fn run_connection(socket: MaybeTlsStream, shared: Shared, initial_peer: Op
     }
 
     loop {
-        tokio::select! {
-            frame = async_framing::read_frame(&mut reader) => {
-                let bytes = match frame {
-                    Ok(bytes) => bytes,
-                    Err(err) => {
-                        if is_clean_disconnect(&err) {
-                            tracing::debug!("client disconnected");
-                        } else {
-                            tracing::warn!(%err, "closing connection: frame read error");
-                        }
-                        break;
-                    }
-                };
-                let envelope = match Envelope::from_bytes(&bytes) {
-                    Ok(envelope) => envelope,
-                    Err(err) => {
-                        tracing::warn!(%err, "closing connection: malformed envelope");
-                        break;
-                    }
-                };
-
-                match &envelope.kind {
-                    MessageKind::Subscribe { filter } => {
-                        let filter = filter.clone();
-                        // Client-scoped (ADR-0018) for a connection
-                        // not yet known to be a peer link;
-                        // peer-scoped (ADR-0020) once it is - the two
-                        // lists are independent, and exactly one ever
-                        // applies to a given connection. A wildcard
-                        // filter is refused outright wherever either
-                        // applies - see ADR-0022.
-                        let is_peer = peer_identity.is_some();
-                        if !filter_acl_permits(
-                            &topic_acl,
-                            &peer_topic_acl,
-                            is_peer,
-                            principal,
-                            &filter,
-                            Action::Subscribe,
-                        ) {
-                            tracing::warn!(sender = ?envelope.sender, %filter, is_peer, "rejected: not on the configured topic ACL");
-                            if is_peer {
-                                metrics.record_peer_topic_acl_rejection();
-                            } else {
-                                metrics.record_topic_acl_rejection();
-                            }
-                            let error = Envelope::new(
-                                node_id,
-                                MessageKind::Error {
-                                    in_reply_to: Some(envelope.id),
-                                    message: format!("not authorized to subscribe to {filter}"),
-                                },
-                            );
-                            if !send_envelope(&mut writer, &error).await {
-                                break;
-                            }
-                            continue;
-                        }
-                        tracing::info!(sender = ?envelope.sender, %filter, "subscribed");
-                        let is_new_forwarder = !forwarders.contains_key(&filter);
-                        forwarders.entry(filter.clone()).or_insert_with(|| {
-                            spawn_forwarder(&broker, filter.clone(), outgoing_tx.clone(), metrics.clone())
-                        });
-                        if is_new_forwarder && interest.subscribe(filter.clone()) {
-                            propagate_interest(&peer_links, node_id, filter, true);
-                        }
-                        let ack = Envelope::new(node_id, MessageKind::Ack { in_reply_to: envelope.id });
-                        if !send_envelope(&mut writer, &ack).await {
-                            break;
-                        }
-                    }
-                    MessageKind::Unsubscribe { filter } => {
-                        tracing::info!(sender = ?envelope.sender, %filter, "unsubscribed");
-                        if let Some(handle) = forwarders.remove(filter) {
-                            handle.abort();
-                            if interest.unsubscribe(filter) {
-                                propagate_interest(&peer_links, node_id, filter.clone(), false);
-                            }
-                        }
-                        let ack = Envelope::new(node_id, MessageKind::Ack { in_reply_to: envelope.id });
-                        if !send_envelope(&mut writer, &ack).await {
-                            break;
-                        }
-                    }
-                    MessageKind::Publish { topic, payload } => {
-                        tracing::debug!(sender = ?envelope.sender, %topic, len = payload.len(), "publish");
-                        let topic = topic.clone();
-                        // Client-scoped (ADR-0018) or peer-scoped
-                        // (ADR-0020) - see the Subscribe arm above.
-                        let is_peer = peer_identity.is_some();
-                        if !acl_permits(
-                            &topic_acl,
-                            &peer_topic_acl,
-                            is_peer,
-                            principal,
-                            &topic,
-                            Action::Publish,
-                        ) {
-                            tracing::warn!(sender = ?envelope.sender, %topic, is_peer, "rejected: not on the configured topic ACL");
-                            if is_peer {
-                                metrics.record_peer_topic_acl_rejection();
-                            } else {
-                                metrics.record_topic_acl_rejection();
-                            }
-                            let error = Envelope::new(
-                                node_id,
-                                MessageKind::Error {
-                                    in_reply_to: Some(envelope.id),
-                                    message: format!("not authorized to publish to {topic}"),
-                                },
-                            );
-                            if !send_envelope(&mut writer, &error).await {
-                                break;
-                            }
-                            continue;
-                        }
-                        broker.publish(&topic, Arc::new(envelope)).await;
-                    }
-                    MessageKind::Ack { .. } | MessageKind::Error { .. } => {
-                        // Not actionable from a client in v1; ignore.
-                    }
-                    MessageKind::Hello { listen_addr } => {
-                        tracing::info!(
-                            sender = ?envelope.sender,
-                            peer_listen_addr = ?listen_addr,
-                            "peer said hello"
-                        );
-                        if !allowlist_permits(&allowed_peers, peer_fingerprint) {
-                            tracing::warn!(
-                                sender = ?envelope.sender,
-                                "closing connection: peer certificate not on the --allow-peer allowlist"
-                            );
-                            let error = Envelope::new(
-                                node_id,
-                                MessageKind::Error {
-                                    in_reply_to: Some(envelope.id),
-                                    message: "peer certificate not on the --allow-peer allowlist"
-                                        .to_owned(),
-                                },
-                            );
-                            let _ = send_envelope(&mut writer, &error).await;
-                            break;
-                        }
-                        peer_identity = Some(envelope.sender);
-                        membership.mark_connected(envelope.sender, listen_addr.clone());
-                        register_peer_link(
-                            &peer_links,
-                            &interest,
-                            &discover,
-                            node_id,
-                            envelope.sender,
-                            listen_addr.clone(),
-                            &outgoing_tx,
-                        );
-                        let reply = Envelope::new(
-                            node_id,
-                            MessageKind::Hello {
-                                listen_addr: my_listen_addr.clone(),
-                            },
-                        );
-                        if !send_envelope(&mut writer, &reply).await {
-                            break;
-                        }
-                    }
-                    MessageKind::PeerAnnounce { peers } => {
-                        learn_peers(
-                            &peer_links,
-                            &discover,
-                            &discovered_tx,
-                            node_id,
-                            peers,
-                        );
-                    }
+        let bytes = match async_framing::read_frame(&mut reader).await {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                if is_clean_disconnect(&err) {
+                    tracing::debug!("client disconnected");
+                } else {
+                    tracing::warn!(%err, "closing connection: frame read error");
                 }
+                break;
             }
-            Some(outgoing) = outgoing_rx.recv() => {
-                if !send_envelope(&mut writer, &outgoing).await {
-                    tracing::warn!("closing connection: frame write error");
+        };
+        let envelope = match Envelope::from_bytes(&bytes) {
+            Ok(envelope) => envelope,
+            Err(err) => {
+                tracing::warn!(%err, "closing connection: malformed envelope");
+                break;
+            }
+        };
+
+        match &envelope.kind {
+            MessageKind::Subscribe { filter } => {
+                let filter = filter.clone();
+                // Client-scoped (ADR-0018) for a connection
+                // not yet known to be a peer link;
+                // peer-scoped (ADR-0020) once it is - the two
+                // lists are independent, and exactly one ever
+                // applies to a given connection. A wildcard
+                // filter is refused outright wherever either
+                // applies - see ADR-0022.
+                let is_peer = peer_identity.is_some();
+                if !filter_acl_permits(
+                    &topic_acl,
+                    &peer_topic_acl,
+                    is_peer,
+                    principal,
+                    &filter,
+                    Action::Subscribe,
+                ) {
+                    tracing::warn!(sender = ?envelope.sender, %filter, is_peer, "rejected: not on the configured topic ACL");
+                    if is_peer {
+                        metrics.record_peer_topic_acl_rejection();
+                    } else {
+                        metrics.record_topic_acl_rejection();
+                    }
+                    let error = Envelope::new(
+                        node_id,
+                        MessageKind::Error {
+                            in_reply_to: Some(envelope.id),
+                            message: format!("not authorized to subscribe to {filter}"),
+                        },
+                    );
+                    if outgoing_tx.send(Arc::new(error)).await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
+                tracing::info!(sender = ?envelope.sender, %filter, "subscribed");
+                let is_new_forwarder = !forwarders.contains_key(&filter);
+                forwarders.entry(filter.clone()).or_insert_with(|| {
+                    spawn_forwarder(
+                        &broker,
+                        filter.clone(),
+                        outgoing_tx.clone(),
+                        metrics.clone(),
+                    )
+                });
+                // The ack goes out before the interest-propagation
+                // echo below (ADR-0011) - both now flow through the
+                // same outgoing_tx queue (see ADR-0029), so whichever
+                // is sent first is what a subscriber sees first; a
+                // reply to this connection's own request reads more
+                // naturally arriving ahead of a side effect of it.
+                let ack = Envelope::new(
+                    node_id,
+                    MessageKind::Ack {
+                        in_reply_to: envelope.id,
+                    },
+                );
+                if outgoing_tx.send(Arc::new(ack)).await.is_err() {
                     break;
                 }
+                if is_new_forwarder && interest.subscribe(filter.clone()) {
+                    propagate_interest(&peer_links, node_id, filter, true);
+                }
+            }
+            MessageKind::Unsubscribe { filter } => {
+                tracing::info!(sender = ?envelope.sender, %filter, "unsubscribed");
+                let had_forwarder = forwarders.remove(filter).inspect(|handle| handle.abort());
+                // Ack before the echo - see the Subscribe arm above.
+                let ack = Envelope::new(
+                    node_id,
+                    MessageKind::Ack {
+                        in_reply_to: envelope.id,
+                    },
+                );
+                if outgoing_tx.send(Arc::new(ack)).await.is_err() {
+                    break;
+                }
+                if had_forwarder.is_some() && interest.unsubscribe(filter) {
+                    propagate_interest(&peer_links, node_id, filter.clone(), false);
+                }
+            }
+            MessageKind::Publish { topic, payload } => {
+                tracing::debug!(sender = ?envelope.sender, %topic, len = payload.len(), "publish");
+                let topic = topic.clone();
+                // Client-scoped (ADR-0018) or peer-scoped
+                // (ADR-0020) - see the Subscribe arm above.
+                let is_peer = peer_identity.is_some();
+                if !acl_permits(
+                    &topic_acl,
+                    &peer_topic_acl,
+                    is_peer,
+                    principal,
+                    &topic,
+                    Action::Publish,
+                ) {
+                    tracing::warn!(sender = ?envelope.sender, %topic, is_peer, "rejected: not on the configured topic ACL");
+                    if is_peer {
+                        metrics.record_peer_topic_acl_rejection();
+                    } else {
+                        metrics.record_topic_acl_rejection();
+                    }
+                    let error = Envelope::new(
+                        node_id,
+                        MessageKind::Error {
+                            in_reply_to: Some(envelope.id),
+                            message: format!("not authorized to publish to {topic}"),
+                        },
+                    );
+                    if outgoing_tx.send(Arc::new(error)).await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
+                broker.publish(&topic, Arc::new(envelope)).await;
+            }
+            MessageKind::Ack { .. } | MessageKind::Error { .. } => {
+                // Not actionable from a client in v1; ignore.
+            }
+            MessageKind::Hello { listen_addr } => {
+                tracing::info!(
+                    sender = ?envelope.sender,
+                    peer_listen_addr = ?listen_addr,
+                    "peer said hello"
+                );
+                if !allowlist_permits(&allowed_peers, peer_fingerprint) {
+                    tracing::warn!(
+                        sender = ?envelope.sender,
+                        "closing connection: peer certificate not on the --allow-peer allowlist"
+                    );
+                    let error = Envelope::new(
+                        node_id,
+                        MessageKind::Error {
+                            in_reply_to: Some(envelope.id),
+                            message: "peer certificate not on the --allow-peer allowlist"
+                                .to_owned(),
+                        },
+                    );
+                    let _ = outgoing_tx.send(Arc::new(error)).await;
+                    break;
+                }
+                peer_identity = Some(envelope.sender);
+                membership.mark_connected(envelope.sender, listen_addr.clone());
+                // The reply goes out before register_peer_link's own
+                // catch-up traffic (interest, known peers) - dial_
+                // handshake on the far end expects this Hello reply to
+                // be the very first thing it reads, and register_peer_
+                // link would otherwise queue catch-up messages ahead
+                // of it on the same outgoing_tx queue (see ADR-0029),
+                // which the far end can't parse as a Hello. Registering
+                // the link afterward is still safe: this task doesn't
+                // read the next incoming frame until this whole match
+                // arm returns, so nothing from the far end can be
+                // processed here before register_peer_link runs anyway.
+                let reply = Envelope::new(
+                    node_id,
+                    MessageKind::Hello {
+                        listen_addr: my_listen_addr.clone(),
+                    },
+                );
+                if outgoing_tx.send(Arc::new(reply)).await.is_err() {
+                    break;
+                }
+                register_peer_link(
+                    &peer_links,
+                    &interest,
+                    &discover,
+                    node_id,
+                    envelope.sender,
+                    listen_addr.clone(),
+                    &outgoing_tx,
+                );
+            }
+            MessageKind::PeerAnnounce { peers } => {
+                learn_peers(&peer_links, &discover, &discovered_tx, node_id, peers);
             }
         }
     }
@@ -344,6 +381,16 @@ async fn run_connection(socket: MaybeTlsStream, shared: Shared, initial_peer: Op
         peer_links.unregister(peer_id, &outgoing_tx);
         membership.mark_disconnected(peer_id);
     }
+
+    // Every other outgoing_tx clone (forwarders, the peer_links
+    // registry entry) is already gone by this point - dropping this
+    // last one closes the channel write_loop is reading from, and it
+    // exits on its own once it's drained whatever was already queued.
+    // Joined rather than left as a fire-and-forget background task, so
+    // this connection isn't considered fully done until its last reply
+    // has actually been flushed (or the write side already failed).
+    drop(outgoing_tx);
+    let _ = writer_task.await;
 }
 
 /// Registers this connection as a peer link and catches it up on
@@ -581,6 +628,52 @@ async fn send_envelope(
     match envelope.to_bytes() {
         Ok(bytes) => async_framing::write_frame(writer, &bytes).await.is_ok(),
         Err(_) => false,
+    }
+}
+
+/// Drains `outgoing_rx` and writes each envelope to `writer`, ending
+/// once the channel closes (every sender - `run_connection`'s own
+/// `outgoing_tx`, and every clone held by `peer_links`/a forwarder -
+/// has been dropped) or a write fails. Owns the write half
+/// exclusively and runs as its own task, concurrently with
+/// `run_connection`'s read loop - see ADR-0029 for why the two don't
+/// share one task via `tokio::select!` any more.
+async fn write_loop(
+    mut writer: Compat<WriteHalf<MaybeTlsStream>>,
+    mut outgoing_rx: mpsc::Receiver<Arc<Envelope>>,
+) {
+    while let Some(envelope) = outgoing_rx.recv().await {
+        if !send_envelope(&mut writer, &envelope).await {
+            tracing::warn!("closing connection: frame write error");
+            break;
+        }
+    }
+}
+
+/// A `JoinHandle` that aborts its task on drop, rather than detaching
+/// it to keep running in the background - the default for a plain
+/// `JoinHandle`. Used for [`write_loop`]'s task so cancelling the task
+/// holding this (e.g. `run_connection` itself being aborted, as a test
+/// simulating this connection dying does via
+/// `Node::accepted_connections`) also stops the writer task, instead
+/// of leaving the socket's write half alive with nothing left to read
+/// the other side.
+struct AbortOnDrop<T>(JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+impl<T> std::future::Future for AbortOnDrop<T> {
+    type Output = Result<T, tokio::task::JoinError>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::pin::Pin::new(&mut self.0).poll(cx)
     }
 }
 
