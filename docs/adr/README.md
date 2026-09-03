@@ -37,6 +37,7 @@ thoth-mesh, using the format described in
 | [0029](0029-split-connection-read-and-write-loops.md) | Splitting a connection's read and write loops into separate tasks |
 | [0030](0030-mesh-benchmark-suite.md) | A benchmark suite for throughput and latency across N mesh hops |
 | [0031](0031-connection-context-struct.md) | A `ConnectionContext` struct for `run_connection`'s dispatch loop |
+| [0032](0032-git-tags-and-github-releases.md) | Git tags and GitHub Releases for workspace version bumps |
 
 To add a new one, copy the format of an existing ADR, number it
 sequentially, and set its status to `Accepted` once the decision is
