@@ -38,6 +38,7 @@ thoth-mesh, using the format described in
 | [0030](0030-mesh-benchmark-suite.md) | A benchmark suite for throughput and latency across N mesh hops |
 | [0031](0031-connection-context-struct.md) | A `ConnectionContext` struct for `run_connection`'s dispatch loop |
 | [0032](0032-git-tags-and-github-releases.md) | Git tags and GitHub Releases for workspace version bumps |
+| [0033](0033-cli-subscribe-to-multiple-topics.md) | `thoth-mesh-cli subscribe` accepts more than one filter |
 
 To add a new one, copy the format of an existing ADR, number it
 sequentially, and set its status to `Accepted` once the decision is
