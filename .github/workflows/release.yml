@@ -1,0 +1,68 @@
+name: Release
+
+# Runs on every push to main, but only actually does anything the one
+# time in however many pushes that the workspace version bumped and
+# doesn't have a tag yet - see the "tag already exists" check below,
+# and ADR-0032. Doesn't publish anything to crates.io: that stays a
+# separate, manual `cargo publish` step (ADR-0014).
+on:
+  push:
+    branches: ["main"]
+
+# A second push landing while a tag/release from the first is still
+# being created should queue behind it, not race it - never cancel a
+# run that might already be mid-tag.
+concurrency:
+  group: release-${{ github.workflow }}
+  cancel-in-progress: false
+
+# Needs to push a tag and create a GitHub Release - the first workflow
+# in this repo that isn't read-only (ci.yml/audit.yml never write to
+# the repo). Scoped to just what this job needs.
+permissions:
+  contents: write
+
+jobs:
+  tag-and-release:
+    name: tag + release on a version bump
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: true # needs to push a tag below
+
+      - name: Read the workspace version
+        id: version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          if [ -z "$version" ]; then
+            echo "::error::couldn't read [workspace.package].version from Cargo.toml" >&2
+            exit 1
+          fi
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+
+      - name: Check whether the tag already exists
+        id: check
+        run: |
+          # Checked against origin directly, not the local clone -
+          # this doesn't depend on how much history/how many tags
+          # actions/checkout happened to fetch.
+          if git ls-remote --exit-code --tags origin "refs/tags/${{ steps.version.outputs.tag }}" >/dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create the tag and GitHub Release
+        if: steps.check.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "$TAG"
+          git push origin "$TAG"
+          gh release create "$TAG" --title "$TAG" --generate-notes
