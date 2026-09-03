@@ -1,15 +1,17 @@
 //! `thoth-mesh`: command-line client for publishing, subscribing, and
 //! administering a thoth-mesh node.
 //!
-//! v1 is intentionally minimal (see issue #13): one topic per
-//! invocation, no config file, no output formatting options. Admin
-//! commands are deferred until the node actually has an admin
-//! protocol to talk to.
+//! v1 is intentionally minimal (see issue #13): no config file, no
+//! output formatting options. Admin commands are deferred until the
+//! node actually has an admin protocol to talk to.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use thoth_mesh_core::{Envelope, MessageKind, PeerId, Topic, TopicFilter, async_framing};
+use thoth_mesh_core::{
+    Envelope, MessageId, MessageKind, PeerId, Topic, TopicFilter, async_framing,
+};
 use thoth_mesh_tls::{MaybeTlsStream, TlsConnector, client_config, load_certs, load_private_key};
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncReadCompatExt};
@@ -55,13 +57,16 @@ pub enum Command {
         /// Payload to send, as UTF-8 text.
         payload: String,
     },
-    /// Subscribe to a topic filter and print delivered messages until
-    /// interrupted (Ctrl-C).
+    /// Subscribe to one or more topic filters and print delivered
+    /// messages until interrupted (Ctrl-C).
     Subscribe {
-        /// Topic filter to subscribe to - a literal topic name, or an
-        /// MQTT-style wildcard pattern (`+` matches one segment, a
-        /// trailing `#` matches the rest; see ADR-0022).
-        filter: String,
+        /// Topic filter(s) to subscribe to - each a literal topic
+        /// name, or an MQTT-style wildcard pattern (`+` matches one
+        /// segment, a trailing `#` matches the rest; see ADR-0022).
+        /// Give more than one to watch several filters over one
+        /// connection (see ADR-0033).
+        #[arg(required = true)]
+        filters: Vec<String>,
     },
 }
 
@@ -74,8 +79,10 @@ pub async fn run(cli: Cli) -> std::io::Result<()> {
         Command::Publish { topic, .. } => {
             parse_topic(topic)?;
         }
-        Command::Subscribe { filter } => {
-            parse_filter(filter)?;
+        Command::Subscribe { filters } => {
+            for filter in filters {
+                parse_filter(filter)?;
+            }
         }
     }
 
@@ -102,22 +109,38 @@ pub async fn run(cli: Cli) -> std::io::Result<()> {
             );
             send(&mut conn, &envelope).await
         }
-        Command::Subscribe { filter } => {
-            let filter = parse_filter(&filter)?;
-            subscribe_and_print(&mut conn, sender, filter).await
+        Command::Subscribe { filters } => {
+            let filters = filters
+                .iter()
+                .map(|filter| parse_filter(filter))
+                .collect::<std::io::Result<Vec<_>>>()?;
+            subscribe_and_print(&mut conn, sender, filters).await
         }
     }
 }
 
-/// Sends a `Subscribe` for `filter`, waits for its ack, then prints
-/// each delivered message until interrupted (Ctrl-C).
+/// Sends a `Subscribe` for every filter in `filters`, waits until each
+/// has been acked, then prints every delivered message until
+/// interrupted (Ctrl-C).
 async fn subscribe_and_print(
     conn: &mut Compat<MaybeTlsStream>,
     sender: PeerId,
-    filter: TopicFilter,
+    filters: Vec<TopicFilter>,
 ) -> std::io::Result<()> {
-    subscribe(conn, sender, filter.clone()).await?;
-    println!("Subscribed to {filter}. Waiting for messages (Ctrl-C to stop)...");
+    let backlog = subscribe_all(conn, sender, &filters).await?;
+    let list = filters
+        .iter()
+        .map(TopicFilter::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!("Subscribed to {list}. Waiting for messages (Ctrl-C to stop)...");
+    // Anything subscribe_all had to buffer while still waiting on
+    // another filter's ack (see its own doc comment) is real,
+    // already-received traffic - print it before falling into the
+    // live loop below, in the order it actually arrived.
+    for envelope in backlog {
+        print_if_publish(envelope);
+    }
 
     loop {
         tokio::select! {
@@ -139,9 +162,12 @@ fn print_if_publish(envelope: Envelope) {
 /// matching `Error`, surfaced as an `Err` rather than waiting forever
 /// for an `Ack` that will never come.
 ///
-/// This is the actual protocol logic behind `subscribe_and_print`,
-/// factored out so tests can drive it directly without simulating
-/// Ctrl-C or capturing stdout.
+/// Test-only: `subscribe_and_print`'s actual CLI-facing path goes
+/// through [`subscribe_all`] even for a single filter (its per-filter
+/// overhead is trivial), so this exists purely so protocol-level tests
+/// can drive a single subscribe directly, without simulating Ctrl-C or
+/// capturing stdout. See ADR-0033.
+#[cfg(test)]
 async fn subscribe(
     conn: &mut Compat<MaybeTlsStream>,
     sender: PeerId,
@@ -165,6 +191,61 @@ async fn subscribe(
             _ => continue,
         }
     }
+}
+
+/// Like [`subscribe`], but for every filter in `filters` at once: sends
+/// every `Subscribe` up front, then drains responses until each has
+/// been acked (or the first `Error` is hit, which fails the whole
+/// batch immediately - not "whichever filters were permitted"). Any
+/// `Publish` that arrives before every ack does is returned, in
+/// arrival order, rather than acted on here - this function is only
+/// about the subscribe handshake, same division of responsibility as
+/// [`subscribe`] itself never printing anything.
+///
+/// Deliberately not just `filters.iter()` calling [`subscribe`] once
+/// per filter in sequence: with more than one filter outstanding, an
+/// earlier filter can already be acked and start delivering live
+/// `Publish` traffic while a later one is still awaiting its own ack -
+/// [`subscribe`]'s loop would silently discard that delivery, since it
+/// only recognizes the one `Ack`/`Error` it's currently waiting on.
+/// This loop instead buffers any `Publish` that arrives in the
+/// meantime, alongside tracking every outstanding request by its own
+/// `MessageId`. See ADR-0033.
+async fn subscribe_all(
+    conn: &mut Compat<MaybeTlsStream>,
+    sender: PeerId,
+    filters: &[TopicFilter],
+) -> std::io::Result<Vec<Envelope>> {
+    let mut pending: HashSet<MessageId> = HashSet::new();
+    for filter in filters {
+        let envelope = Envelope::new(
+            sender,
+            MessageKind::Subscribe {
+                filter: filter.clone(),
+            },
+        );
+        send(conn, &envelope).await?;
+        pending.insert(envelope.id);
+    }
+    let mut backlog = Vec::new();
+    while !pending.is_empty() {
+        let received = recv(conn).await?;
+        match &received.kind {
+            MessageKind::Ack { in_reply_to } if pending.remove(in_reply_to) => {}
+            MessageKind::Error {
+                in_reply_to: Some(id),
+                message,
+            } if pending.remove(id) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    message.clone(),
+                ));
+            }
+            MessageKind::Publish { .. } => backlog.push(received),
+            _ => continue,
+        }
+    }
+    Ok(backlog)
 }
 
 /// Builds this connection's TLS connector from `cli`'s `--tls-*`
@@ -349,7 +430,7 @@ mod tests {
             tls_cert: None,
             tls_key: None,
             command: Command::Subscribe {
-                filter: "weather.#.updates".to_owned(),
+                filters: vec!["weather.#.updates".to_owned()],
             },
         };
         let err = timeout(TEST_TIMEOUT, run(cli))
@@ -435,6 +516,182 @@ mod tests {
         )
         .await
         .expect("timed out waiting for the rejection - subscribe() must not hang on an Error")
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn subscribe_all_acks_every_filter_and_each_still_delivers() {
+        let addr = spawn_test_node().await;
+        let mut client = connect(addr).await;
+        let weather: TopicFilter = "weather.updates".parse().unwrap();
+        let traffic: TopicFilter = "traffic.updates".parse().unwrap();
+
+        let backlog = timeout(
+            TEST_TIMEOUT,
+            subscribe_all(
+                &mut client,
+                PeerId::new(),
+                &[weather.clone(), traffic.clone()],
+            ),
+        )
+        .await
+        .expect("timed out waiting for both acks")
+        .unwrap();
+        assert!(
+            backlog.is_empty(),
+            "nothing was published yet, so there's nothing to have buffered"
+        );
+
+        let mut publisher = connect(addr).await;
+        for (topic, payload) in [
+            ("weather.updates", b"sunny".to_vec()),
+            ("traffic.updates", b"jammed".to_vec()),
+        ] {
+            send(
+                &mut publisher,
+                &Envelope::new(
+                    PeerId::new(),
+                    MessageKind::Publish {
+                        topic: topic.parse().unwrap(),
+                        payload,
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        }
+
+        let mut delivered = Vec::new();
+        for _ in 0..2 {
+            let envelope = timeout(TEST_TIMEOUT, recv(&mut client))
+                .await
+                .expect("timed out waiting for a publish")
+                .unwrap();
+            if let MessageKind::Publish { topic, payload } = envelope.kind {
+                delivered.push((topic.to_string(), payload));
+            }
+        }
+        delivered.sort();
+        assert_eq!(
+            delivered,
+            vec![
+                ("traffic.updates".to_owned(), b"jammed".to_vec()),
+                ("weather.updates".to_owned(), b"sunny".to_vec()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn subscribe_all_buffers_a_publish_that_arrives_before_every_ack_does() {
+        // A raw socket standing in for a node - not spawn_test_node(),
+        // deliberately: this test needs to choose exactly which order
+        // responses arrive in (a live publish for the first filter,
+        // interleaved *ahead of* the second filter's own ack), not
+        // hope real server/forwarder scheduling happens to produce
+        // that interleaving on a given run.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let fake_node = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut conn = MaybeTlsStream::Plain(socket).compat();
+
+            // The client sends filters in order, awaiting each send()
+            // before the next - so the first frame read here is
+            // reliably weather's Subscribe, the second traffic's.
+            let weather_subscribe = recv(&mut conn).await.unwrap();
+            let traffic_subscribe = recv(&mut conn).await.unwrap();
+
+            send(
+                &mut conn,
+                &Envelope::new(
+                    PeerId::new(),
+                    MessageKind::Ack {
+                        in_reply_to: weather_subscribe.id,
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+            send(
+                &mut conn,
+                &Envelope::new(
+                    PeerId::new(),
+                    MessageKind::Publish {
+                        topic: "weather.updates".parse().unwrap(),
+                        payload: b"sunny".to_vec(),
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+            send(
+                &mut conn,
+                &Envelope::new(
+                    PeerId::new(),
+                    MessageKind::Ack {
+                        in_reply_to: traffic_subscribe.id,
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        });
+
+        let mut client = connect(addr).await;
+        let weather: TopicFilter = "weather.updates".parse().unwrap();
+        let traffic: TopicFilter = "traffic.updates".parse().unwrap();
+        let backlog = timeout(
+            TEST_TIMEOUT,
+            subscribe_all(&mut client, PeerId::new(), &[weather.clone(), traffic]),
+        )
+        .await
+        .expect("timed out waiting for the batch ack")
+        .unwrap();
+        timeout(TEST_TIMEOUT, fake_node)
+            .await
+            .expect("fake node task timed out")
+            .unwrap();
+
+        // A naive per-filter subscribe() loop would have discarded
+        // this - it isn't the ack traffic's Subscribe is waiting on.
+        assert_eq!(
+            backlog.len(),
+            1,
+            "the interleaved publish should be buffered, not lost: {backlog:?}"
+        );
+        assert_eq!(
+            backlog[0].kind,
+            MessageKind::Publish {
+                topic: weather.as_topic().unwrap(),
+                payload: b"sunny".to_vec(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn subscribe_all_rejects_the_whole_batch_on_the_first_denied_filter() {
+        let acl = thoth_mesh_node::TopicAcl::parse(["anonymous|sub|weather.updates"]).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(thoth_mesh_node::serve_with_tls(
+            listener,
+            Vec::new(),
+            thoth_mesh_node::NodeOptions {
+                topic_acl: Some(acl),
+                ..Default::default()
+            },
+        ));
+
+        let mut client = connect(addr).await;
+        let weather: TopicFilter = "weather.updates".parse().unwrap();
+        let secret: TopicFilter = "secret.topic".parse().unwrap();
+        let err = timeout(
+            TEST_TIMEOUT,
+            subscribe_all(&mut client, PeerId::new(), &[weather, secret]),
+        )
+        .await
+        .expect("timed out waiting for the rejection")
         .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
     }

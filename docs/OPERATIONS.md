@@ -139,11 +139,14 @@ Subscribed to demo.topic. Waiting for messages (Ctrl-C to stop)...
 [demo.topic] hello mesh
 ```
 
-`subscribe` runs until interrupted (Ctrl-C). `publish` sends one
-payload and exits — there's no reply or delivery confirmation (see
-[`PROTOCOL.md`](../PROTOCOL.md#delivery-semantics)). The payload is
-taken as UTF-8 text on the command line; there's no way yet to send
-binary payloads or read one from stdin (see
+`subscribe` runs until interrupted (Ctrl-C) and accepts more than one
+filter in one invocation (`subscribe demo.topic other.topic`), sharing
+a single connection - each printed line names the concrete topic it
+arrived on, so it's clear which filter matched (see ADR-0033).
+`publish` sends one payload and exits — there's no reply or delivery
+confirmation (see [`PROTOCOL.md`](../PROTOCOL.md#delivery-semantics)).
+The payload is taken as UTF-8 text on the command line; there's no way
+yet to send binary payloads or read one from stdin (see
 [docs/ROADMAP.md](ROADMAP.md) Phase 10).
 
 Every node and CLI invocation picks a fresh random `PeerId` on
