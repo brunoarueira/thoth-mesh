@@ -787,18 +787,17 @@ no repetition or statistical averaging.
 
 Worth knowing before running this anywhere that matters:
 
-- **A claimed `sender` still isn't checked against anything.** A node
-  or CLI invocation with its own `--tls-cert` now derives its `PeerId`
-  from that certificate (see [above](#single-node-quickstart), ADR-0038) rather
-  than self-reporting a random one - but nothing on the receiving end
-  compares a `Hello`/envelope's claimed `sender` against the
-  fingerprint actually authenticating that connection yet, so a
-  differently-identified connection can still claim someone else's
-  `PeerId`. TLS ([above](#tls)), a [peer allowlist](#peer-allowlist),
-  and [per-topic client authorization](#per-topic-client-authorization)
-  are all available but opt-in regardless. Without TLS, every
-  connection is plaintext TCP; don't expose a node's port beyond a
-  trusted network either way.
+- **A `sender`/`Hello` claim is only as trustworthy as TLS makes it.**
+  A node or CLI invocation with its own `--tls-cert` derives its
+  `PeerId` from that certificate (see
+  [above](#single-node-quickstart)), and a differently-identified
+  connection claiming a `PeerId` that certificate doesn't back gets
+  silently corrected to the one it does, rather than trusted as
+  claimed (see ADR-0038/ADR-0039) - closing the impersonation gap for
+  any connection presenting a certificate. A connection with no
+  certificate at all still has nothing stronger than an unverifiable
+  self-report, and without TLS, every connection is plaintext TCP;
+  don't expose a node's port beyond a trusted network either way.
 - **The metrics endpoint's authentication, when on, is a single shared
   secret.** `--metrics-token-file` (see
   [Metrics authentication](#metrics-authentication)) is opt-in and

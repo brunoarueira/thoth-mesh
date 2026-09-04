@@ -44,6 +44,7 @@ thoth-mesh, using the format described in
 | [0036](0036-cli-shell-completions.md) | `thoth-mesh-cli` shell completions |
 | [0037](0037-status-command.md) | `thoth-mesh-cli` status command |
 | [0038](0038-peerid-from-tls-fingerprint.md) | `PeerId` derived from a TLS certificate fingerprint |
+| [0039](0039-silently-correct-mismatched-peerid.md) | Silently correct a mismatched `PeerId` claim |
 
 To add a new one, copy the format of an existing ADR, number it
 sequentially, and set its status to `Accepted` once the decision is
