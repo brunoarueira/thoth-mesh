@@ -10,13 +10,15 @@
 mod config;
 
 use std::collections::HashSet;
+use std::io::Write;
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use thoth_mesh_core::{
     Envelope, MessageId, MessageKind, PeerId, Topic, TopicFilter, async_framing,
 };
 use thoth_mesh_tls::{MaybeTlsStream, TlsConnector, client_config, load_certs, load_private_key};
+use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncReadCompatExt};
 
@@ -66,7 +68,10 @@ pub enum Command {
     Publish {
         /// Topic to publish to.
         topic: String,
-        /// Payload to send, as UTF-8 text.
+        /// Payload to send, as UTF-8 text - or `-` to read the
+        /// payload as raw bytes from stdin instead, the only way to
+        /// send a binary payload, or one too large for a CLI argument.
+        /// See ADR-0035.
         payload: String,
     },
     /// Subscribe to one or more topic filters and print delivered
@@ -79,7 +84,27 @@ pub enum Command {
         /// connection (see ADR-0033).
         #[arg(required = true)]
         filters: Vec<String>,
+        /// How to print delivered messages: `text` (default,
+        /// human-readable, lossy for a non-UTF-8 payload) or `raw`
+        /// (exact payload bytes to stdout, binary-safe - see
+        /// ADR-0035).
+        #[arg(long, value_enum, default_value_t = OutputMode::Text)]
+        output: OutputMode,
     },
+}
+
+/// `subscribe --output <MODE>`. See ADR-0035.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum OutputMode {
+    /// `[topic] {payload}`, decoded as UTF-8 (lossy: an invalid byte
+    /// sequence is replaced with U+FFFD). The default.
+    Text,
+    /// Every delivered message's raw payload bytes, written to stdout
+    /// back-to-back with nothing else - no topic label, no separator
+    /// between messages. Binary-safe. The "Subscribed to ..." banner
+    /// and a per-message `[topic] N bytes` note go to stderr instead,
+    /// so stdout stays exactly the payload bytes.
+    Raw,
 }
 
 /// Runs the CLI: connects to `cli.addr` and executes `cli.command`.
@@ -91,7 +116,7 @@ pub async fn run(cli: Cli) -> std::io::Result<()> {
         Command::Publish { topic, .. } => {
             parse_topic(topic)?;
         }
-        Command::Subscribe { filters } => {
+        Command::Subscribe { filters, .. } => {
             for filter in filters {
                 parse_filter(filter)?;
             }
@@ -115,32 +140,48 @@ pub async fn run(cli: Cli) -> std::io::Result<()> {
     match cli.command {
         Command::Publish { topic, payload } => {
             let topic = parse_topic(&topic)?;
-            let envelope = Envelope::new(
-                sender,
-                MessageKind::Publish {
-                    topic,
-                    payload: payload.into_bytes(),
-                },
-            );
+            let payload = read_payload(&payload, tokio::io::stdin()).await?;
+            let envelope = Envelope::new(sender, MessageKind::Publish { topic, payload });
             send(&mut conn, &envelope).await
         }
-        Command::Subscribe { filters } => {
+        Command::Subscribe { filters, output } => {
             let filters = filters
                 .iter()
                 .map(|filter| parse_filter(filter))
                 .collect::<std::io::Result<Vec<_>>>()?;
-            subscribe_and_print(&mut conn, sender, filters).await
+            subscribe_and_print(&mut conn, sender, filters, output).await
         }
     }
 }
 
+/// Resolves `arg` (`publish`'s `payload` argument) to the actual bytes
+/// to send: `arg` itself, UTF-8 encoded, unless `arg` is exactly `-`,
+/// in which case `stdin` is read to EOF instead and used as-is - not
+/// decoded as UTF-8, which is what makes a binary payload possible at
+/// all. Takes `stdin` as a parameter (rather than calling
+/// `tokio::io::stdin()` itself) so tests can exercise the `-` path
+/// against an in-memory buffer. See ADR-0035.
+async fn read_payload(
+    arg: &str,
+    mut stdin: impl tokio::io::AsyncRead + Unpin,
+) -> std::io::Result<Vec<u8>> {
+    if arg == "-" {
+        let mut bytes = Vec::new();
+        stdin.read_to_end(&mut bytes).await?;
+        Ok(bytes)
+    } else {
+        Ok(arg.as_bytes().to_vec())
+    }
+}
+
 /// Sends a `Subscribe` for every filter in `filters`, waits until each
-/// has been acked, then prints every delivered message until
-/// interrupted (Ctrl-C).
+/// has been acked, then prints every delivered message (per `output`,
+/// see [`OutputMode`]) until interrupted (Ctrl-C).
 async fn subscribe_and_print(
     conn: &mut Compat<MaybeTlsStream>,
     sender: PeerId,
     filters: Vec<TopicFilter>,
+    output: OutputMode,
 ) -> std::io::Result<()> {
     let backlog = subscribe_all(conn, sender, &filters).await?;
     let list = filters
@@ -148,27 +189,44 @@ async fn subscribe_and_print(
         .map(TopicFilter::to_string)
         .collect::<Vec<_>>()
         .join(", ");
-    println!("Subscribed to {list}. Waiting for messages (Ctrl-C to stop)...");
+    let banner = format!("Subscribed to {list}. Waiting for messages (Ctrl-C to stop)...");
+    // In OutputMode::Raw, stdout is reserved for exactly the delivered
+    // payload bytes - this banner (and each message's own note, see
+    // print_if_publish) goes to stderr instead there.
+    match output {
+        OutputMode::Text => println!("{banner}"),
+        OutputMode::Raw => eprintln!("{banner}"),
+    }
     // Anything subscribe_all had to buffer while still waiting on
     // another filter's ack (see its own doc comment) is real,
     // already-received traffic - print it before falling into the
     // live loop below, in the order it actually arrived.
     for envelope in backlog {
-        print_if_publish(envelope);
+        print_if_publish(envelope, output)?;
     }
 
     loop {
         tokio::select! {
-            envelope = recv(conn) => print_if_publish(envelope?),
+            envelope = recv(conn) => print_if_publish(envelope?, output)?,
             _ = tokio::signal::ctrl_c() => return Ok(()),
         }
     }
 }
 
-fn print_if_publish(envelope: Envelope) {
-    if let MessageKind::Publish { topic, payload } = envelope.kind {
-        println!("[{topic}] {}", String::from_utf8_lossy(&payload));
+fn print_if_publish(envelope: Envelope, output: OutputMode) -> std::io::Result<()> {
+    let MessageKind::Publish { topic, payload } = envelope.kind else {
+        return Ok(());
+    };
+    match output {
+        OutputMode::Text => println!("[{topic}] {}", String::from_utf8_lossy(&payload)),
+        OutputMode::Raw => {
+            eprintln!("[{topic}] {} bytes", payload.len());
+            let mut stdout = std::io::stdout();
+            stdout.write_all(&payload)?;
+            stdout.flush()?;
+        }
     }
+    Ok(())
 }
 
 /// Sends a `Subscribe` for `filter` and waits for the matching `Ack` -
@@ -488,6 +546,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_payload_uses_the_literal_argument_when_it_is_not_a_dash() {
+        // A reader that would panic if actually read from - proves
+        // the literal-argument path never touches it.
+        let unused = tokio::io::empty();
+        let payload = read_payload("hello", unused).await.unwrap();
+        assert_eq!(payload, b"hello");
+    }
+
+    #[tokio::test]
+    async fn read_payload_reads_raw_bytes_from_stdin_when_the_argument_is_a_dash() {
+        // Includes bytes that aren't valid UTF-8 - the whole point of
+        // reading stdin raw instead of as a CLI-argument String.
+        let binary: &[u8] = &[0xff, 0xfe, 0x00, b'h', b'i', 0x01];
+        let payload = read_payload("-", binary).await.unwrap();
+        assert_eq!(payload, binary);
+    }
+
+    #[tokio::test]
     async fn run_rejects_an_invalid_filter_before_connecting() {
         // Nothing listens on this address - if run() tried to connect
         // before validating its argument, this would time out or fail
@@ -500,6 +576,7 @@ mod tests {
             tls_key: None,
             command: Command::Subscribe {
                 filters: vec!["weather.#.updates".to_owned()],
+                output: OutputMode::Text,
             },
         };
         let err = timeout(TEST_TIMEOUT, run(cli))
