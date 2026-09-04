@@ -661,3 +661,71 @@ async fn dial_side_corrects_a_mismatched_seed_peer_hello_to_the_authenticated_id
     eventually(|| dialer.membership.is_reachable(authenticated_id)).await;
     assert!(!dialer.membership.is_reachable(claimed_id));
 }
+
+/// ADR-0040 (closing #122): a real peer and a simultaneously-connected
+/// impersonation attempt - its own valid certificate, but a `Hello`
+/// claiming the real peer's identity - can never collide on one
+/// `Membership`/`PeerLinks` entry. The "attacker" ends up registered
+/// under its own distinct authenticated identity, alongside the real
+/// peer's untouched one, and both keep working independently.
+#[tokio::test]
+async fn an_impersonation_attempt_never_collides_with_the_real_peers_membership_entry() {
+    let ca = TestCa::new();
+    let real_peer_identity = ca.issue();
+    let real_peer_id =
+        thoth_mesh_core::PeerId::from_fingerprint(fingerprint_of(&real_peer_identity));
+    let attacker_identity = ca.issue();
+    let attacker_id = thoth_mesh_core::PeerId::from_fingerprint(fingerprint_of(&attacker_identity));
+    assert_ne!(real_peer_id, attacker_id);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let node = thoth_mesh_node::spawn_with_tls(
+        listener,
+        Vec::new(),
+        NodeOptions {
+            tls: Some(ca.issue()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    // The real peer connects and identifies itself honestly.
+    let mut real_conn = connect_tls_as(addr, &real_peer_identity, Some(&real_peer_identity)).await;
+    send(
+        &mut real_conn,
+        &Envelope::new(real_peer_id, MessageKind::Hello { listen_addr: None }),
+    )
+    .await;
+    recv(&mut real_conn).await; // this node's Hello reply
+
+    // The attacker connects with its own certificate, but claims to
+    // be the real peer.
+    let mut attacker_conn =
+        connect_tls_as(addr, &attacker_identity, Some(&attacker_identity)).await;
+    send(
+        &mut attacker_conn,
+        &Envelope::new(real_peer_id, MessageKind::Hello { listen_addr: None }),
+    )
+    .await;
+    recv(&mut attacker_conn).await; // this node's Hello reply
+
+    // Two distinct entries, not one clobbering the other.
+    assert!(node.membership.is_reachable(real_peer_id));
+    assert!(node.membership.is_reachable(attacker_id));
+
+    // Both connections are still independently live and correctly
+    // routed - a status round trip on each (not Subscribe/Publish:
+    // both connections are peer links now, and a peer link's own
+    // Subscribe also echoes back to itself via interest propagation,
+    // ADR-0011 - a second reply this check doesn't care about and
+    // would just complicate accounting for).
+    for conn in [&mut real_conn, &mut attacker_conn] {
+        let request = Envelope::new(thoth_mesh_core::PeerId::new(), MessageKind::StatusRequest);
+        send(conn, &request).await;
+        match recv(conn).await.kind {
+            MessageKind::StatusReply { in_reply_to, .. } => assert_eq!(in_reply_to, request.id),
+            other => panic!("expected a StatusReply, got {other:?}"),
+        }
+    }
+}
