@@ -170,6 +170,102 @@ limitation names directly.
   currently keys off `Hello`'s self-reported `PeerId` alone with
   nothing stopping two peers from claiming the same one.
 
+## Phase 13 — Delivery semantics
+
+**Goal:** pub/sub today is fire-and-forget fan-out to whoever's
+currently subscribed — no delivery guarantee, no way to split load
+across a group of workers, no way to just get "the current value,"
+and no hint at what a payload even is.
+
+- At-least-once delivery with ack-based redelivery, built on the
+  existing replay buffer (ADR-0021/ADR-0024) rather than requiring
+  durable storage first.
+- Consumer groups — a named group load-balances a topic (one member
+  gets each message) as an alternative to today's
+  fan-out-to-everyone.
+- Retained/last-value semantics per topic — subscribing gets you the
+  current value immediately, distinct from the replay buffer's
+  bounded catch-up window.
+- An optional content-type hint on `Publish`, so a subscriber can
+  know what it's looking at without a full schema registry.
+
+## Phase 14 — Durability beyond the replay buffer
+
+**Goal:** Phase 8's replay buffer is bounded, in-memory, and
+short-lived — nothing survives a node restart, and a subscriber gone
+too long loses everything in between.
+
+- On-disk persistence for published messages, replacing or backing
+  the in-memory broadcast channel (ADR-0006).
+- Durable subscriptions / consumer offsets — reconnecting resumes
+  exactly where a subscriber left off.
+- Message TTL / dead-lettering for payloads nobody ever consumes.
+
+## Phase 15 — Federation-specific routing
+
+**Goal:** a peer link forwards whatever the far end's aggregate
+subscriber interest already is (ADR-0011) — real federation
+topologies often want more deliberate control over what crosses a
+given link.
+
+- Selective per-peer-link topic filtering — relay only matching
+  topics to a specific peer, independent of that peer's own interest.
+- Request/reply over pub/sub — a correlation-ID convention for
+  RPC-style call/response.
+
+## Phase 16 — Operability
+
+**Goal:** running thoth-mesh somewhere that matters needs guardrails
+and visibility beyond `status`/metrics.
+
+- Rate limiting / quotas, per client or per topic.
+- Topic discovery — "what topics currently have traffic."
+- Payload-level encryption, independent of transport TLS.
+- Dynamic config reload — `--topic-acl`/`--allow-peer`/etc. without a
+  restart.
+- Health/readiness endpoints for orchestration (k8s, systemd),
+  distinct from metrics/status.
+
+## Phase 17 — Per-message tracing across peer hops
+
+**Goal:** `status` (ADR-0037) shows a node's point-in-time state, but
+nothing shows the path a single message actually took across a
+multi-hop mesh — essential for debugging routing/federation issues
+that only show up in a real topology.
+
+- A trace/correlation id propagated alongside a message as it crosses
+  peer links, distinct from `MessageId` (which identifies the
+  message, not its journey).
+- A way to actually observe a trace — logged at each hop at minimum,
+  a dedicated query surface possibly later.
+- Worth documenting explicitly: a traced message re-entering an
+  already-visited node is exactly the case loop-prevention
+  (ADR-0011) exists for.
+
+## Phase 18 — Protocol version negotiation
+
+**Goal:** `Envelope.version` exists on the wire (ADR-0005) but
+nothing reads or enforces it — a version mismatch between two builds
+(or a future non-Rust implementation) fails unpredictably instead of
+being detected and handled.
+
+- Reject/handle an incompatible version explicitly, rather than
+  attempting to decode it as understood.
+- A documented compatibility policy — what "supported" means across
+  versions, and how a breaking wire change would roll out.
+
+## Phase 19 — Embeddable client library
+
+**Goal:** every existing wire-protocol user, including this project's
+own test suites, hand-rolls envelope construction and framing calls —
+there's no ergonomic Rust API for embedding a thoth-mesh client in
+another application, the way `thoth-mesh-cli` is one for a terminal.
+
+- A `thoth-mesh-client`-shaped crate wrapping connect/publish/
+  subscribe/status behind a proper async API.
+- Decide the relationship to `thoth-mesh-cli`: does the CLI become a
+  thin wrapper over this crate, or do they stay independent?
+
 ## Standalone work (not tied to a phase)
 
 Some work is useful on its own regardless of which feature phase lands
@@ -181,6 +277,15 @@ next — tracked as plain issues rather than under a milestone:
 
 ## Non-goals (for now)
 
-Things intentionally left out of this roadmap: a hosted/managed
-deployment story (a control plane, a SaaS offering — distinct from
-Phase 9's "runnable via Docker/systemd," which is in scope).
+Things intentionally left out of this roadmap:
+
+- A hosted/managed deployment story (a control plane, a SaaS offering
+  — distinct from Phase 9's "runnable via Docker/systemd," which is
+  in scope).
+- Multi-tenancy / a schema registry — enterprise-shaped features that
+  don't obviously match this project's minimalism so far; Phase 13's
+  content-type hint covers the "what is this payload" need without
+  either.
+- Horizontal sharding within one logical node — contradicts the
+  mesh's own design, where *nodes* are the scaling unit, not shards
+  within one.
