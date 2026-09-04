@@ -13,7 +13,7 @@ use std::collections::HashSet;
 use std::io::Write;
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use thoth_mesh_core::{
     Envelope, MessageId, MessageKind, PeerId, Topic, TopicFilter, async_framing,
 };
@@ -25,7 +25,11 @@ use tokio_util::compat::{Compat, TokioAsyncReadCompatExt};
 pub use thoth_mesh_core::DEFAULT_ADDR;
 
 #[derive(Parser, Debug)]
-#[command(version, about)]
+// Explicit name: this crate is thoth-mesh-cli, but the binary it
+// builds - and what `--help`/`--version` and, since ADR-0036,
+// generated completions should actually say - is `thoth-mesh`. Left
+// implicit, clap defaults to CARGO_PKG_NAME (the crate name) instead.
+#[command(name = "thoth-mesh", version, about)]
 pub struct Cli {
     /// Node address to connect to. Falls back to the config file's
     /// `addr` (see --config), then to the built-in default, if not
@@ -91,6 +95,9 @@ pub enum Command {
         #[arg(long, value_enum, default_value_t = OutputMode::Text)]
         output: OutputMode,
     },
+    /// Print a tab-completion script for `shell` to stdout, then exit.
+    /// See ADR-0036 for how to install the result.
+    Completions { shell: clap_complete::Shell },
 }
 
 /// `subscribe --output <MODE>`. See ADR-0035.
@@ -101,7 +108,7 @@ pub enum OutputMode {
     Text,
     /// Every delivered message's raw payload bytes, written to stdout
     /// back-to-back with nothing else - no topic label, no separator
-    /// between messages. Binary-safe. The "Subscribed to ..." banner
+    /// between messages. Binary-safe. The `Subscribed to ...` banner
     /// and a per-message `[topic] N bytes` note go to stderr instead,
     /// so stdout stays exactly the payload bytes.
     Raw,
@@ -109,6 +116,13 @@ pub enum OutputMode {
 
 /// Runs the CLI: connects to `cli.addr` and executes `cli.command`.
 pub async fn run(cli: Cli) -> std::io::Result<()> {
+    // Generating a completion script touches neither the network nor
+    // the config file every other command needs - handled before any
+    // of that setup runs, not after. See ADR-0036.
+    if let Command::Completions { shell } = cli.command {
+        return print_completions(shell, &mut std::io::stdout());
+    }
+
     // Validated up front, before dialing anything - a malformed topic
     // or filter should fail immediately, not only after a possibly
     // slow connect/TLS handshake.
@@ -121,6 +135,7 @@ pub async fn run(cli: Cli) -> std::io::Result<()> {
                 parse_filter(filter)?;
             }
         }
+        Command::Completions { .. } => unreachable!("returned above"),
     }
 
     let config = config::load(cli.config.as_deref())?;
@@ -151,7 +166,17 @@ pub async fn run(cli: Cli) -> std::io::Result<()> {
                 .collect::<std::io::Result<Vec<_>>>()?;
             subscribe_and_print(&mut conn, sender, filters, output).await
         }
+        Command::Completions { .. } => unreachable!("returned above"),
     }
+}
+
+/// Writes `shell`'s completion script for this binary to `out`. See
+/// ADR-0036.
+fn print_completions(shell: clap_complete::Shell, out: &mut impl Write) -> std::io::Result<()> {
+    let mut cmd = Cli::command();
+    let name = cmd.get_name().to_owned();
+    clap_complete::generate(shell, &mut cmd, name, out);
+    Ok(())
 }
 
 /// Resolves `arg` (`publish`'s `payload` argument) to the actual bytes
@@ -561,6 +586,95 @@ mod tests {
         let binary: &[u8] = &[0xff, 0xfe, 0x00, b'h', b'i', 0x01];
         let payload = read_payload("-", binary).await.unwrap();
         assert_eq!(payload, binary);
+    }
+
+    #[test]
+    fn help_text_has_no_embedded_double_quotes() {
+        // A literal `"` in any --help/doc-comment text embeds
+        // unescaped into fish's generated `-d`/`-a` arguments and
+        // breaks the script at load time - an actual bug this test is
+        // here to catch, found by loading a real generated fish
+        // script (see ADR-0036), not by reasoning about the generator
+        // up front. Checked structurally over the whole Cli command
+        // tree, rather than one string at a time, so a doc comment
+        // added anywhere later stays covered.
+        fn check(cmd: &clap::Command) {
+            let texts = [cmd.get_about(), cmd.get_long_about()];
+            for text in texts.into_iter().flatten() {
+                assert!(
+                    !text.to_string().contains('"'),
+                    "{}: {text}",
+                    cmd.get_name()
+                );
+            }
+            for arg in cmd.get_arguments() {
+                let texts = [arg.get_help(), arg.get_long_help()];
+                for text in texts.into_iter().flatten() {
+                    assert!(
+                        !text.to_string().contains('"'),
+                        "{}/{}: {text}",
+                        cmd.get_name(),
+                        arg.get_id()
+                    );
+                }
+                for value in arg.get_possible_values() {
+                    if let Some(help) = value.get_help() {
+                        assert!(
+                            !help.to_string().contains('"'),
+                            "{}/{}={}: {help}",
+                            cmd.get_name(),
+                            arg.get_id(),
+                            value.get_name()
+                        );
+                    }
+                }
+            }
+            for sub in cmd.get_subcommands() {
+                check(sub);
+            }
+        }
+        check(&Cli::command());
+    }
+
+    #[test]
+    fn print_completions_registers_under_the_real_binary_name_for_every_shell() {
+        for shell in clap_complete::Shell::value_variants() {
+            let mut out = Vec::new();
+            print_completions(*shell, &mut out).unwrap();
+            let script = String::from_utf8(out).unwrap();
+            assert!(
+                !script.is_empty(),
+                "{shell:?} produced an empty completion script"
+            );
+            // Regression check for the name mismatch this depended on
+            // fixing (see ADR-0036): the crate is thoth-mesh-cli, but
+            // that's not the binary anyone actually runs.
+            assert!(
+                !script.contains("thoth-mesh-cli") && !script.contains("thoth__mesh__cli"),
+                "{shell:?} completions registered under the crate name, not the thoth-mesh binary:\n{script}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn run_completions_short_circuits_before_touching_the_network() {
+        // Nothing listens on this address - if run() tried to connect
+        // before handling Completions, this would time out or fail
+        // with a connection error instead of succeeding.
+        let cli = Cli {
+            addr: Some("127.0.0.1:1".to_owned()),
+            config: Some(nonexistent_config_path()),
+            tls_ca: None,
+            tls_cert: None,
+            tls_key: None,
+            command: Command::Completions {
+                shell: clap_complete::Shell::Bash,
+            },
+        };
+        timeout(TEST_TIMEOUT, run(cli))
+            .await
+            .expect("run() should handle Completions before ever touching the network")
+            .unwrap();
     }
 
     #[tokio::test]

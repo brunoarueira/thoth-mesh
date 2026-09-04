@@ -33,6 +33,18 @@ For a container image or a systemd service, see [Docker](#docker) and
 `--release` flag while iterating, add it back for anything you're
 leaving running for a while.
 
+### Shell completions
+
+`thoth-mesh completions <shell>` prints a tab-completion script for
+`bash`, `zsh`, `fish`, `elvish`, or `powershell` to stdout - install it
+the same way you would for any other CLI (see ADR-0036):
+
+```sh
+thoth-mesh completions bash | sudo tee /etc/bash_completion.d/thoth-mesh
+thoth-mesh completions zsh > "${fpath[1]}/_thoth-mesh"
+thoth-mesh completions fish > ~/.config/fish/completions/thoth-mesh.fish
+```
+
 ## Docker
 
 A multi-stage `Dockerfile` at the repo root builds both binaries into
