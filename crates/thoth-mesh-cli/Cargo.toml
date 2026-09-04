@@ -26,6 +26,7 @@ tokio-util = { version = "0.7.19", features = ["compat"] }
 toml = "1.1.5"
 directories = "6.0.0"
 serde = { version = "1.0.229", features = ["derive"] }
+clap_complete = "4.6.9"
 
 [dev-dependencies]
 thoth-mesh-node = { path = "../thoth-mesh-node", version = "0.1.0" }
