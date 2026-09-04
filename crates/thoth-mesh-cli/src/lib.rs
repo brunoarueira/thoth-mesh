@@ -1,9 +1,13 @@
 //! `thoth-mesh`: command-line client for publishing, subscribing, and
 //! administering a thoth-mesh node.
 //!
-//! v1 is intentionally minimal (see issue #13): no config file, no
-//! output formatting options. Admin commands are deferred until the
-//! node actually has an admin protocol to talk to.
+//! v1 is intentionally minimal (see issue #13): no output formatting
+//! options. Admin commands are deferred until the node actually has
+//! an admin protocol to talk to. Connection options (`--addr`,
+//! `--tls-*`) can be set once via a config file instead of repeated
+//! flags - see ADR-0034.
+
+mod config;
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -21,9 +25,17 @@ pub use thoth_mesh_core::DEFAULT_ADDR;
 #[derive(Parser, Debug)]
 #[command(version, about)]
 pub struct Cli {
-    /// Node address to connect to.
-    #[arg(long, global = true, default_value = DEFAULT_ADDR)]
-    pub addr: String,
+    /// Node address to connect to. Falls back to the config file's
+    /// `addr` (see --config), then to the built-in default, if not
+    /// given. See ADR-0034.
+    #[arg(long, global = true)]
+    pub addr: Option<String>,
+
+    /// Config file to read connection defaults from, in place of the
+    /// conventional per-OS location (`~/.config/thoth-mesh/config.toml`
+    /// on Linux). See ADR-0034.
+    #[arg(long, global = true)]
+    pub config: Option<PathBuf>,
 
     /// CA certificate (PEM) to trust for verifying the node's TLS
     /// certificate. Enables TLS for this connection - without it, the
@@ -86,10 +98,13 @@ pub async fn run(cli: Cli) -> std::io::Result<()> {
         }
     }
 
-    let connector = build_connector(&cli)?;
-    let tcp = TcpStream::connect(&cli.addr).await?;
+    let config = config::load(cli.config.as_deref())?;
+    let conn_opts = ConnectionOptions::merge(&cli, config)?;
+
+    let connector = build_connector(&conn_opts)?;
+    let tcp = TcpStream::connect(&conn_opts.addr).await?;
     let stream = match &connector {
-        Some(connector) => MaybeTlsStream::connect(connector, tcp, &cli.addr)
+        Some(connector) => MaybeTlsStream::connect(connector, tcp, &conn_opts.addr)
             .await
             .map_err(std::io::Error::other)?,
         None => MaybeTlsStream::Plain(tcp),
@@ -248,20 +263,63 @@ async fn subscribe_all(
     Ok(backlog)
 }
 
-/// Builds this connection's TLS connector from `cli`'s `--tls-*`
-/// flags, if `--tls-ca` was given - `None` (plaintext, as before)
-/// otherwise. `--tls-cert`/`--tls-key`, if also given, are presented
-/// as this client's own identity; clap's `requires` already enforces
-/// they're both-or-neither. See ADR-0016.
-fn build_connector(cli: &Cli) -> std::io::Result<Option<TlsConnector>> {
-    let Some(ca_path) = &cli.tls_ca else {
+/// The connection settings `run()` actually dials with, after merging
+/// `Cli`'s flags with the config file (`--config`/ADR-0034) - CLI flag
+/// takes precedence, then the config file, then `DEFAULT_ADDR` for
+/// `addr` alone (the TLS fields have no built-in default: no
+/// `--tls-ca`/`tls_ca` from either source means a plaintext
+/// connection, as before this ADR).
+#[derive(Debug)]
+struct ConnectionOptions {
+    addr: String,
+    tls_ca: Option<PathBuf>,
+    tls_cert: Option<PathBuf>,
+    tls_key: Option<PathBuf>,
+}
+
+impl ConnectionOptions {
+    /// Merges `cli`'s flags over `config`'s fields. clap's `requires`
+    /// already enforces `--tls-cert`/`--tls-key` are both-or-neither
+    /// for a pure-CLI invocation, but can't see across a CLI flag
+    /// paired with the other half from the config file - so that same
+    /// constraint is re-checked here, on the merged, effective values.
+    fn merge(cli: &Cli, config: config::Config) -> std::io::Result<Self> {
+        let tls_cert = cli.tls_cert.clone().or(config.tls_cert);
+        let tls_key = cli.tls_key.clone().or(config.tls_key);
+        if tls_cert.is_some() != tls_key.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "--tls-cert and --tls-key must be given together, whether from flags or the config file (see --config)",
+            ));
+        }
+        Ok(Self {
+            addr: cli
+                .addr
+                .clone()
+                .or(config.addr)
+                .unwrap_or_else(|| DEFAULT_ADDR.to_owned()),
+            tls_ca: cli.tls_ca.clone().or(config.tls_ca),
+            tls_cert,
+            tls_key,
+        })
+    }
+}
+
+/// Builds this connection's TLS connector from `opts`'s `--tls-*`
+/// fields, if `tls_ca` was given (from a flag or the config file) -
+/// `None` (plaintext, as before) otherwise. `tls_cert`/`tls_key`, if
+/// also given, are presented as this client's own identity;
+/// `ConnectionOptions::merge` already enforces they're
+/// both-or-neither. See ADR-0016.
+fn build_connector(opts: &ConnectionOptions) -> std::io::Result<Option<TlsConnector>> {
+    let Some(ca_path) = &opts.tls_ca else {
         return Ok(None);
     };
     let to_io =
         |err: thoth_mesh_tls::TlsError| std::io::Error::new(std::io::ErrorKind::InvalidInput, err);
 
     let ca = load_certs(ca_path).map_err(to_io)?;
-    let identity = match (&cli.tls_cert, &cli.tls_key) {
+    let identity = match (&opts.tls_cert, &opts.tls_key) {
         (Some(cert_path), Some(key_path)) => Some((
             load_certs(cert_path).map_err(to_io)?,
             load_private_key(key_path).map_err(to_io)?,
@@ -330,6 +388,15 @@ mod tests {
         MaybeTlsStream::Plain(tcp).compat()
     }
 
+    /// A `--config` path guaranteed to not exist, so tests that don't
+    /// care about the config file get an empty one deterministically -
+    /// not whatever happens to be at the real conventional location on
+    /// the machine running the test. See config::load's own tests for
+    /// the loading/merging logic itself.
+    fn nonexistent_config_path() -> PathBuf {
+        PathBuf::from("/nonexistent/thoth-mesh-cli-test/config.toml")
+    }
+
     #[tokio::test]
     async fn run_publish_delivers_to_a_real_subscriber() {
         let addr = spawn_test_node().await;
@@ -346,7 +413,8 @@ mod tests {
 
         // The CLI's own public entry point, run against the same node.
         let cli = Cli {
-            addr: addr.to_string(),
+            addr: Some(addr.to_string()),
+            config: Some(nonexistent_config_path()),
             tls_ca: None,
             tls_cert: None,
             tls_key: None,
@@ -425,7 +493,8 @@ mod tests {
         // before validating its argument, this would time out or fail
         // with a connection error instead of InvalidInput.
         let cli = Cli {
-            addr: "127.0.0.1:1".to_owned(),
+            addr: Some("127.0.0.1:1".to_owned()),
+            config: Some(nonexistent_config_path()),
             tls_ca: None,
             tls_cert: None,
             tls_key: None,
@@ -694,5 +763,125 @@ mod tests {
         .expect("timed out waiting for the rejection")
         .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    fn publish_cli(addr: Option<String>, config: Option<PathBuf>) -> Cli {
+        Cli {
+            addr,
+            config,
+            tls_ca: None,
+            tls_cert: None,
+            tls_key: None,
+            command: Command::Publish {
+                topic: "weather.updates".into(),
+                payload: "sunny".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn connection_options_merge_prefers_cli_over_config_over_default_addr() {
+        let cli = publish_cli(None, None);
+        let opts = ConnectionOptions::merge(&cli, config::Config::default()).unwrap();
+        assert_eq!(opts.addr, DEFAULT_ADDR);
+
+        let from_config = config::Config {
+            addr: Some("127.0.0.2:1".to_owned()),
+            ..Default::default()
+        };
+        let opts = ConnectionOptions::merge(&cli, from_config).unwrap();
+        assert_eq!(opts.addr, "127.0.0.2:1");
+
+        let cli_with_addr = publish_cli(Some("127.0.0.3:1".to_owned()), None);
+        let from_config = config::Config {
+            addr: Some("127.0.0.2:1".to_owned()),
+            ..Default::default()
+        };
+        let opts = ConnectionOptions::merge(&cli_with_addr, from_config).unwrap();
+        assert_eq!(
+            opts.addr, "127.0.0.3:1",
+            "the CLI flag should win over the config file"
+        );
+    }
+
+    #[test]
+    fn connection_options_merge_accepts_a_tls_identity_split_across_cli_and_config() {
+        // --tls-cert on the CLI, tls_key only in the config file -
+        // clap's own `requires` can't see across sources to allow
+        // this, so ConnectionOptions::merge has to.
+        let mut cli = publish_cli(None, None);
+        cli.tls_cert = Some(PathBuf::from("client.pem"));
+        let config = config::Config {
+            tls_key: Some(PathBuf::from("client.key")),
+            ..Default::default()
+        };
+        let opts = ConnectionOptions::merge(&cli, config).unwrap();
+        assert_eq!(opts.tls_cert, Some(PathBuf::from("client.pem")));
+        assert_eq!(opts.tls_key, Some(PathBuf::from("client.key")));
+    }
+
+    #[test]
+    fn connection_options_merge_rejects_a_tls_cert_with_no_key_from_either_source() {
+        // tls_cert set (from the CLI here; the config file would be
+        // the same), but tls_key missing from both - unlike the split
+        // above, there's no key to pair it with at all.
+        let mut cli = publish_cli(None, None);
+        cli.tls_cert = Some(PathBuf::from("client.pem"));
+        let err = ConnectionOptions::merge(&cli, config::Config::default()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[tokio::test]
+    async fn run_falls_back_to_the_config_files_addr_when_no_cli_flag_is_given() {
+        let addr = spawn_test_node().await;
+
+        let mut subscriber = connect(addr).await;
+        subscribe(
+            &mut subscriber,
+            PeerId::new(),
+            "weather.updates".parse().unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let dir = std::env::temp_dir().join(format!("thoth-mesh-cli-test-{:?}", PeerId::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.toml");
+        std::fs::write(&config_path, format!("addr = \"{addr}\"\n")).unwrap();
+
+        run(publish_cli(None, Some(config_path))).await.unwrap();
+
+        let delivered = timeout(TEST_TIMEOUT, recv(&mut subscriber))
+            .await
+            .expect("timed out waiting for the publish")
+            .unwrap();
+        assert_eq!(
+            delivered.kind,
+            MessageKind::Publish {
+                topic: "weather.updates".parse().unwrap(),
+                payload: b"sunny".to_vec(),
+            }
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_prefers_the_cli_addr_flag_over_the_config_files() {
+        let addr = spawn_test_node().await;
+
+        let dir =
+            std::env::temp_dir().join(format!("thoth-mesh-cli-test-override-{:?}", PeerId::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.toml");
+        // A bogus address - if run() used this instead of the --addr
+        // flag below, connecting would fail (nothing listens there).
+        std::fs::write(&config_path, "addr = \"127.0.0.1:1\"\n").unwrap();
+
+        run(publish_cli(Some(addr.to_string()), Some(config_path)))
+            .await
+            .unwrap();
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
