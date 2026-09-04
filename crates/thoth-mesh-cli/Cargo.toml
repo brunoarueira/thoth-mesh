@@ -23,6 +23,9 @@ thoth-mesh-tls = { path = "../thoth-mesh-tls", version = "0.1.0" }
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "signal"] }
 tokio-util = { version = "0.7.19", features = ["compat"] }
+toml = "1.1.5"
+directories = "6.0.0"
+serde = { version = "1.0.229", features = ["derive"] }
 
 [dev-dependencies]
 thoth-mesh-node = { path = "../thoth-mesh-node", version = "0.1.0" }

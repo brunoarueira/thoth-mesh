@@ -152,6 +152,22 @@ yet to send binary payloads or read one from stdin (see
 Every node and CLI invocation picks a fresh random `PeerId` on
 startup — there's no persistent identity across restarts.
 
+`--addr` and the `--tls-*` flags don't have to be repeated on every
+invocation: a TOML config file at the conventional per-OS location
+(`~/.config/thoth-mesh/config.toml` on Linux) supplies defaults for
+them, overridden by whichever of these are actually given as flags
+(see ADR-0034):
+
+```toml
+addr = "127.0.0.1:49501"
+tls_ca = "/path/to/ca-cert.pem"
+```
+
+Pass `--config <path>` to use a different file instead of the
+conventional location - handy for more than one saved profile. A
+config file is entirely optional either way: nothing changes for an
+invocation that doesn't have one.
+
 ## Multi-node / federation quickstart
 
 Start a second node, telling it about the first via `--peer`. Each
@@ -734,10 +750,6 @@ Worth knowing before running this anywhere that matters:
   on recent history, but only within a bounded in-memory buffer that's
   gone the moment a node restarts — there's still no durable,
   on-disk store. See [docs/ROADMAP.md](ROADMAP.md) Phase 8.
-- **No config file.** Every flag is set on the command line each
-  time; there's no `thoth-mesh.toml` or similar yet. See
-  [docs/ROADMAP.md](ROADMAP.md) Phase 10.
-
 None of these are hidden defaults — they're the honest current state
 of a project still in early phases. See [docs/ROADMAP.md](ROADMAP.md)
 for what's planned next.
