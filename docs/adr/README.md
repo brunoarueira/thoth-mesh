@@ -40,6 +40,7 @@ thoth-mesh, using the format described in
 | [0032](0032-git-tags-and-github-releases.md) | Git tags and GitHub Releases for workspace version bumps |
 | [0033](0033-cli-subscribe-to-multiple-topics.md) | `thoth-mesh-cli subscribe` accepts more than one filter |
 | [0034](0034-cli-config-file.md) | `thoth-mesh-cli` config file for connection options |
+| [0035](0035-cli-payload-fidelity.md) | `thoth-mesh-cli` payload input/output fidelity |
 
 To add a new one, copy the format of an existing ADR, number it
 sequentially, and set its status to `Accepted` once the decision is

@@ -145,9 +145,21 @@ a single connection - each printed line names the concrete topic it
 arrived on, so it's clear which filter matched (see ADR-0033).
 `publish` sends one payload and exits — there's no reply or delivery
 confirmation (see [`PROTOCOL.md`](../PROTOCOL.md#delivery-semantics)).
-The payload is taken as UTF-8 text on the command line; there's no way
-yet to send binary payloads or read one from stdin (see
-[docs/ROADMAP.md](ROADMAP.md) Phase 10).
+The payload is UTF-8 text on the command line by default, or pass `-`
+to read it as raw bytes from stdin instead - the way to send a binary
+payload, or one too large for a CLI argument:
+
+```sh
+cat image.png | thoth-mesh publish images.new -
+```
+
+`subscribe --output raw` is the matching binary-safe read side: every
+delivered payload's exact bytes go to stdout, with no topic label or
+separator between messages, so it's safe to redirect straight to a
+file. The usual `Subscribed to ...` banner and a per-message `[topic]
+N bytes` note move to stderr in this mode, so they stay visible on the
+terminal without corrupting the captured file (`--output text`, the
+default, is unchanged - see ADR-0035).
 
 Every node and CLI invocation picks a fresh random `PeerId` on
 startup — there's no persistent identity across restarts.
