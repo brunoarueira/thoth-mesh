@@ -452,3 +452,91 @@ async fn topic_acl_distinguishes_principals_by_certificate_fingerprint() {
         other => panic!("expected an Error, got {other:?}"),
     }
 }
+
+/// ADR-0038: a node with its own certificate derives `node_id` from
+/// it, rather than a random `PeerId::new()`.
+#[tokio::test]
+async fn spawn_with_tls_derives_node_id_from_its_own_certificate() {
+    let ca = TestCa::new();
+    let identity = ca.issue();
+    let expected_id = thoth_mesh_core::PeerId::from_fingerprint(fingerprint_of(&identity));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let node = thoth_mesh_node::spawn_with_tls(
+        listener,
+        Vec::new(),
+        NodeOptions {
+            tls: Some(identity),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(node.id, expected_id);
+}
+
+/// ADR-0038: unlike a random `PeerId::new()`, the derived identity is
+/// the same every time the same certificate is used - the point of
+/// deriving it at all (stable across a real restart, which reloads
+/// the same cert/key files from disk).
+#[tokio::test]
+async fn spawn_with_tls_node_id_is_stable_across_a_restart_with_the_same_certificate() {
+    let ca = TestCa::new();
+    let identity = ca.issue();
+
+    let listener_1 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let node_1 = thoth_mesh_node::spawn_with_tls(
+        listener_1,
+        Vec::new(),
+        NodeOptions {
+            tls: Some(identity.clone()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let listener_2 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let node_2 = thoth_mesh_node::spawn_with_tls(
+        listener_2,
+        Vec::new(),
+        NodeOptions {
+            tls: Some(identity),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(node_1.id, node_2.id);
+}
+
+/// ADR-0038: two nodes with two different certificates get two
+/// different derived identities - not, say, some fixed placeholder
+/// that'd make every TLS-enabled node collide.
+#[tokio::test]
+async fn spawn_with_tls_gives_distinct_certificates_distinct_node_ids() {
+    let ca = TestCa::new();
+
+    let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let node_a = thoth_mesh_node::spawn_with_tls(
+        listener_a,
+        Vec::new(),
+        NodeOptions {
+            tls: Some(ca.issue()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let listener_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let node_b = thoth_mesh_node::spawn_with_tls(
+        listener_b,
+        Vec::new(),
+        NodeOptions {
+            tls: Some(ca.issue()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    assert_ne!(node_a.id, node_b.id);
+}

@@ -174,7 +174,11 @@ terminal without corrupting the captured file (`--output text`, the
 default, is unchanged - see ADR-0035).
 
 Every node and CLI invocation picks a fresh random `PeerId` on
-startup — there's no persistent identity across restarts.
+startup, with one exception: given `--tls-cert`/`--tls-key`, a node or
+CLI invocation derives its `PeerId` from that certificate's SHA-256
+fingerprint instead - stable across restarts as long as the
+certificate is, unlike the random default (see ADR-0038). Without a
+certificate, there's still no persistent identity across restarts.
 
 `--addr` and the `--tls-*` flags don't have to be repeated on every
 invocation: a TOML config file at the conventional per-OS location
@@ -783,14 +787,18 @@ no repetition or statistical averaging.
 
 Worth knowing before running this anywhere that matters:
 
-- **`sender` is still unverified.** TLS ([above](#tls)), a
-  [peer allowlist](#peer-allowlist), and
-  [per-topic client authorization](#per-topic-client-authorization)
-  are all available but opt-in, and even with all three on, any
-  connection can still claim any `PeerId` in an envelope's `sender`
-  field — nothing ties it to the connection's TLS identity. Without
-  TLS, every connection is plaintext TCP; don't expose a node's port
-  beyond a trusted network either way.
+- **A claimed `sender` still isn't checked against anything.** A node
+  or CLI invocation with its own `--tls-cert` now derives its `PeerId`
+  from that certificate (see [above](#single-node-quickstart), ADR-0038) rather
+  than self-reporting a random one - but nothing on the receiving end
+  compares a `Hello`/envelope's claimed `sender` against the
+  fingerprint actually authenticating that connection yet, so a
+  differently-identified connection can still claim someone else's
+  `PeerId`. TLS ([above](#tls)), a [peer allowlist](#peer-allowlist),
+  and [per-topic client authorization](#per-topic-client-authorization)
+  are all available but opt-in regardless. Without TLS, every
+  connection is plaintext TCP; don't expose a node's port beyond a
+  trusted network either way.
 - **The metrics endpoint's authentication, when on, is a single shared
   secret.** `--metrics-token-file` (see
   [Metrics authentication](#metrics-authentication)) is opt-in and

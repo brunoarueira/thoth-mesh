@@ -111,10 +111,21 @@ prevention and de-duplication key on — see
 ### `PeerId`
 
 Also a UUID, encoded the same way (16 raw bytes). Identifies a client
-or a node. **Carries no cryptographic guarantee today** — nothing
-about the protocol proves a `sender` value is who it claims to be; any
-connection can claim any `PeerId`. A random one is generated fresh per
-CLI invocation and per node startup.
+or a node. A random (version 7) one is generated fresh per CLI
+invocation and per node startup by default - but given a TLS
+certificate of its own (`--tls-cert`/`--tls-key`), a node or CLI
+invocation instead derives one deterministically from that
+certificate's SHA-256 fingerprint (its first 16 bytes, packed as a
+version 8/"custom" UUID per RFC 9562 - visibly distinct from a
+version-7 self-assigned one), stable across restarts as long as the
+certificate is (see [ADR-0038](docs/adr/0038-peerid-from-tls-fingerprint.md)).
+
+**Still carries no cryptographic guarantee against a *false* claim
+today**, either way: nothing on the receiving end compares a `Hello`/
+envelope's claimed `sender` against the fingerprint actually
+authenticating that connection, so a differently-identified connection
+can still claim someone else's `PeerId`. That check, and what a
+mismatch does, is deliberately left to a follow-up (see the ADR).
 
 ### `Topic`
 

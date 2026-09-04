@@ -896,6 +896,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "directories",
+ "rcgen",
  "serde",
  "thoth-mesh-core",
  "thoth-mesh-node",
