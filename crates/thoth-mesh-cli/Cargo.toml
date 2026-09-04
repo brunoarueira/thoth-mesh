@@ -18,8 +18,8 @@ name = "thoth-mesh"
 path = "src/main.rs"
 
 [dependencies]
-thoth-mesh-core = { path = "../thoth-mesh-core", version = "0.1.0", features = ["async"] }
-thoth-mesh-tls = { path = "../thoth-mesh-tls", version = "0.1.0" }
+thoth-mesh-core = { path = "../thoth-mesh-core", version = "0.2.0", features = ["async"] }
+thoth-mesh-tls = { path = "../thoth-mesh-tls", version = "0.2.0" }
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "io-std", "macros", "signal"] }
 tokio-util = { version = "0.7.19", features = ["compat"] }
@@ -29,5 +29,5 @@ serde = { version = "1.0.229", features = ["derive"] }
 clap_complete = "4.6.9"
 
 [dev-dependencies]
-thoth-mesh-node = { path = "../thoth-mesh-node", version = "0.1.0" }
+thoth-mesh-node = { path = "../thoth-mesh-node", version = "0.2.0" }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "signal", "time"] }
