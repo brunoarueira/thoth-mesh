@@ -111,10 +111,14 @@ pub async fn run_with_tls(
     let (mut shared, discovered_rx) = Shared::new_with_discovery(node_id, my_listen_addr);
     if let Some(tls) = options.tls {
         let allowed_peers = tls.allowed_peers.clone();
-        let (acceptor, connector) = tls.build()?;
+        let (acceptor, connector, own_fingerprint) = tls.build()?;
         shared.tls_acceptor = Some(acceptor);
         shared.tls_connector = Some(connector);
         shared.allowed_peers = allowed_peers.map(Arc::new);
+        // A node with its own certificate has a stable identity to
+        // derive - persistent across restarts as long as the
+        // certificate is, unlike the random one below. See ADR-0038.
+        shared.node_id = PeerId::from_fingerprint(own_fingerprint);
     }
     shared.topic_acl = options.topic_acl.map(Arc::new);
     shared.peer_topic_acl = options.peer_topic_acl.map(Arc::new);
@@ -175,10 +179,14 @@ pub async fn serve_with_tls(
     let (mut shared, discovered_rx) = Shared::new_with_discovery(node_id, my_listen_addr);
     if let Some(tls) = options.tls {
         let allowed_peers = tls.allowed_peers.clone();
-        let (acceptor, connector) = tls.build()?;
+        let (acceptor, connector, own_fingerprint) = tls.build()?;
         shared.tls_acceptor = Some(acceptor);
         shared.tls_connector = Some(connector);
         shared.allowed_peers = allowed_peers.map(Arc::new);
+        // A node with its own certificate has a stable identity to
+        // derive - persistent across restarts as long as the
+        // certificate is, unlike the random one below. See ADR-0038.
+        shared.node_id = PeerId::from_fingerprint(own_fingerprint);
     }
     shared.topic_acl = options.topic_acl.map(Arc::new);
     shared.peer_topic_acl = options.peer_topic_acl.map(Arc::new);
@@ -236,10 +244,14 @@ pub fn spawn_with_tls(
     let (mut shared, discovered_rx) = Shared::new_with_discovery(node_id, my_listen_addr);
     if let Some(tls) = options.tls {
         let allowed_peers = tls.allowed_peers.clone();
-        let (acceptor, connector) = tls.build()?;
+        let (acceptor, connector, own_fingerprint) = tls.build()?;
         shared.tls_acceptor = Some(acceptor);
         shared.tls_connector = Some(connector);
         shared.allowed_peers = allowed_peers.map(Arc::new);
+        // A node with its own certificate has a stable identity to
+        // derive - persistent across restarts as long as the
+        // certificate is, unlike the random one below. See ADR-0038.
+        shared.node_id = PeerId::from_fingerprint(own_fingerprint);
     }
     shared.topic_acl = options.topic_acl.map(Arc::new);
     shared.peer_topic_acl = options.peer_topic_acl.map(Arc::new);
@@ -247,6 +259,12 @@ pub fn spawn_with_tls(
         discovered_rx,
         shared.clone(),
     ));
+    // Re-read rather than reusing the `node_id` local above: the TLS
+    // block may have overridden `shared.node_id` with a
+    // certificate-derived one (ADR-0038), and this `Node` needs to
+    // report the identity actually in effect, not the discarded seed
+    // value `Shared::new_with_discovery` was first built with.
+    let node_id = shared.node_id;
     let membership = shared.membership.clone();
     let discover = shared.discover.clone();
     let peer_dials = peering::spawn_seed_peers(seed_peers, shared.clone());

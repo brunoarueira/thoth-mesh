@@ -18,7 +18,9 @@ use thoth_mesh_core::{
     Envelope, MessageId, MessageKind, MetricsSummary, PeerId, PeerSummary, Topic, TopicFilter,
     async_framing,
 };
-use thoth_mesh_tls::{MaybeTlsStream, TlsConnector, client_config, load_certs, load_private_key};
+use thoth_mesh_tls::{
+    MaybeTlsStream, TlsConnector, client_config, fingerprint, load_certs, load_private_key,
+};
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncReadCompatExt};
@@ -146,7 +148,7 @@ pub async fn run(cli: Cli) -> std::io::Result<()> {
     let config = config::load(cli.config.as_deref())?;
     let conn_opts = ConnectionOptions::merge(&cli, config)?;
 
-    let connector = build_connector(&conn_opts)?;
+    let (connector, own_fingerprint) = build_connector(&conn_opts)?;
     let tcp = TcpStream::connect(&conn_opts.addr).await?;
     let stream = match &connector {
         Some(connector) => MaybeTlsStream::connect(connector, tcp, &conn_opts.addr)
@@ -155,7 +157,12 @@ pub async fn run(cli: Cli) -> std::io::Result<()> {
         None => MaybeTlsStream::Plain(tcp),
     };
     let mut conn = stream.compat();
-    let sender = PeerId::new();
+    // A stable, cryptographic sender when this invocation presented
+    // its own TLS identity; a fresh random one otherwise, unchanged
+    // from before - see ADR-0038.
+    let sender = own_fingerprint
+        .map(PeerId::from_fingerprint)
+        .unwrap_or_else(PeerId::new);
 
     match cli.command {
         Command::Publish { topic, payload } => {
@@ -495,13 +502,18 @@ impl ConnectionOptions {
 
 /// Builds this connection's TLS connector from `opts`'s `--tls-*`
 /// fields, if `tls_ca` was given (from a flag or the config file) -
-/// `None` (plaintext, as before) otherwise. `tls_cert`/`tls_key`, if
-/// also given, are presented as this client's own identity;
-/// `ConnectionOptions::merge` already enforces they're
-/// both-or-neither. See ADR-0016.
-fn build_connector(opts: &ConnectionOptions) -> std::io::Result<Option<TlsConnector>> {
+/// `None` (plaintext, as before) otherwise - plus this client's own
+/// leaf certificate's fingerprint, if `tls_cert`/`tls_key` were also
+/// given to present as its own identity (`ConnectionOptions::merge`
+/// already enforces they're both-or-neither) - what
+/// `PeerId::from_fingerprint` derives this invocation's `sender` from,
+/// when it has an identity to derive one from (ADR-0038). See
+/// ADR-0016.
+fn build_connector(
+    opts: &ConnectionOptions,
+) -> std::io::Result<(Option<TlsConnector>, Option<[u8; 32]>)> {
     let Some(ca_path) = &opts.tls_ca else {
-        return Ok(None);
+        return Ok((None, None));
     };
     let to_io =
         |err: thoth_mesh_tls::TlsError| std::io::Error::new(std::io::ErrorKind::InvalidInput, err);
@@ -514,8 +526,18 @@ fn build_connector(opts: &ConnectionOptions) -> std::io::Result<Option<TlsConnec
         )),
         _ => None,
     };
+    // The leaf cert is conventionally first in the chain a cert file
+    // presents - the same convention thoth-mesh-node's
+    // TlsConfig::build relies on for its own identity (ADR-0038).
+    let own_fingerprint = identity
+        .as_ref()
+        .and_then(|(certs, _)| certs.first())
+        .map(fingerprint);
     let config = client_config(ca, identity).map_err(to_io)?;
-    Ok(Some(TlsConnector::from(std::sync::Arc::new(config))))
+    Ok((
+        Some(TlsConnector::from(std::sync::Arc::new(config))),
+        own_fingerprint,
+    ))
 }
 
 fn parse_topic(s: &str) -> std::io::Result<Topic> {
@@ -583,6 +605,34 @@ mod tests {
     /// the loading/merging logic itself.
     fn nonexistent_config_path() -> PathBuf {
         PathBuf::from("/nonexistent/thoth-mesh-cli-test/config.toml")
+    }
+
+    /// Writes `pem` to a fresh temp file and returns its path - for
+    /// tests that need a real certificate/key file on disk, not just
+    /// a path `ConnectionOptions::merge`-style tests never actually
+    /// read.
+    fn write_temp_pem(label: &str, pem: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "thoth-mesh-cli-test-{}-{label}-{:?}.pem",
+            std::process::id(),
+            PeerId::new()
+        ));
+        std::fs::write(&path, pem).unwrap();
+        path
+    }
+
+    /// A fresh self-signed certificate/key pair, as (cert path, key
+    /// path) - real enough for `build_connector` to load and
+    /// fingerprint, even though nothing in these tests actually
+    /// dials/handshakes with it.
+    fn self_signed_cert() -> (PathBuf, PathBuf) {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let params = rcgen::CertificateParams::new(Vec::new()).unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        (
+            write_temp_pem("cert", &cert.pem()),
+            write_temp_pem("key", &key.serialize_pem()),
+        )
     }
 
     #[tokio::test]
@@ -1158,6 +1208,45 @@ mod tests {
         cli.tls_cert = Some(PathBuf::from("client.pem"));
         let err = ConnectionOptions::merge(&cli, config::Config::default()).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn build_connector_returns_this_clients_own_certificate_fingerprint() {
+        // The CA path doesn't need any real relationship to the leaf
+        // cert here - build_connector only loads and fingerprints it,
+        // it never actually dials/validates a chain.
+        let (cert_path, key_path) = self_signed_cert();
+        let opts = ConnectionOptions {
+            addr: DEFAULT_ADDR.to_owned(),
+            tls_ca: Some(cert_path.clone()),
+            tls_cert: Some(cert_path.clone()),
+            tls_key: Some(key_path),
+        };
+
+        let (connector, own_fingerprint) = build_connector(&opts).unwrap();
+
+        assert!(connector.is_some());
+        let expected = fingerprint(&load_certs(&cert_path).unwrap()[0]);
+        assert_eq!(own_fingerprint, Some(expected));
+    }
+
+    #[test]
+    fn build_connector_returns_no_fingerprint_without_a_client_identity() {
+        // --tls-ca alone (no --tls-cert/--tls-key): this invocation
+        // trusts the node but doesn't identify itself - nothing to
+        // derive a fingerprint from.
+        let (ca_path, _key_path) = self_signed_cert();
+        let opts = ConnectionOptions {
+            addr: DEFAULT_ADDR.to_owned(),
+            tls_ca: Some(ca_path),
+            tls_cert: None,
+            tls_key: None,
+        };
+
+        let (connector, own_fingerprint) = build_connector(&opts).unwrap();
+
+        assert!(connector.is_some());
+        assert_eq!(own_fingerprint, None);
     }
 
     #[tokio::test]

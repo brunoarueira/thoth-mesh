@@ -43,6 +43,7 @@ thoth-mesh, using the format described in
 | [0035](0035-cli-payload-fidelity.md) | `thoth-mesh-cli` payload input/output fidelity |
 | [0036](0036-cli-shell-completions.md) | `thoth-mesh-cli` shell completions |
 | [0037](0037-status-command.md) | `thoth-mesh-cli` status command |
+| [0038](0038-peerid-from-tls-fingerprint.md) | `PeerId` derived from a TLS certificate fingerprint |
 
 To add a new one, copy the format of an existing ADR, number it
 sequentially, and set its status to `Accepted` once the decision is
