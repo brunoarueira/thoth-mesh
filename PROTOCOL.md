@@ -120,12 +120,15 @@ version 8/"custom" UUID per RFC 9562 - visibly distinct from a
 version-7 self-assigned one), stable across restarts as long as the
 certificate is (see [ADR-0038](docs/adr/0038-peerid-from-tls-fingerprint.md)).
 
-**Still carries no cryptographic guarantee against a *false* claim
-today**, either way: nothing on the receiving end compares a `Hello`/
-envelope's claimed `sender` against the fingerprint actually
-authenticating that connection, so a differently-identified connection
-can still claim someone else's `PeerId`. That check, and what a
-mismatch does, is deliberately left to a follow-up (see the ADR).
+A claimed `sender`/`Hello` value that doesn't match the fingerprint
+actually authenticating a connection is silently overridden with the
+one that does, rather than trusted as claimed or rejected outright -
+so an impersonation attempt against a *certificate-bearing* connection
+never succeeds at anything (see
+[ADR-0039](docs/adr/0039-silently-correct-mismatched-peerid.md)). A
+connection presenting no certificate at all still has nothing stronger
+to offer than an unverifiable self-report - not a gap this can close,
+since there's no cryptographic material to check it against.
 
 ### `Topic`
 

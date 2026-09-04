@@ -540,3 +540,124 @@ async fn spawn_with_tls_gives_distinct_certificates_distinct_node_ids() {
 
     assert_ne!(node_a.id, node_b.id);
 }
+
+/// ADR-0039: a client authenticating with its own certificate but
+/// claiming a different `PeerId` in its `Publish` gets silently
+/// corrected to the identity its certificate actually implies -
+/// including in what a subscriber actually receives, not just some
+/// node-internal bookkeeping value.
+#[tokio::test]
+async fn a_publish_with_a_mismatched_sender_is_corrected_to_the_authenticated_identity() {
+    let ca = TestCa::new();
+    let client_identity = ca.issue();
+    let authenticated_id =
+        thoth_mesh_core::PeerId::from_fingerprint(fingerprint_of(&client_identity));
+    let claimed_id = thoth_mesh_core::PeerId::new();
+    assert_ne!(authenticated_id, claimed_id);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    thoth_mesh_node::spawn_with_tls(
+        listener,
+        Vec::new(),
+        NodeOptions {
+            tls: Some(ca.issue()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let mut subscriber = connect_tls(addr, &client_identity).await;
+    let sub = Envelope::new(
+        thoth_mesh_core::PeerId::new(),
+        MessageKind::Subscribe {
+            filter: topic("weather.updates").into(),
+        },
+    );
+    send(&mut subscriber, &sub).await;
+    recv(&mut subscriber).await; // subscribe ack
+
+    let mut publisher = connect_tls_as(addr, &client_identity, Some(&client_identity)).await;
+    let publish = Envelope::new(
+        claimed_id,
+        MessageKind::Publish {
+            topic: topic("weather.updates"),
+            payload: b"sunny".to_vec(),
+        },
+    );
+    send(&mut publisher, &publish).await;
+
+    let delivered = recv(&mut subscriber).await;
+    assert_eq!(delivered.sender, authenticated_id);
+}
+
+/// ADR-0039, the accept side: a raw connection claiming a `Hello`
+/// sender that doesn't match its own certificate is registered in
+/// membership under the authenticated identity, not the claim.
+#[tokio::test]
+async fn a_hello_with_a_mismatched_sender_is_corrected_before_being_recorded_in_membership() {
+    let ca = TestCa::new();
+    let peer_identity = ca.issue();
+    let authenticated_id =
+        thoth_mesh_core::PeerId::from_fingerprint(fingerprint_of(&peer_identity));
+    let claimed_id = thoth_mesh_core::PeerId::new();
+    assert_ne!(authenticated_id, claimed_id);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let node = thoth_mesh_node::spawn_with_tls(
+        listener,
+        Vec::new(),
+        NodeOptions {
+            tls: Some(ca.issue()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let mut conn = connect_tls_as(addr, &peer_identity, Some(&peer_identity)).await;
+    let hello = Envelope::new(claimed_id, MessageKind::Hello { listen_addr: None });
+    send(&mut conn, &hello).await;
+    recv(&mut conn).await; // the node's own Hello reply
+
+    assert!(node.membership.is_reachable(authenticated_id));
+    assert!(!node.membership.is_reachable(claimed_id));
+}
+
+/// ADR-0039, the dial side: a seed peer whose `Hello` reply claims a
+/// `PeerId` that doesn't match its own certificate is registered
+/// under the authenticated identity instead - the same correction
+/// the accept side applies, via `admit_initial_peer` rather than
+/// `handle_hello`.
+#[tokio::test]
+async fn dial_side_corrects_a_mismatched_seed_peer_hello_to_the_authenticated_identity() {
+    let ca = TestCa::new();
+    let raw_peer_identity = ca.issue();
+    let authenticated_id =
+        thoth_mesh_core::PeerId::from_fingerprint(fingerprint_of(&raw_peer_identity));
+    let claimed_id = thoth_mesh_core::PeerId::new();
+    assert_ne!(authenticated_id, claimed_id);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let raw_peer_addr = listener.local_addr().unwrap();
+
+    let dialer = thoth_mesh_node::spawn_with_tls(
+        TcpListener::bind("127.0.0.1:0").await.unwrap(),
+        vec![raw_peer_addr.to_string()],
+        NodeOptions {
+            tls: Some(ca.issue()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let mut conn = accept_tls(&listener, &raw_peer_identity).await;
+    let their_hello = recv(&mut conn).await;
+    assert!(matches!(their_hello.kind, MessageKind::Hello { .. }));
+
+    let our_hello = Envelope::new(claimed_id, MessageKind::Hello { listen_addr: None });
+    send(&mut conn, &our_hello).await;
+
+    eventually(|| dialer.membership.is_reachable(authenticated_id)).await;
+    assert!(!dialer.membership.is_reachable(claimed_id));
+}

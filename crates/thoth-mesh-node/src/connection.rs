@@ -178,13 +178,20 @@ async fn run_connection(socket: MaybeTlsStream, shared: Shared, initial_peer: Op
                 break;
             }
         };
-        let envelope = match Envelope::from_bytes(&bytes) {
+        let mut envelope = match Envelope::from_bytes(&bytes) {
             Ok(envelope) => envelope,
             Err(err) => {
                 tracing::warn!(%err, "closing connection: malformed envelope");
                 break;
             }
         };
+        // Authenticated once, here, rather than in each handler below
+        // - every message kind that carries a meaningful `sender`
+        // (Hello, Publish, Subscribe, Unsubscribe, StatusRequest) is
+        // covered by this one call, and a Publish's corrected sender
+        // is what actually gets broadcast to subscribers. See
+        // ADR-0039.
+        envelope.sender = ctx.authenticated_sender(envelope.sender);
 
         let keep_going = match &envelope.kind {
             MessageKind::Subscribe { filter } => {
@@ -274,6 +281,30 @@ impl ConnectionContext {
         self.peer_identity.is_some()
     }
 
+    /// The identity `claimed` should actually be treated as: if this
+    /// connection has a known TLS fingerprint (ADR-0038), the
+    /// identity that fingerprint derives - silently overriding
+    /// `claimed` if it disagrees, rather than rejecting the
+    /// connection outright (see ADR-0039). A connection with no
+    /// fingerprint (plaintext, or TLS without a client certificate)
+    /// has nothing to correct against, so `claimed` passes through
+    /// unchanged - the same boundary `Principal::Anonymous` already
+    /// draws for `--topic-acl`.
+    fn authenticated_sender(&self, claimed: PeerId) -> PeerId {
+        let Some(fingerprint) = self.peer_fingerprint else {
+            return claimed;
+        };
+        let authenticated = PeerId::from_fingerprint(fingerprint);
+        if claimed != authenticated {
+            tracing::warn!(
+                ?claimed,
+                ?authenticated,
+                "claimed PeerId does not match this connection's TLS identity - using the authenticated one"
+            );
+        }
+        authenticated
+    }
+
     /// Queues `envelope` for the write task. Returns `false` if the
     /// outgoing channel has already closed (the writer task ended,
     /// e.g. on a write failure) - every call site treats that as a
@@ -297,6 +328,10 @@ impl ConnectionContext {
         listen_addr: Option<String>,
         hello_id: MessageId,
     ) -> bool {
+        // The one identity the per-frame correction in run_connection's
+        // read loop can't reach - this is the dial side's already-known
+        // identity, established before that loop starts. See ADR-0039.
+        let peer_id = self.authenticated_sender(peer_id);
         if !allowlist_permits(&self.allowed_peers, self.peer_fingerprint) {
             tracing::warn!(
                 ?peer_id,
