@@ -237,7 +237,7 @@ summary, without needing `--metrics-addr` enabled at all (see
 ADR-0037):
 
 ```sh
-cargo run -p thoth-mesh-cli -- --addr 127.0.0.1:49500 status
+thoth-mesh --addr 127.0.0.1:49500 status
 ```
 
 ```
