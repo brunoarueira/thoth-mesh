@@ -146,6 +146,30 @@ Prometheus endpoint (ADR-0013) or reading logs.
 - Admin/status commands (e.g. `thoth-mesh status`), depends on Phase 6
   for what "peers" means once topology isn't purely static-config-driven.
 
+## Phase 12 — Verified sender identity
+
+**Goal:** `PeerId` actually means something — bound to the TLS
+identity a connection already authenticates with, closing the gap
+ADR-0005 flagged as deliberate-but-temporary ("expected to be
+replaced by a cryptographic identity ... once federation/trust work
+begins") and OPERATIONS.md's "`sender` is still unverified"
+limitation names directly.
+
+- Bind a connection's `PeerId` to its authenticated TLS certificate
+  fingerprint (the same identity `--allow-peer`/`--topic-acl` already
+  use), rather than trusting whatever it self-reports in `Hello`/an
+  envelope's `sender`. Inherently TLS-and-client-cert-only — a
+  plaintext or certificate-less connection has no cryptographic
+  identity to bind to, the same boundary `Principal::Anonymous`
+  already draws for topic ACLs.
+- Decide what a mismatched claim does: reject the connection outright
+  (like an unlisted peer today, ADR-0017) or silently correct it to
+  the authenticated identity.
+- Once a peer's identity is trustworthy, close the corresponding gap
+  in loop-prevention/membership/interest-dedup (ADR-0011), which
+  currently keys off `Hello`'s self-reported `PeerId` alone with
+  nothing stopping two peers from claiming the same one.
+
 ## Standalone work (not tied to a phase)
 
 Some work is useful on its own regardless of which feature phase lands
