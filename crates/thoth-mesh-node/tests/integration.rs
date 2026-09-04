@@ -870,3 +870,91 @@ async fn malformed_frame_closes_connection() {
         "expected the server to close the connection, got {result:?}"
     );
 }
+
+#[tokio::test]
+async fn status_request_reports_this_nodes_id_and_no_peers_when_alone() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let node = thoth_mesh_node::spawn(listener, Vec::new());
+
+    let mut client = connect(addr).await;
+    let request = Envelope::new(PeerId::new(), MessageKind::StatusRequest);
+    send(&mut client, &request).await;
+
+    let reply = recv(&mut client).await;
+    match reply.kind {
+        MessageKind::StatusReply {
+            in_reply_to,
+            node_id,
+            peers,
+            ..
+        } => {
+            assert_eq!(in_reply_to, request.id);
+            assert_eq!(node_id, node.id);
+            assert!(peers.is_empty());
+        }
+        other => panic!("expected a StatusReply, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn status_request_reports_a_connected_peer() {
+    let listener_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_b = listener_b.local_addr().unwrap();
+    let node_b = thoth_mesh_node::spawn(listener_b, Vec::new());
+
+    let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_a = listener_a.local_addr().unwrap();
+    let node_a = thoth_mesh_node::spawn(listener_a, vec![addr_b.to_string()]);
+
+    eventually(|| node_a.membership.is_reachable(node_b.id)).await;
+
+    let mut client = connect(addr_a).await;
+    let request = Envelope::new(PeerId::new(), MessageKind::StatusRequest);
+    send(&mut client, &request).await;
+
+    let reply = recv(&mut client).await;
+    match reply.kind {
+        MessageKind::StatusReply { node_id, peers, .. } => {
+            assert_eq!(node_id, node_a.id);
+            assert_eq!(peers.len(), 1);
+            assert_eq!(peers[0].peer_id, node_b.id);
+            assert_eq!(
+                peers[0].listen_addr.as_deref(),
+                Some(addr_b.to_string()).as_deref()
+            );
+        }
+        other => panic!("expected a StatusReply, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn status_request_reports_a_metrics_summary_reflecting_activity() {
+    let addr = spawn_test_node().await;
+    let mut client = connect(addr).await;
+
+    let publish = Envelope::new(
+        PeerId::new(),
+        MessageKind::Publish {
+            topic: topic("weather.updates"),
+            payload: b"sunny".to_vec(),
+        },
+    );
+    send(&mut client, &publish).await;
+
+    // Same connection, right after publishing - the node's dispatch
+    // loop processes frames strictly in order (handle_publish awaits
+    // the broker before the next frame is read), so the counter this
+    // bumps is guaranteed visible by the time this status request is
+    // handled, with no polling needed.
+    let request = Envelope::new(PeerId::new(), MessageKind::StatusRequest);
+    send(&mut client, &request).await;
+
+    let reply = recv(&mut client).await;
+    match reply.kind {
+        MessageKind::StatusReply { metrics, .. } => {
+            assert!(metrics.messages_published >= 1);
+        }
+        other => panic!("expected a StatusReply, got {other:?}"),
+    }
+}

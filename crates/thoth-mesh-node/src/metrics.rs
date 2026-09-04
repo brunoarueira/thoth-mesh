@@ -109,6 +109,34 @@ impl Metrics {
     }
 }
 
+/// A snapshot of every metric this node tracks, as typed fields - the
+/// `metrics` field of a `MessageKind::StatusReply` (ADR-0037), and
+/// what [`render_prometheus`] itself formats as text. One function
+/// computing every number, rather than each renderer reading every
+/// counter itself, is what keeps the two presentations from silently
+/// drifting apart as counters are added later.
+pub fn summary(
+    membership: &Membership,
+    broker: &Broker,
+    discover: &PeerDirectory,
+    metrics: &Metrics,
+) -> thoth_mesh_core::MetricsSummary {
+    thoth_mesh_core::MetricsSummary {
+        peers_connected: membership.connected_count() as u64,
+        messages_published: broker.messages_published(),
+        forwarder_lag_total: metrics.forwarder_lag_total(),
+        topic_acl_rejections_total: metrics.topic_acl_rejections_total(),
+        metrics_auth_rejections_total: metrics.metrics_auth_rejections_total(),
+        peer_topic_acl_rejections_total: metrics.peer_topic_acl_rejections_total(),
+        replayed_messages_total: metrics.replayed_messages_total(),
+        lag_recovered_total: metrics.lag_recovered_total(),
+        topic_evictions_total: broker.topic_evictions(),
+        pattern_evictions_total: broker.pattern_evictions(),
+        membership_evictions_total: membership.disconnected_evictions(),
+        peer_directory_evictions_total: discover.evictions(),
+    }
+}
+
 /// Renders the current node metrics as Prometheus text exposition
 /// format - a `# TYPE` line plus a `name value` line per metric.
 pub fn render_prometheus(
@@ -117,6 +145,7 @@ pub fn render_prometheus(
     discover: &PeerDirectory,
     metrics: &Metrics,
 ) -> String {
+    let s = summary(membership, broker, discover, metrics);
     format!(
         "# TYPE thothmesh_peers_connected gauge\n\
          thothmesh_peers_connected {}\n\
@@ -142,18 +171,18 @@ pub fn render_prometheus(
          thothmesh_membership_evictions_total {}\n\
          # TYPE thothmesh_peer_directory_evictions_total counter\n\
          thothmesh_peer_directory_evictions_total {}\n",
-        membership.connected_count(),
-        broker.messages_published(),
-        metrics.forwarder_lag_total(),
-        metrics.topic_acl_rejections_total(),
-        metrics.metrics_auth_rejections_total(),
-        metrics.peer_topic_acl_rejections_total(),
-        metrics.replayed_messages_total(),
-        metrics.lag_recovered_total(),
-        broker.topic_evictions(),
-        broker.pattern_evictions(),
-        membership.disconnected_evictions(),
-        discover.evictions(),
+        s.peers_connected,
+        s.messages_published,
+        s.forwarder_lag_total,
+        s.topic_acl_rejections_total,
+        s.metrics_auth_rejections_total,
+        s.peer_topic_acl_rejections_total,
+        s.replayed_messages_total,
+        s.lag_recovered_total,
+        s.topic_evictions_total,
+        s.pattern_evictions_total,
+        s.membership_evictions_total,
+        s.peer_directory_evictions_total,
     )
 }
 
@@ -253,5 +282,38 @@ mod tests {
         assert!(rendered.contains("thothmesh_peer_directory_evictions_total 0"));
         assert!(rendered.contains("thothmesh_replayed_messages_total 2"));
         assert!(rendered.contains("thothmesh_lag_recovered_total 5"));
+    }
+
+    #[test]
+    fn summary_reports_the_same_numbers_render_prometheus_does() {
+        // render_prometheus is now just summary()'s fields formatted
+        // as text - same activity, same numbers, both ways.
+        let membership = Membership::new();
+        membership.mark_connected(thoth_mesh_core::PeerId::new(), None);
+        let broker = Broker::new();
+        let discover = PeerDirectory::new();
+        let metrics = Metrics::new();
+        metrics.record_forwarder_lag(7);
+        metrics.record_topic_acl_rejection();
+
+        let s = summary(&membership, &broker, &discover, &metrics);
+
+        assert_eq!(s.peers_connected, 1);
+        assert_eq!(s.messages_published, 0);
+        assert_eq!(s.forwarder_lag_total, 7);
+        assert_eq!(s.topic_acl_rejections_total, 1);
+        assert_eq!(s.metrics_auth_rejections_total, 0);
+        assert_eq!(s.peer_topic_acl_rejections_total, 0);
+        assert_eq!(s.replayed_messages_total, 0);
+        assert_eq!(s.lag_recovered_total, 0);
+        assert_eq!(s.topic_evictions_total, 0);
+        assert_eq!(s.pattern_evictions_total, 0);
+        assert_eq!(s.membership_evictions_total, 0);
+        assert_eq!(s.peer_directory_evictions_total, 0);
+
+        let rendered = render_prometheus(&membership, &broker, &discover, &metrics);
+        assert!(rendered.contains("thothmesh_peers_connected 1"));
+        assert!(rendered.contains("thothmesh_forwarder_lag_total 7"));
+        assert!(rendered.contains("thothmesh_topic_acl_rejections_total 1"));
     }
 }

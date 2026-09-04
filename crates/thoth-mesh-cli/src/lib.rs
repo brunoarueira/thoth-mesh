@@ -2,10 +2,10 @@
 //! administering a thoth-mesh node.
 //!
 //! v1 is intentionally minimal (see issue #13): no output formatting
-//! options. Admin commands are deferred until the node actually has
-//! an admin protocol to talk to. Connection options (`--addr`,
-//! `--tls-*`) can be set once via a config file instead of repeated
-//! flags - see ADR-0034.
+//! options beyond `subscribe --output` (ADR-0035). Connection options
+//! (`--addr`, `--tls-*`) can be set once via a config file instead of
+//! repeated flags - see ADR-0034. `status` is the first admin
+//! command - see ADR-0037.
 
 mod config;
 
@@ -15,7 +15,8 @@ use std::path::PathBuf;
 
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use thoth_mesh_core::{
-    Envelope, MessageId, MessageKind, PeerId, Topic, TopicFilter, async_framing,
+    Envelope, MessageId, MessageKind, MetricsSummary, PeerId, PeerSummary, Topic, TopicFilter,
+    async_framing,
 };
 use thoth_mesh_tls::{MaybeTlsStream, TlsConnector, client_config, load_certs, load_private_key};
 use tokio::io::AsyncReadExt;
@@ -98,6 +99,9 @@ pub enum Command {
     /// Print a tab-completion script for `shell` to stdout, then exit.
     /// See ADR-0036 for how to install the result.
     Completions { shell: clap_complete::Shell },
+    /// Print the node's connected peers and a metrics summary, then
+    /// exit. See ADR-0037.
+    Status,
 }
 
 /// `subscribe --output <MODE>`. See ADR-0035.
@@ -135,6 +139,7 @@ pub async fn run(cli: Cli) -> std::io::Result<()> {
                 parse_filter(filter)?;
             }
         }
+        Command::Status => {}
         Command::Completions { .. } => unreachable!("returned above"),
     }
 
@@ -166,6 +171,7 @@ pub async fn run(cli: Cli) -> std::io::Result<()> {
                 .collect::<std::io::Result<Vec<_>>>()?;
             subscribe_and_print(&mut conn, sender, filters, output).await
         }
+        Command::Status => status_and_print(&mut conn, sender).await,
         Command::Completions { .. } => unreachable!("returned above"),
     }
 }
@@ -344,6 +350,105 @@ async fn subscribe_all(
         }
     }
     Ok(backlog)
+}
+
+/// A `StatusReply`'s payload, minus `in_reply_to` - already consumed
+/// by [`request_status`] to find the reply that's actually ours.
+#[derive(Debug, Clone, PartialEq)]
+struct StatusReply {
+    node_id: PeerId,
+    listen_addr: Option<String>,
+    peers: Vec<PeerSummary>,
+    metrics: MetricsSummary,
+}
+
+/// Sends a `StatusRequest` and waits for the matching `StatusReply`,
+/// skipping anything else that arrives first (e.g. a `Publish`, if
+/// this connection happens to have a live subscription too) - the
+/// same "wait for the reply that's actually ours" pattern
+/// [`subscribe`] uses for an `Ack`. Kept separate from printing (see
+/// [`status_and_print`]) so it's testable without capturing stdout,
+/// same reasoning as [`subscribe_all`]. See ADR-0037.
+async fn request_status(
+    conn: &mut Compat<MaybeTlsStream>,
+    sender: PeerId,
+) -> std::io::Result<StatusReply> {
+    let envelope = Envelope::new(sender, MessageKind::StatusRequest);
+    send(conn, &envelope).await?;
+    loop {
+        let received = recv(conn).await?;
+        if let MessageKind::StatusReply {
+            in_reply_to,
+            node_id,
+            listen_addr,
+            peers,
+            metrics,
+        } = received.kind
+            && in_reply_to == envelope.id
+        {
+            return Ok(StatusReply {
+                node_id,
+                listen_addr,
+                peers,
+                metrics,
+            });
+        }
+    }
+}
+
+/// Requests and prints the node's status: its identity, currently
+/// connected peers, and a metrics summary. See ADR-0037.
+async fn status_and_print(
+    conn: &mut Compat<MaybeTlsStream>,
+    sender: PeerId,
+) -> std::io::Result<()> {
+    let reply = request_status(conn, sender).await?;
+    print_status(&reply);
+    Ok(())
+}
+
+fn print_status(reply: &StatusReply) {
+    println!("Node {:?}", reply.node_id);
+    match &reply.listen_addr {
+        Some(addr) => println!("Listening on {addr}"),
+        None => println!("Not accepting inbound connections"),
+    }
+
+    println!("\nConnected peers ({}):", reply.peers.len());
+    for peer in &reply.peers {
+        match &peer.listen_addr {
+            Some(addr) => println!("  {:?}  {addr}", peer.peer_id),
+            None => println!("  {:?}  (no listen address)", peer.peer_id),
+        }
+    }
+
+    let m = &reply.metrics;
+    println!("\nMetrics:");
+    for (name, value) in [
+        ("peers_connected", m.peers_connected),
+        ("messages_published", m.messages_published),
+        ("forwarder_lag_total", m.forwarder_lag_total),
+        ("topic_acl_rejections_total", m.topic_acl_rejections_total),
+        (
+            "metrics_auth_rejections_total",
+            m.metrics_auth_rejections_total,
+        ),
+        (
+            "peer_topic_acl_rejections_total",
+            m.peer_topic_acl_rejections_total,
+        ),
+        ("replayed_messages_total", m.replayed_messages_total),
+        ("lag_recovered_total", m.lag_recovered_total),
+        ("topic_evictions_total", m.topic_evictions_total),
+        ("pattern_evictions_total", m.pattern_evictions_total),
+        ("membership_evictions_total", m.membership_evictions_total),
+        (
+            "peer_directory_evictions_total",
+            m.peer_directory_evictions_total,
+        ),
+    ] {
+        println!("  {name:<32} {value}");
+    }
 }
 
 /// The connection settings `run()` actually dials with, after merging
@@ -954,6 +1059,39 @@ mod tests {
         .expect("timed out waiting for the rejection")
         .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn request_status_reports_this_nodes_listen_addr_and_no_peers_when_alone() {
+        let addr = spawn_test_node().await;
+        let mut client = connect(addr).await;
+
+        let reply = timeout(TEST_TIMEOUT, request_status(&mut client, PeerId::new()))
+            .await
+            .expect("timed out waiting for the status reply")
+            .unwrap();
+
+        assert_eq!(reply.listen_addr, Some(addr.to_string()));
+        assert!(reply.peers.is_empty());
+        assert_eq!(reply.metrics.peers_connected, 0);
+    }
+
+    #[tokio::test]
+    async fn run_handles_the_status_command_end_to_end() {
+        // request_status's own test above covers the reply's content
+        // in detail; this just proves Command::Status actually flows
+        // through run()'s validation-then-dispatch path, the same way
+        // run_publish_delivers_to_a_real_subscriber does for Publish.
+        let addr = spawn_test_node().await;
+        let cli = Cli {
+            addr: Some(addr.to_string()),
+            config: Some(nonexistent_config_path()),
+            tls_ca: None,
+            tls_cert: None,
+            tls_key: None,
+            command: Command::Status,
+        };
+        run(cli).await.unwrap();
     }
 
     fn publish_cli(addr: Option<String>, config: Option<PathBuf>) -> Cli {

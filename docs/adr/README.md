@@ -42,6 +42,7 @@ thoth-mesh, using the format described in
 | [0034](0034-cli-config-file.md) | `thoth-mesh-cli` config file for connection options |
 | [0035](0035-cli-payload-fidelity.md) | `thoth-mesh-cli` payload input/output fidelity |
 | [0036](0036-cli-shell-completions.md) | `thoth-mesh-cli` shell completions |
+| [0037](0037-status-command.md) | `thoth-mesh-cli` status command |
 
 To add a new one, copy the format of an existing ADR, number it
 sequentially, and set its status to `Accepted` once the decision is

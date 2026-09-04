@@ -230,6 +230,35 @@ configured with (see [ADR-0015](adr/0015-dynamic-peer-discovery-gossip.md)).
 Node C, started with only `--peer` pointing at B, ends up directly
 connected to A too, without ever being told A's address.
 
+## Status
+
+`thoth-mesh status` reports a node's connected peers and a metrics
+summary, without needing `--metrics-addr` enabled at all (see
+ADR-0037):
+
+```sh
+cargo run -p thoth-mesh-cli -- --addr 127.0.0.1:49500 status
+```
+
+```
+Node PeerId(...)
+Listening on 127.0.0.1:49500
+
+Connected peers (1):
+  PeerId(...)  127.0.0.1:49501
+
+Metrics:
+  peers_connected                  1
+  messages_published               4
+  ...
+```
+
+Only currently-connected peers are listed - not the fuller
+disconnected history `Membership` keeps internally (see
+[Bounded memory footprint](#bounded-memory-footprint)). The metrics
+section is the same counters [below](#metrics) exposes as Prometheus
+text, as plain numbers instead.
+
 ## Metrics
 
 A node opens no metrics port by default. Pass `--metrics-addr` to
