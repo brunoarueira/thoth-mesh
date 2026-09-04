@@ -23,7 +23,8 @@ use thoth_mesh::{Interest, Membership, PeerDirectory, PeerInfo};
 use thoth_mesh_broker::Broker;
 use thoth_mesh_core::async_framing;
 use thoth_mesh_core::{
-    Envelope, FramingError, MessageId, MessageKind, PeerAdvert, PeerId, Topic, TopicFilter,
+    Envelope, FramingError, MessageId, MessageKind, PeerAdvert, PeerId, PeerSummary, Topic,
+    TopicFilter,
 };
 use thoth_mesh_tls::{MaybeTlsStream, fingerprint};
 use tokio::io::{WriteHalf, split};
@@ -195,8 +196,12 @@ async fn run_connection(socket: MaybeTlsStream, shared: Shared, initial_peer: Op
                 ctx.handle_unsubscribe(&envelope, filter).await
             }
             MessageKind::Publish { .. } => ctx.handle_publish(envelope).await,
-            MessageKind::Ack { .. } | MessageKind::Error { .. } => {
-                // Not actionable from a client in v1; ignore.
+            MessageKind::Ack { .. }
+            | MessageKind::Error { .. }
+            | MessageKind::StatusReply { .. } => {
+                // Not actionable from a client in v1; ignore. A
+                // StatusReply is only ever sent by a node, never a
+                // client, but still has to go somewhere in this match.
                 true
             }
             MessageKind::Hello { listen_addr } => {
@@ -207,6 +212,7 @@ async fn run_connection(socket: MaybeTlsStream, shared: Shared, initial_peer: Op
                 ctx.handle_peer_announce(peers);
                 true
             }
+            MessageKind::StatusRequest => ctx.handle_status(&envelope).await,
         };
         if !keep_going {
             break;
@@ -521,6 +527,44 @@ impl ConnectionContext {
             self.node_id,
             peers,
         );
+    }
+
+    /// Handles a `StatusRequest`: replies with this node's identity,
+    /// every currently-connected peer (sorted by `peer_id`, for
+    /// deterministic output - `Membership::snapshot` doesn't guarantee
+    /// an order), and a metrics summary (the same numbers
+    /// `render_prometheus` reports, as typed fields - ADR-0037).
+    /// Answered on any connection, client or peer link, with no ACL
+    /// check. Returns `false` if the outgoing queue has closed and the
+    /// read loop should stop.
+    async fn handle_status(&self, envelope: &Envelope) -> bool {
+        let mut peers: Vec<PeerSummary> = self
+            .membership
+            .snapshot()
+            .into_iter()
+            .filter(|(_, status)| status.connected)
+            .map(|(peer_id, status)| PeerSummary {
+                peer_id,
+                listen_addr: status.listen_addr,
+            })
+            .collect();
+        peers.sort_by_key(|peer| peer.peer_id);
+        let reply = Envelope::new(
+            self.node_id,
+            MessageKind::StatusReply {
+                in_reply_to: envelope.id,
+                node_id: self.node_id,
+                listen_addr: self.my_listen_addr.clone(),
+                peers,
+                metrics: crate::metrics::summary(
+                    &self.membership,
+                    &self.broker,
+                    &self.discover,
+                    &self.metrics,
+                ),
+            },
+        );
+        self.send(reply).await
     }
 
     /// Runs once the read loop ends: stops every forwarder this

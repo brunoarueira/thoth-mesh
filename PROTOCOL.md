@@ -152,10 +152,13 @@ matches only itself, `weather.+` matches `weather.updates` and
 ## Message kinds
 
 `kind` is CBOR-encoded the way Rust/serde encodes an externally-tagged
-enum by default: a one-entry map whose single key is the variant name,
-and whose value is that variant's fields as a nested map. For example,
-a `Publish` is `{"Publish": {"topic": "...", "payload": [...]}}`, not
-a flat structure with a separate `"type"`-style discriminant field.
+enum by default: for a variant with fields, a one-entry map whose
+single key is the variant name and whose value is that variant's
+fields as a nested map. For example, a `Publish` is `{"Publish":
+{"topic": "...", "payload": [...]}}`, not a flat structure with a
+separate `"type"`-style discriminant field. The one field-less variant
+(`StatusRequest`, below) is the exception this representation carves
+out: it's a bare string, not a one-entry map with a `null` value.
 
 ### `Publish`
 
@@ -294,6 +297,43 @@ except the new link's own), and again, incrementally, whenever the
 sender itself learns of a peer it didn't already know.
 
 No reply is sent for a `PeerAnnounce`, the same as `Publish`.
+
+### `StatusRequest` / `StatusReply`
+
+```
+"StatusRequest"
+{"StatusReply": {
+  "in_reply_to": <MessageId>,
+  "node_id": <PeerId>,
+  "listen_addr": <string | null>,
+  "peers": [{"peer_id": <PeerId>, "listen_addr": <string | null>}, ...],
+  "metrics": {
+    "peers_connected": <u64>, "messages_published": <u64>,
+    "forwarder_lag_total": <u64>, "topic_acl_rejections_total": <u64>,
+    "metrics_auth_rejections_total": <u64>,
+    "peer_topic_acl_rejections_total": <u64>,
+    "replayed_messages_total": <u64>, "lag_recovered_total": <u64>,
+    "topic_evictions_total": <u64>, "pattern_evictions_total": <u64>,
+    "membership_evictions_total": <u64>,
+    "peer_directory_evictions_total": <u64>
+  }
+}}
+```
+
+Requests the receiving node's current status. Answered on any
+connection - client or peer link - with no ACL check
+([ADR-0037](docs/adr/0037-status-command.md)): `peers` lists every
+peer the node currently has an open link to (not the full history a
+`--metrics-addr` scrape's `thothmesh_peers_connected` count is
+capped-and-collapsed from), and `metrics` mirrors every counter that
+endpoint's Prometheus text exposes (ADR-0013), just as typed fields
+instead of text - the two field sets correspond 1:1, minus the
+`thothmesh_` prefix. Unlike every other message kind, `StatusRequest` carries no fields at
+all - a unit variant, which serde/ciborium's externally-tagged
+representation encodes as a bare CBOR text string (`"StatusRequest"`),
+not a one-entry map the way every field-carrying variant above is. An
+implementation decoding the envelope's `kind` needs to accept a bare
+string as well as a map with one entry.
 
 ## Connections: clients vs. peer links
 

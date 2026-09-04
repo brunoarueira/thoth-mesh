@@ -32,7 +32,13 @@ pub enum HandshakeError {
     #[error("failed to encode handshake envelope: {0}")]
     Encode(#[from] EncodeError),
     #[error("expected a Hello, got {0:?}")]
-    UnexpectedMessage(MessageKind),
+    // Boxed: MessageKind grew past clippy::result_large_err's
+    // threshold once StatusReply (ADR-0037) added a MetricsSummary's
+    // worth of u64 fields to it - a HandshakeError already flows
+    // through Result everywhere in this module, so a bare MessageKind
+    // inline would inflate every one of those Results' stack size for
+    // the sake of this one rarely-taken error variant.
+    UnexpectedMessage(Box<MessageKind>),
 }
 
 /// Builds this node's `Hello` envelope.
@@ -61,7 +67,7 @@ async fn recv_hello<S: AsyncRead + Unpin>(stream: &mut S) -> Result<PeerInfo, Ha
             listen_addr,
             hello_id: envelope.id,
         }),
-        other => Err(HandshakeError::UnexpectedMessage(other)),
+        other => Err(HandshakeError::UnexpectedMessage(Box::new(other))),
     }
 }
 

@@ -17,7 +17,7 @@ pub use envelope::{Envelope, PROTOCOL_VERSION};
 pub use error::{DecodeError, EncodeError, FramingError, TopicError, TopicFilterError};
 pub use filter::TopicFilter;
 pub use framing::{MAX_FRAME_LEN, read_frame, write_frame};
-pub use message::{MessageId, MessageKind, PeerAdvert};
+pub use message::{MessageId, MessageKind, MetricsSummary, PeerAdvert, PeerSummary};
 pub use peer::PeerId;
 pub use topic::{MAX_TOPIC_LEN, Topic};
 

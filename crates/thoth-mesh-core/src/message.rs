@@ -43,6 +43,40 @@ pub struct PeerAdvert {
     pub listen_addr: String,
 }
 
+/// One peer connected to the node that answered a
+/// [`MessageKind::StatusRequest`], as reported in its
+/// [`MessageKind::StatusReply`]. Unlike [`PeerAdvert`],
+/// `listen_addr` is optional - the same as `Membership`'s own
+/// `PeerStatus`, since a peer that only ever dials out never reports
+/// one. See ADR-0037.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerSummary {
+    pub peer_id: PeerId,
+    pub listen_addr: Option<String>,
+}
+
+/// A snapshot of a node's counters, as typed fields rather than the
+/// Prometheus text `--metrics-addr` exposes (ADR-0013) - the
+/// [`MessageKind::StatusReply`] payload. Field names match the
+/// Prometheus metric names 1:1 (minus the `thothmesh_` prefix, and
+/// `_total`/no suffix mirroring counter vs. gauge there), so the two
+/// stay easy to cross-reference. See ADR-0037.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetricsSummary {
+    pub peers_connected: u64,
+    pub messages_published: u64,
+    pub forwarder_lag_total: u64,
+    pub topic_acl_rejections_total: u64,
+    pub metrics_auth_rejections_total: u64,
+    pub peer_topic_acl_rejections_total: u64,
+    pub replayed_messages_total: u64,
+    pub lag_recovered_total: u64,
+    pub topic_evictions_total: u64,
+    pub pattern_evictions_total: u64,
+    pub membership_evictions_total: u64,
+    pub peer_directory_evictions_total: u64,
+}
+
 /// The payload of an [`Envelope`](crate::Envelope).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MessageKind {
@@ -76,6 +110,18 @@ pub enum MessageKind {
     /// again whenever the sender learns of a peer it didn't already
     /// know. See ADR-0015.
     PeerAnnounce { peers: Vec<PeerAdvert> },
+    /// Request the receiving node's current status: its connected
+    /// peers and a metrics summary. Answered on any connection,
+    /// client or peer link - see ADR-0037.
+    StatusRequest,
+    /// Reply to a `StatusRequest`.
+    StatusReply {
+        in_reply_to: MessageId,
+        node_id: PeerId,
+        listen_addr: Option<String>,
+        peers: Vec<PeerSummary>,
+        metrics: MetricsSummary,
+    },
 }
 
 #[cfg(test)]
@@ -132,6 +178,21 @@ mod tests {
                 }],
             },
             MessageKind::PeerAnnounce { peers: vec![] },
+            MessageKind::StatusRequest,
+            MessageKind::StatusReply {
+                in_reply_to: MessageId::new(),
+                node_id: PeerId::new(),
+                listen_addr: Some("127.0.0.1:49500".to_owned()),
+                peers: vec![PeerSummary {
+                    peer_id: PeerId::new(),
+                    listen_addr: None,
+                }],
+                metrics: MetricsSummary {
+                    peers_connected: 1,
+                    messages_published: 2,
+                    ..Default::default()
+                },
+            },
         ];
 
         for kind in kinds {
