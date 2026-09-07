@@ -81,6 +81,7 @@ async fn a_restarted_peer_reconnects_as_a_new_identity_with_no_leftover_duplicat
         PeerId::new(),
         MessageKind::Subscribe {
             filter: topic("weather.updates").into(),
+            ack: false,
         },
     );
     send(&mut subscriber, &sub).await;

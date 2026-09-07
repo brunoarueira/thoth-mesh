@@ -315,6 +315,7 @@ mod tests {
             their_id,
             MessageKind::Subscribe {
                 filter: filter.clone(),
+                ack: false,
             },
         );
         async_framing::write_frame(&mut conn, &sub.to_bytes().unwrap())
@@ -342,7 +343,8 @@ mod tests {
         assert_eq!(
             Envelope::from_bytes(&echoed).unwrap().kind,
             MessageKind::Subscribe {
-                filter: filter.clone()
+                filter: filter.clone(),
+                ack: false,
             }
         );
 
@@ -466,7 +468,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             Envelope::from_bytes(&bytes).unwrap().kind,
-            MessageKind::Subscribe { filter }
+            MessageKind::Subscribe { filter, ack: false }
         );
     }
 

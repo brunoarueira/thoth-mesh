@@ -180,6 +180,7 @@ mod tests {
                 PeerId::new(),
                 MessageKind::Subscribe {
                     filter: "weather.updates".parse().unwrap(),
+                    ack: false,
                 },
             );
             let mut preloaded = Vec::new();

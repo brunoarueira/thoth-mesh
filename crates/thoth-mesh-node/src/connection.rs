@@ -13,11 +13,14 @@
 //! history - see ADR-0021. A forwarder that falls behind mid-stream
 //! and lags its broadcast receiver recovers what it can from that
 //! same buffer rather than accepting silent loss outright - see
-//! ADR-0024.
+//! ADR-0024. A `Subscribe { ack: true }` gets a different forwarder
+//! that holds each delivery until acknowledged and redelivers it on a
+//! timeout - see ADR-0041 and the `redelivery` module.
 
 use std::collections::{HashMap, HashSet};
 use std::io::ErrorKind;
 use std::sync::Arc;
+use std::time::Instant;
 
 use thoth_mesh::{Interest, Membership, PeerDirectory, PeerInfo};
 use thoth_mesh_broker::Broker;
@@ -36,8 +39,17 @@ use tracing::Instrument;
 
 use crate::metrics::Metrics;
 use crate::peer_links::PeerLinks;
+use crate::redelivery::{
+    DEFAULT_ACK_TIMEOUT, DEFAULT_MAX_REDELIVERY_ATTEMPTS, PendingAcks, sweep_interval,
+};
 use crate::shared::Shared;
 use crate::topic_acl::{Action, Principal, TopicAcl};
+
+/// Bounds how many un-drained `Ack`s can queue up for one ack-required
+/// forwarder before `handle_ack` starts dropping them (best-effort -
+/// see its own doc comment). Sized well above what a single
+/// connection's real ack traffic should ever need to buffer.
+const ACK_CHANNEL_CAPACITY: usize = 256;
 
 const OUTGOING_CHANNEL_CAPACITY: usize = 64;
 
@@ -194,18 +206,25 @@ async fn run_connection(socket: MaybeTlsStream, shared: Shared, initial_peer: Op
         envelope.sender = ctx.authenticated_sender(envelope.sender);
 
         let keep_going = match &envelope.kind {
-            MessageKind::Subscribe { filter } => {
+            MessageKind::Subscribe { filter, ack } => {
                 let filter = filter.clone();
-                ctx.handle_subscribe(&envelope, filter).await
+                let ack = *ack;
+                ctx.handle_subscribe(&envelope, filter, ack).await
             }
             MessageKind::Unsubscribe { filter } => {
                 let filter = filter.clone();
                 ctx.handle_unsubscribe(&envelope, filter).await
             }
             MessageKind::Publish { .. } => ctx.handle_publish(envelope).await,
-            MessageKind::Ack { .. }
-            | MessageKind::Error { .. }
-            | MessageKind::StatusReply { .. } => {
+            MessageKind::Ack { in_reply_to } => {
+                // A node never receives a Subscribe/Unsubscribe from a
+                // client to acknowledge, so any Ack it receives is
+                // unambiguously a client acking an individual
+                // ack: true delivery (ADR-0041).
+                ctx.handle_ack(*in_reply_to);
+                true
+            }
+            MessageKind::Error { .. } | MessageKind::StatusReply { .. } => {
                 // Not actionable from a client in v1; ignore. A
                 // StatusReply is only ever sent by a node, never a
                 // client, but still has to go somewhere in this match.
@@ -262,7 +281,7 @@ struct ConnectionContext {
     /// Every topic filter a `Subscribe` on this connection is
     /// currently forwarding for, keyed by the same filter a matching
     /// `Unsubscribe` removes it by.
-    forwarders: HashMap<TopicFilter, JoinHandle<()>>,
+    forwarders: HashMap<TopicFilter, Forwarder>,
     /// Set once this connection is known to be a peer link - either
     /// passed in already-known (dial side, ADR-0010) or learned from
     /// an incoming `Hello` (accept side) - so `shut_down` knows whose
@@ -361,15 +380,25 @@ impl ConnectionContext {
         true
     }
 
-    /// Handles a `Subscribe { filter }` request: authorizes it against
-    /// whichever ACL applies (ADR-0018/ADR-0020) - refusing a wildcard
-    /// filter outright wherever one does, regardless of what it would
-    /// expand to (ADR-0022) - spawns a forwarder for a genuinely new
-    /// filter (ADR-0021), acks, and, only on this connection's first
-    /// subscriber for `filter`, propagates the interest transition to
-    /// every peer link (ADR-0011). Returns `false` if the outgoing
-    /// queue has closed and the read loop should stop.
-    async fn handle_subscribe(&mut self, envelope: &Envelope, filter: TopicFilter) -> bool {
+    /// Handles a `Subscribe { filter, ack }` request: authorizes it
+    /// against whichever ACL applies (ADR-0018/ADR-0020) - refusing a
+    /// wildcard filter outright wherever one does, regardless of what
+    /// it would expand to (ADR-0022) - spawns a forwarder for a
+    /// genuinely new filter (ADR-0021), acks, and, only on this
+    /// connection's first subscriber for `filter`, propagates the
+    /// interest transition to every peer link (ADR-0011). `ack` opts
+    /// this subscription into at-least-once delivery (ADR-0041); it's
+    /// only read the first time `filter` is subscribed to on this
+    /// connection - same as the rest of a no-op re-`Subscribe`, it
+    /// doesn't retroactively change an already-running forwarder's
+    /// mode. Returns `false` if the outgoing queue has closed and the
+    /// read loop should stop.
+    async fn handle_subscribe(
+        &mut self,
+        envelope: &Envelope,
+        filter: TopicFilter,
+        ack: bool,
+    ) -> bool {
         let is_peer = self.is_peer();
         if !filter_acl_permits(
             &self.topic_acl,
@@ -394,14 +423,28 @@ impl ConnectionContext {
             );
             return self.send(error).await;
         }
-        tracing::info!(sender = ?envelope.sender, %filter, "subscribed");
+        tracing::info!(sender = ?envelope.sender, %filter, ack, "subscribed");
         let is_new_forwarder = !self.forwarders.contains_key(&filter);
         let broker = Arc::clone(&self.broker);
         let outgoing_tx = self.outgoing_tx.clone();
         let metrics = self.metrics.clone();
-        self.forwarders
-            .entry(filter.clone())
-            .or_insert_with(|| spawn_forwarder(&broker, filter.clone(), outgoing_tx, metrics));
+        self.forwarders.entry(filter.clone()).or_insert_with(|| {
+            if ack {
+                spawn_ack_forwarder(
+                    &broker,
+                    filter.clone(),
+                    outgoing_tx,
+                    metrics,
+                    DEFAULT_ACK_TIMEOUT,
+                    DEFAULT_MAX_REDELIVERY_ATTEMPTS,
+                )
+            } else {
+                Forwarder {
+                    handle: spawn_forwarder(&broker, filter.clone(), outgoing_tx, metrics),
+                    ack_tx: None,
+                }
+            }
+        });
         // The ack goes out before the interest-propagation echo below
         // (ADR-0011) - both now flow through the same outgoing_tx
         // queue (see ADR-0029), so whichever is sent first is what a
@@ -433,7 +476,7 @@ impl ConnectionContext {
         let had_forwarder = self
             .forwarders
             .remove(&filter)
-            .inspect(|handle| handle.abort());
+            .inspect(|forwarder| forwarder.handle.abort());
         // Ack before the echo - see handle_subscribe above.
         let ack = Envelope::new(
             self.node_id,
@@ -564,6 +607,27 @@ impl ConnectionContext {
         );
     }
 
+    /// Handles an `Ack { in_reply_to }` received from a client:
+    /// forwards it to every forwarder on this connection that's
+    /// tracking pending acknowledgements (ADR-0041) - i.e. every
+    /// filter subscribed to with `ack: true`. Best-effort
+    /// (`try_send`, not awaited): a forwarder whose ack channel is
+    /// momentarily full just resends on its next timeout instead of
+    /// retiring the entry a little early - at-least-once delivery
+    /// already tolerates a redundant resend, so this never causes
+    /// incorrect behavior, only an occasional extra one. Never fails
+    /// the connection - nothing here writes back to this link, and an
+    /// `in_reply_to` that matches none of this connection's own
+    /// forwarders (e.g. a stale or malicious ack) is simply ignored
+    /// everywhere it's tried.
+    fn handle_ack(&self, in_reply_to: MessageId) {
+        for forwarder in self.forwarders.values() {
+            if let Some(ack_tx) = &forwarder.ack_tx {
+                let _ = ack_tx.try_send(in_reply_to);
+            }
+        }
+    }
+
     /// Handles a `StatusRequest`: replies with this node's identity,
     /// every currently-connected peer (sorted by `peer_id`, for
     /// deterministic output - `Membership::snapshot` doesn't guarantee
@@ -608,9 +672,9 @@ impl ConnectionContext {
     /// this connection turned out to be a peer link, unregisters it
     /// and marks it disconnected.
     fn shut_down(&mut self) {
-        for (filter, handle) in self.forwarders.drain() {
+        for (filter, forwarder) in self.forwarders.drain() {
             tracing::debug!(%filter, "stopping forwarder");
-            handle.abort();
+            forwarder.handle.abort();
             if self.interest.unsubscribe(&filter) {
                 propagate_interest(&self.peer_links, self.node_id, filter, false);
             }
@@ -646,8 +710,12 @@ fn register_peer_link(
     for filter in interest.snapshot() {
         let envelope = Arc::new(Envelope::new(
             node_id,
+            // Always ack: false - interest propagation is a routing
+            // signal between peers, not a real consumer wanting
+            // delivery guarantees. See ADR-0041's Scope.
             MessageKind::Subscribe {
                 filter: filter.clone(),
+                ack: false,
             },
         ));
         if outgoing_tx.try_send(envelope).is_err() {
@@ -760,7 +828,9 @@ fn propagate_interest(
     now_interested: bool,
 ) {
     let kind = if now_interested {
-        MessageKind::Subscribe { filter }
+        // Always ack: false - see register_peer_link's interest
+        // catch-up above and ADR-0041's Scope.
+        MessageKind::Subscribe { filter, ack: false }
     } else {
         MessageKind::Unsubscribe { filter }
     };
@@ -906,6 +976,18 @@ impl<T> std::future::Future for AbortOnDrop<T> {
     }
 }
 
+/// One connection's forwarder for a single `Subscribe`d filter: the
+/// task itself, plus - only for a filter subscribed to with
+/// `ack: true` (ADR-0041) - the channel `ConnectionContext::handle_ack`
+/// uses to tell it a delivery was acknowledged. `None` for an
+/// ordinary, fire-and-forget subscription; `handle.abort()` alone is
+/// enough to stop either kind (see `shut_down`/`handle_unsubscribe`),
+/// `ack_tx` doesn't need its own explicit teardown.
+struct Forwarder {
+    handle: JoinHandle<()>,
+    ack_tx: Option<mpsc::Sender<MessageId>>,
+}
+
 fn spawn_forwarder(
     broker: &Arc<Broker>,
     filter: TopicFilter,
@@ -999,6 +1081,141 @@ fn spawn_forwarder(
         }
         .in_current_span(),
     )
+}
+
+/// Like [`spawn_forwarder`], for a filter subscribed to with
+/// `ack: true` (ADR-0041): every delivery - backlog, live, or
+/// lag-recovered alike - is tracked in a [`PendingAcks`] table after
+/// being sent, and a periodic sweep resends anything that's gone
+/// unacknowledged for `ack_timeout`, giving up on it after
+/// `max_redelivery_attempts`. A dedicated function rather than
+/// folding this into `spawn_forwarder` itself via an `Option`
+/// everywhere - the ordinary, by-far-more-common path stays exactly
+/// as simple as it was before this ADR, with zero added overhead.
+///
+/// `ack_timeout`/`max_redelivery_attempts` are parameters (rather
+/// than reading [`DEFAULT_ACK_TIMEOUT`]/[`DEFAULT_MAX_REDELIVERY_ATTEMPTS`]
+/// directly) purely so tests can exercise real redelivery/give-up
+/// behavior against a timeout measured in milliseconds instead of the
+/// production default; `handle_subscribe` always passes the defaults.
+fn spawn_ack_forwarder(
+    broker: &Arc<Broker>,
+    filter: TopicFilter,
+    outgoing_tx: mpsc::Sender<Arc<Envelope>>,
+    metrics: Metrics,
+    ack_timeout: std::time::Duration,
+    max_redelivery_attempts: u32,
+) -> Forwarder {
+    let (ack_tx, mut ack_rx) = mpsc::channel::<MessageId>(ACK_CHANNEL_CAPACITY);
+    let broker = Arc::clone(broker);
+    let handle = tokio::spawn(
+        async move {
+            let mut pending = PendingAcks::new(ack_timeout, max_redelivery_attempts);
+            let mut sweep = tokio::time::interval(sweep_interval(ack_timeout));
+            // The first tick fires immediately - nothing to sweep yet,
+            // and firing it up front (rather than skipping one tick,
+            // tokio::time::interval's default) keeps every subsequent
+            // tick exactly sweep_interval apart.
+            sweep.tick().await;
+
+            let (backlog, mut rx) = broker.subscribe(filter.clone()).await;
+            if !backlog.is_empty() {
+                metrics.record_replayed_messages(backlog.len() as u64);
+            }
+            let mut last_delivered: Option<MessageId> = None;
+            for envelope in backlog {
+                let id = envelope.id;
+                if outgoing_tx.send(Arc::clone(&envelope)).await.is_err() {
+                    return;
+                }
+                pending.record(envelope, Instant::now());
+                last_delivered = Some(id);
+            }
+
+            loop {
+                tokio::select! {
+                    acked = ack_rx.recv() => {
+                        // `None` means the connection is shutting down
+                        // (this forwarder's ack_tx was dropped) - the
+                        // task is about to be aborted regardless, so
+                        // there's nothing useful to do but keep going
+                        // until that happens.
+                        if let Some(id) = acked {
+                            pending.ack(id);
+                        }
+                    }
+                    _ = sweep.tick() => {
+                        let (to_resend, given_up_on) = pending.sweep(Instant::now());
+                        if !given_up_on.is_empty() {
+                            tracing::warn!(
+                                count = given_up_on.len(),
+                                "giving up on {} delivery(ies) after exhausting every redelivery attempt with no ack",
+                                given_up_on.len()
+                            );
+                            metrics.record_delivery_ack_timeouts(given_up_on.len() as u64);
+                        }
+                        if !to_resend.is_empty() {
+                            metrics.record_redelivered_messages(to_resend.len() as u64);
+                        }
+                        for envelope in to_resend {
+                            if outgoing_tx.send(envelope).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    received = rx.recv() => {
+                        match received {
+                            Ok(envelope) => {
+                                let id = envelope.id;
+                                if outgoing_tx.send(Arc::clone(&envelope)).await.is_err() {
+                                    break;
+                                }
+                                pending.record(envelope, Instant::now());
+                                last_delivered = Some(id);
+                            }
+                            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                                tracing::warn!(skipped, "forwarder lagged, attempting recovery from replay buffer");
+                                metrics.record_forwarder_lag(skipped);
+
+                                let (fresh_backlog, fresh_rx) = broker.subscribe(filter.clone()).await;
+                                rx = fresh_rx;
+
+                                let recovered: Vec<Arc<Envelope>> = match last_delivered {
+                                    None => fresh_backlog,
+                                    Some(last_id) => match fresh_backlog.iter().position(|e| e.id == last_id) {
+                                        Some(idx) => fresh_backlog.into_iter().skip(idx + 1).collect(),
+                                        None => {
+                                            tracing::warn!(
+                                                "lag recovery gap exceeded the replay buffer, some messages are unrecoverably lost"
+                                            );
+                                            Vec::new()
+                                        }
+                                    },
+                                };
+                                if !recovered.is_empty() {
+                                    metrics.record_lag_recovered(recovered.len() as u64);
+                                }
+                                for envelope in recovered {
+                                    let id = envelope.id;
+                                    if outgoing_tx.send(Arc::clone(&envelope)).await.is_err() {
+                                        return;
+                                    }
+                                    pending.record(envelope, Instant::now());
+                                    last_delivered = Some(id);
+                                }
+                            }
+                            Err(broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                }
+            }
+        }
+        .in_current_span(),
+    );
+    Forwarder {
+        handle,
+        ack_tx: Some(ack_tx),
+    }
 }
 
 #[cfg(test)]
@@ -1114,6 +1331,172 @@ mod tests {
         assert!(
             !received.is_empty(),
             "whatever fit in the outgoing channel before it blocked should still arrive"
+        );
+    }
+
+    /// An unacknowledged delivery is resent once `ack_timeout` passes,
+    /// and stops being resent as soon as it's acked - the core
+    /// at-least-once behavior `spawn_ack_forwarder` adds (ADR-0041).
+    /// Uses a tiny `ack_timeout` (rather than
+    /// `DEFAULT_ACK_TIMEOUT`) purely so this test doesn't have to wait
+    /// several real seconds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ack_forwarder_redelivers_an_unacked_message_then_stops_once_acked() {
+        let broker = Arc::new(Broker::new());
+        let topic = Topic::from_str("weather.updates").unwrap();
+        let filter: TopicFilter = topic.clone().into();
+        let (outgoing_tx, mut outgoing_rx) = mpsc::channel(8);
+        let forwarder = spawn_ack_forwarder(
+            &broker,
+            filter,
+            outgoing_tx,
+            Metrics::new(),
+            Duration::from_millis(30),
+            5,
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let envelope = Envelope::new(
+            PeerId::new(),
+            MessageKind::Publish {
+                topic: topic.clone(),
+                payload: b"sunny".to_vec(),
+            },
+        );
+        broker.publish(&topic, Arc::new(envelope.clone())).await;
+
+        let first = outgoing_rx.recv().await.unwrap();
+        assert_eq!(first.id, envelope.id);
+
+        // No ack sent yet - the same message should be resent once
+        // ack_timeout passes.
+        let resent = tokio::time::timeout(Duration::from_millis(500), outgoing_rx.recv())
+            .await
+            .expect("timed out waiting for a redelivery")
+            .unwrap();
+        assert_eq!(resent.id, envelope.id);
+
+        // Ack it now - no further resend should ever arrive.
+        let ack_tx = forwarder
+            .ack_tx
+            .clone()
+            .expect("ack forwarder always has an ack_tx");
+        ack_tx.send(envelope.id).await.unwrap();
+        let nothing_more =
+            tokio::time::timeout(Duration::from_millis(150), outgoing_rx.recv()).await;
+        assert!(
+            nothing_more.is_err(),
+            "an acked message should never be redelivered again"
+        );
+    }
+
+    /// Once `max_redelivery_attempts` resends have gone unacknowledged,
+    /// the forwarder gives up on that delivery for good rather than
+    /// resending it forever (ADR-0041's "never acks at all").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ack_forwarder_stops_redelivering_once_max_attempts_is_exhausted() {
+        let broker = Arc::new(Broker::new());
+        let topic = Topic::from_str("weather.updates").unwrap();
+        let filter: TopicFilter = topic.clone().into();
+        let (outgoing_tx, mut outgoing_rx) = mpsc::channel(16);
+        const MAX_ATTEMPTS: u32 = 2;
+        let _forwarder = spawn_ack_forwarder(
+            &broker,
+            filter,
+            outgoing_tx,
+            Metrics::new(),
+            Duration::from_millis(20),
+            MAX_ATTEMPTS,
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let envelope = Envelope::new(
+            PeerId::new(),
+            MessageKind::Publish {
+                topic: topic.clone(),
+                payload: b"sunny".to_vec(),
+            },
+        );
+        broker.publish(&topic, Arc::new(envelope.clone())).await;
+
+        // The original delivery plus MAX_ATTEMPTS resends - never acked.
+        for _ in 0..=MAX_ATTEMPTS {
+            let received = tokio::time::timeout(Duration::from_millis(500), outgoing_rx.recv())
+                .await
+                .expect("timed out waiting for a delivery")
+                .unwrap();
+            assert_eq!(received.id, envelope.id);
+        }
+
+        // Nothing more should ever arrive - every attempt is spent.
+        let nothing_more =
+            tokio::time::timeout(Duration::from_millis(200), outgoing_rx.recv()).await;
+        assert!(
+            nothing_more.is_err(),
+            "should have given up after max_redelivery_attempts resends"
+        );
+    }
+
+    /// A delivery recovered from the replay buffer after a broadcast
+    /// lag (ADR-0024) is tracked for redelivery exactly like a live
+    /// one - lag recovery and ack tracking compose, rather than a
+    /// lag-recovered envelope silently skipping pending-ack tracking.
+    /// See ADR-0041's Decision.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ack_forwarder_tracks_a_lag_recovered_delivery_for_redelivery_too() {
+        let broker = Arc::new(Broker::new());
+        let topic = Topic::from_str("weather.updates").unwrap();
+        let filter: TopicFilter = topic.clone().into();
+        const CHANNEL_CAPACITY: usize = 8;
+        const TOTAL: u32 = 500;
+
+        let (outgoing_tx, mut outgoing_rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let _forwarder = spawn_ack_forwarder(
+            &broker,
+            filter,
+            outgoing_tx,
+            Metrics::new(),
+            Duration::from_millis(50),
+            5,
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Nobody drains outgoing_rx during this - forces the forwarder
+        // to lag and recover from the replay buffer, same setup as
+        // a_lagged_forwarder_recovers_a_gap_within_the_buffers_headroom.
+        publish_sequence(&broker, &topic, TOTAL).await;
+
+        let mut received = Vec::with_capacity(TOTAL as usize);
+        while received.len() < TOTAL as usize {
+            let envelope = tokio::time::timeout(Duration::from_secs(5), outgoing_rx.recv())
+                .await
+                .expect("timed out waiting for a delivery")
+                .unwrap();
+            received.push(envelope);
+        }
+        let received_ids: HashSet<MessageId> = received.iter().map(|e| e.id).collect();
+
+        // Nothing was ever acked - the sweep should now be resending
+        // some of what was already delivered (whether it originally
+        // arrived live or via lag recovery) rather than staying silent
+        // forever.
+        let mut resent_count = 0;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        while tokio::time::Instant::now() < deadline && resent_count < 5 {
+            let Ok(Some(envelope)) =
+                tokio::time::timeout(Duration::from_millis(500), outgoing_rx.recv()).await
+            else {
+                break;
+            };
+            assert!(
+                received_ids.contains(&envelope.id),
+                "a resend should only ever be something already delivered"
+            );
+            resent_count += 1;
+        }
+        assert!(
+            resent_count > 0,
+            "expected at least one redelivery of an unacked message"
         );
     }
 

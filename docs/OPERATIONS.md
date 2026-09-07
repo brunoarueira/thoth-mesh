@@ -173,6 +173,15 @@ N bytes` note move to stderr in this mode, so they stay visible on the
 terminal without corrupting the captured file (`--output text`, the
 default, is unchanged - see ADR-0035).
 
+`subscribe --ack` opts into at-least-once delivery for this
+invocation: the CLI acknowledges each message right after printing it,
+and the node redelivers anything it doesn't hear back about within a
+few seconds - possibly more than once, since a redundant redelivery
+isn't distinguished from a fresh one. Without `--ack`, delivery is
+exactly as before: fire-and-forget, once, best-effort. See
+[ADR-0041](adr/0041-at-least-once-delivery-with-ack-based-redelivery.md)
+and [`PROTOCOL.md`](../PROTOCOL.md#delivery-semantics).
+
 Every node and CLI invocation picks a fresh random `PeerId` on
 startup, with one exception: given `--tls-cert`/`--tls-key`, a node or
 CLI invocation derives its `PeerId` from that certificate's SHA-256
@@ -305,15 +314,20 @@ thothmesh_pattern_evictions_total 0
 thothmesh_membership_evictions_total 0
 # TYPE thothmesh_peer_directory_evictions_total counter
 thothmesh_peer_directory_evictions_total 0
+# TYPE thothmesh_redelivered_messages_total counter
+thothmesh_redelivered_messages_total 0
+# TYPE thothmesh_delivery_ack_timeouts_total counter
+thothmesh_delivery_ack_timeouts_total 0
 ```
 
-Twelve metrics today (ADR-0013, plus `topic_acl_rejections_total`
+Fourteen metrics today (ADR-0013, plus `topic_acl_rejections_total`
 added by ADR-0018, `metrics_auth_rejections_total` added by ADR-0019,
 `peer_topic_acl_rejections_total` added by ADR-0020,
 `replayed_messages_total` added by ADR-0021, `lag_recovered_total`
-added by ADR-0024, and `topic_evictions_total`/`pattern_evictions_total`/
+added by ADR-0024, `topic_evictions_total`/`pattern_evictions_total`/
 `membership_evictions_total`/`peer_directory_evictions_total` added by
-ADR-0025):
+ADR-0025, and `redelivered_messages_total`/`delivery_ack_timeouts_total`
+added by ADR-0041):
 
 | Metric | Type | Meaning |
 | --- | --- | --- |
@@ -329,6 +343,8 @@ ADR-0025):
 | `thothmesh_pattern_evictions_total` | counter | Same as `topic_evictions_total`, for wildcard pattern subscriptions - tracked separately since they're two independent caps. |
 | `thothmesh_membership_evictions_total` | counter | Disconnected peers this node stopped remembering an address for, once over the cap (see [Bounded memory footprint](#bounded-memory-footprint)). A currently-*connected* peer is never counted here. |
 | `thothmesh_peer_directory_evictions_total` | counter | Peers this node stops remembering as dialable, once over the cap - distinct from `membership_evictions_total`: this is every peer ever learned about (gossip or handshake), not just ones this node itself connected to. |
+| `thothmesh_redelivered_messages_total` | counter | Deliveries resent because an `ack: true` subscription's acknowledgement didn't arrive within the redelivery timeout (see [ADR-0041](adr/0041-at-least-once-delivery-with-ack-based-redelivery.md)). Zero on a node with no `ack: true` subscribers, or whose subscribers ack promptly. |
+| `thothmesh_delivery_ack_timeouts_total` | counter | Deliveries an `ack: true` subscription's forwarder gave up on after exhausting every redelivery attempt with no ack - counted, not retried further or dead-lettered. Nonzero here means a subscriber is missing messages it asked to be guaranteed. |
 
 Point a Prometheus `scrape_configs` target at `--metrics-addr` the
 same way you would any other exporter; there's no special

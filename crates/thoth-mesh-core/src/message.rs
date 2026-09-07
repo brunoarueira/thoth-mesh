@@ -75,6 +75,14 @@ pub struct MetricsSummary {
     pub pattern_evictions_total: u64,
     pub membership_evictions_total: u64,
     pub peer_directory_evictions_total: u64,
+    /// Deliveries resent because an `ack: true` subscription's
+    /// acknowledgement didn't arrive within the redelivery timeout
+    /// (ADR-0041). Counts every resend, whether or not it's
+    /// eventually acked.
+    pub redelivered_messages_total: u64,
+    /// Deliveries given up on after exhausting every redelivery
+    /// attempt without ever being acked (ADR-0041).
+    pub delivery_ack_timeouts_total: u64,
 }
 
 /// The payload of an [`Envelope`](crate::Envelope).
@@ -85,10 +93,24 @@ pub enum MessageKind {
     Publish { topic: Topic, payload: Vec<u8> },
     /// Subscribe to a topic filter - a plain topic name, or one
     /// containing MQTT-style wildcard segments (see ADR-0022).
-    Subscribe { filter: TopicFilter },
+    Subscribe {
+        filter: TopicFilter,
+        /// Opts this subscription into at-least-once delivery: each
+        /// `Publish` sent for it is held until acknowledged (see
+        /// `Ack` below) and redelivered on a timeout. `#[serde(default)]`
+        /// so an older sender omitting this field decodes as `false` -
+        /// unchanged fire-and-forget behavior. See ADR-0041.
+        #[serde(default)]
+        ack: bool,
+    },
     /// Unsubscribe from a topic filter previously subscribed to.
     Unsubscribe { filter: TopicFilter },
-    /// Acknowledge a previously received message.
+    /// Acknowledge a previously received message. Sent by a node in
+    /// reply to a `Subscribe`/`Unsubscribe`, or by a client
+    /// acknowledging an individual `Publish` delivery on a
+    /// subscription made with `ack: true` (ADR-0041) - the two are
+    /// unambiguous by direction: a node never receives a
+    /// `Subscribe`/`Unsubscribe` from a client to acknowledge.
     Ack { in_reply_to: MessageId },
     /// Report an error, optionally in response to a specific message.
     Error {
@@ -152,6 +174,11 @@ mod tests {
             },
             MessageKind::Subscribe {
                 filter: topic.clone().into(),
+                ack: false,
+            },
+            MessageKind::Subscribe {
+                filter: topic.clone().into(),
+                ack: true,
             },
             MessageKind::Unsubscribe {
                 filter: topic.into(),
@@ -201,5 +228,31 @@ mod tests {
             let decoded: MessageKind = ciborium::from_reader(&bytes[..]).unwrap();
             assert_eq!(kind, decoded);
         }
+    }
+
+    /// A `Subscribe` encoded without an `ack` field at all - what an
+    /// older sender that predates ADR-0041 actually puts on the wire -
+    /// still decodes, defaulting to `ack: false` (unchanged
+    /// fire-and-forget behavior) rather than failing to parse.
+    #[test]
+    fn subscribe_without_an_ack_field_decodes_as_not_acked() {
+        let topic = Topic::from_str("weather.updates").unwrap();
+        let filter: TopicFilter = topic.into();
+
+        #[derive(Serialize)]
+        enum PreAdr0041 {
+            Subscribe { filter: TopicFilter },
+        }
+
+        let mut bytes = Vec::new();
+        ciborium::into_writer(
+            &PreAdr0041::Subscribe {
+                filter: filter.clone(),
+            },
+            &mut bytes,
+        )
+        .unwrap();
+        let decoded: MessageKind = ciborium::from_reader(&bytes[..]).unwrap();
+        assert_eq!(decoded, MessageKind::Subscribe { filter, ack: false });
     }
 }

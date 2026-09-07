@@ -38,6 +38,15 @@ pub struct Metrics {
     /// `tokio::sync::broadcast` reports, which can differ from how
     /// much was actually recoverable).
     lag_recovered: Arc<AtomicU64>,
+    /// Deliveries resent by an `ack: true` subscription's forwarder
+    /// because the original delivery wasn't acked within the
+    /// redelivery timeout (ADR-0041). Counts every resend, whether or
+    /// not it's eventually acked.
+    redelivered_messages: Arc<AtomicU64>,
+    /// Deliveries an `ack: true` subscription's forwarder gave up on
+    /// after exhausting every redelivery attempt without ever
+    /// receiving an ack (ADR-0041).
+    delivery_ack_timeouts: Arc<AtomicU64>,
 }
 
 impl Metrics {
@@ -84,6 +93,22 @@ impl Metrics {
         self.lag_recovered.fetch_add(count, Ordering::Relaxed);
     }
 
+    /// Records that `count` deliveries were resent by an `ack: true`
+    /// subscription's forwarder after their original delivery went
+    /// unacknowledged past the redelivery timeout (ADR-0041).
+    pub fn record_redelivered_messages(&self, count: u64) {
+        self.redelivered_messages
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
+    /// Records that `count` deliveries were given up on after
+    /// exhausting every redelivery attempt without ever being acked
+    /// (ADR-0041).
+    pub fn record_delivery_ack_timeouts(&self, count: u64) {
+        self.delivery_ack_timeouts
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
     fn forwarder_lag_total(&self) -> u64 {
         self.forwarder_lag.load(Ordering::Relaxed)
     }
@@ -106,6 +131,14 @@ impl Metrics {
 
     fn lag_recovered_total(&self) -> u64 {
         self.lag_recovered.load(Ordering::Relaxed)
+    }
+
+    fn redelivered_messages_total(&self) -> u64 {
+        self.redelivered_messages.load(Ordering::Relaxed)
+    }
+
+    fn delivery_ack_timeouts_total(&self) -> u64 {
+        self.delivery_ack_timeouts.load(Ordering::Relaxed)
     }
 }
 
@@ -134,6 +167,8 @@ pub fn summary(
         pattern_evictions_total: broker.pattern_evictions(),
         membership_evictions_total: membership.disconnected_evictions(),
         peer_directory_evictions_total: discover.evictions(),
+        redelivered_messages_total: metrics.redelivered_messages_total(),
+        delivery_ack_timeouts_total: metrics.delivery_ack_timeouts_total(),
     }
 }
 
@@ -170,7 +205,11 @@ pub fn render_prometheus(
          # TYPE thothmesh_membership_evictions_total counter\n\
          thothmesh_membership_evictions_total {}\n\
          # TYPE thothmesh_peer_directory_evictions_total counter\n\
-         thothmesh_peer_directory_evictions_total {}\n",
+         thothmesh_peer_directory_evictions_total {}\n\
+         # TYPE thothmesh_redelivered_messages_total counter\n\
+         thothmesh_redelivered_messages_total {}\n\
+         # TYPE thothmesh_delivery_ack_timeouts_total counter\n\
+         thothmesh_delivery_ack_timeouts_total {}\n",
         s.peers_connected,
         s.messages_published,
         s.forwarder_lag_total,
@@ -183,6 +222,8 @@ pub fn render_prometheus(
         s.pattern_evictions_total,
         s.membership_evictions_total,
         s.peer_directory_evictions_total,
+        s.redelivered_messages_total,
+        s.delivery_ack_timeouts_total,
     )
 }
 
@@ -250,7 +291,23 @@ mod tests {
     }
 
     #[test]
-    fn render_prometheus_includes_all_twelve_metrics() {
+    fn record_redelivered_messages_accumulates() {
+        let metrics = Metrics::new();
+        metrics.record_redelivered_messages(2);
+        metrics.record_redelivered_messages(3);
+        assert_eq!(metrics.redelivered_messages_total(), 5);
+    }
+
+    #[test]
+    fn record_delivery_ack_timeouts_accumulates() {
+        let metrics = Metrics::new();
+        metrics.record_delivery_ack_timeouts(1);
+        metrics.record_delivery_ack_timeouts(1);
+        assert_eq!(metrics.delivery_ack_timeouts_total(), 2);
+    }
+
+    #[test]
+    fn render_prometheus_includes_all_fourteen_metrics() {
         let membership = Membership::new();
         membership.mark_connected(thoth_mesh_core::PeerId::new(), None);
         let broker = Broker::new();
@@ -262,6 +319,8 @@ mod tests {
         metrics.record_peer_topic_acl_rejection();
         metrics.record_replayed_messages(2);
         metrics.record_lag_recovered(5);
+        metrics.record_redelivered_messages(3);
+        metrics.record_delivery_ack_timeouts(1);
 
         let rendered = render_prometheus(&membership, &broker, &discover, &metrics);
 
@@ -282,6 +341,8 @@ mod tests {
         assert!(rendered.contains("thothmesh_peer_directory_evictions_total 0"));
         assert!(rendered.contains("thothmesh_replayed_messages_total 2"));
         assert!(rendered.contains("thothmesh_lag_recovered_total 5"));
+        assert!(rendered.contains("thothmesh_redelivered_messages_total 3"));
+        assert!(rendered.contains("thothmesh_delivery_ack_timeouts_total 1"));
     }
 
     #[test]
@@ -310,6 +371,8 @@ mod tests {
         assert_eq!(s.pattern_evictions_total, 0);
         assert_eq!(s.membership_evictions_total, 0);
         assert_eq!(s.peer_directory_evictions_total, 0);
+        assert_eq!(s.redelivered_messages_total, 0);
+        assert_eq!(s.delivery_ack_timeouts_total, 0);
 
         let rendered = render_prometheus(&membership, &broker, &discover, &metrics);
         assert!(rendered.contains("thothmesh_peers_connected 1"));

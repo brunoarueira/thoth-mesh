@@ -21,8 +21,9 @@ peer-link authorization),
 [ADR-0021](docs/adr/0021-message-replay-ring-buffer.md) (replay for
 late subscribers), and
 [ADR-0022](docs/adr/0022-wildcard-topic-filters.md) (wildcard topic
-filters). For diagrams of several of these flows, see
-[docs/FLOWS.md](docs/FLOWS.md).
+filters), and [ADR-0041](docs/adr/0041-at-least-once-delivery-with-ack-based-redelivery.md)
+(at-least-once delivery with ack-based redelivery). For diagrams of
+several of these flows, see [docs/FLOWS.md](docs/FLOWS.md).
 
 **Status:** version 1, and explicitly unstable — see ADR-0014. Nothing
 here should be assumed to hold across a breaking change; check
@@ -202,7 +203,7 @@ reply. See [Delivery semantics](#delivery-semantics) for what
 ### `Subscribe`
 
 ```
-{"Subscribe": {"filter": <TopicFilter>}}
+{"Subscribe": {"filter": <TopicFilter>, "ack": <bool>}}
 ```
 
 Registers interest in `filter` on this connection - a literal topic
@@ -214,7 +215,29 @@ connection's role, regardless of what it would actually expand to -
 neither ACL is pattern-aware, and this codebase doesn't attempt to
 make one covering-pattern imply anything about another. Sending
 `Subscribe` for a filter this connection is already subscribed to is a
-no-op (still gets an `Ack`).
+no-op (still gets an `Ack`) - including for `ack`: it's only read the
+first time a filter is subscribed to, the same as everything else a
+no-op re-`Subscribe` doesn't retroactively change.
+
+`ack` opts this subscription into at-least-once delivery
+([ADR-0041](docs/adr/0041-at-least-once-delivery-with-ack-based-redelivery.md)):
+every `Publish` delivered for it is held until the receiver sends back
+an `Ack` naming that delivery's own `id` (see [`Ack`](#ack) below), and
+redelivered - the exact same envelope, `id` included, so a receiver
+can't tell a redelivery apart from a first delivery except by having
+already seen that `id` - if no `Ack` arrives in time. `#[serde(default)]`
+on the implementation side: a sender that omits `ack` entirely (every
+sender that predates ADR-0041) gets `false`, unchanged fire-and-forget
+behavior. `ack: true` is a *per-subscription* opt-in - a client
+watching several filters over one connection (ADR-0033) can request it
+for only some of them - and applies only to the direct connection
+between a node and its subscriber: a `Subscribe` a peer link sends to
+propagate interest onward (ADR-0011) always carries `ack: false`,
+regardless of what any client subscription behind it asked for. There
+is no dead-letter destination once redelivery attempts are exhausted -
+the message is simply dropped, and counted (see
+`thothmesh_delivery_ack_timeouts_total` in
+[OPERATIONS.md](docs/OPERATIONS.md)).
 
 Immediately after the `Ack`, this node also delivers - as ordinary
 `Publish` messages - whatever it currently holds in a matching replay
@@ -226,7 +249,8 @@ no-op re-`Subscribe` above doesn't replay anything again. A wildcard
 filter's replay buffer only starts accumulating once *that exact
 filter string* has been subscribed to at least once - unlike a literal
 topic, there's no way to pre-buffer for a pattern nobody has used yet
-(see ADR-0022's Consequences).
+(see ADR-0022's Consequences). A replay-buffer delivery is held for
+acknowledgement exactly like a live one when `ack: true`.
 
 ### `Unsubscribe`
 
@@ -243,13 +267,22 @@ way as `Subscribe`.
 {"Ack": {"in_reply_to": <MessageId>}}
 ```
 
-Sent by a node in reply to a `Subscribe` or `Unsubscribe`,
-referencing the `id` of the envelope it's acknowledging. A client
-waiting on a `Subscribe`/`Unsubscribe` to take effect should wait for
-the `Ack` whose `in_reply_to` matches the request's `id` — other
-traffic (e.g. a `Publish` delivered on the same connection) can
-legitimately arrive first and should be skipped over, not treated as
-the reply.
+Sent in either direction, unambiguous by which:
+
+- **Node → client/peer**, in reply to a `Subscribe` or `Unsubscribe`,
+  referencing the `id` of the request it's acknowledging. A client
+  waiting on a `Subscribe`/`Unsubscribe` to take effect should wait
+  for the `Ack` whose `in_reply_to` matches the request's `id` — other
+  traffic (e.g. a `Publish` delivered on the same connection) can
+  legitimately arrive first and should be skipped over, not treated as
+  the reply.
+- **Client → node**, acknowledging an individual `Publish` delivery on
+  a subscription made with `ack: true` (see [`Subscribe`](#subscribe),
+  [ADR-0041](docs/adr/0041-at-least-once-delivery-with-ack-based-redelivery.md)) -
+  `in_reply_to` names the delivered `Publish` envelope's own `id`. A
+  node never sends a `Subscribe`/`Unsubscribe` to a client to
+  acknowledge, so there's no ambiguity between the two uses on either
+  side of a connection.
 
 ### `Error`
 
@@ -433,9 +466,20 @@ guarantee:
   within that memory window, not for the life of the mesh — a very
   old repeated `MessageId` after enough other traffic has gone by
   could in principle be treated as new again.
-- **No delivery confirmation for `Publish`.** Unlike `Subscribe`/
-  `Unsubscribe`, nothing acknowledges a `Publish` — not receipt by the
-  node it was sent to, and not delivery to any subscriber.
+- **No delivery confirmation for `Publish` by default - opt-in per
+  subscription.** Nothing acknowledges receipt of a `Publish` by the
+  node it was sent to - a publisher never learns whether anyone
+  actually got it, with or without `ack`. What `ack: true` on a
+  `Subscribe` adds is at-least-once delivery *to that one
+  subscription*: the node holds each delivery until the subscriber
+  sends back an `Ack`, redelivering (the same envelope, same `id`) on
+  a timeout, up to a bounded number of attempts, after which it gives
+  up (see [ADR-0041](docs/adr/0041-at-least-once-delivery-with-ack-based-redelivery.md)).
+  This is a single-hop guarantee between a node and its direct
+  subscriber - interest propagated across a peer link (ADR-0011) is
+  always `ack: false`, so it doesn't extend across a multi-hop
+  forward. Without `ack: true`, delivery remains exactly as before:
+  fire-and-forget, once, best-effort.
 - **A connection with overlapping subscriptions gets more than one
   delivery.** A literal `Subscribe` and a wildcard `Subscribe` that
   both happen to match the same published topic are independent
