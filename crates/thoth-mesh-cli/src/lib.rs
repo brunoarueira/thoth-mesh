@@ -97,6 +97,14 @@ pub enum Command {
         /// ADR-0035).
         #[arg(long, value_enum, default_value_t = OutputMode::Text)]
         output: OutputMode,
+        /// Opt this subscription into at-least-once delivery: every
+        /// delivered message is acknowledged automatically right
+        /// after being printed, and the node redelivers anything it
+        /// doesn't hear an ack back for in time (possibly more than
+        /// once - a redundant redelivery isn't distinguished from a
+        /// fresh one). See ADR-0041.
+        #[arg(long)]
+        ack: bool,
     },
     /// Print a tab-completion script for `shell` to stdout, then exit.
     /// See ADR-0036 for how to install the result.
@@ -171,12 +179,16 @@ pub async fn run(cli: Cli) -> std::io::Result<()> {
             let envelope = Envelope::new(sender, MessageKind::Publish { topic, payload });
             send(&mut conn, &envelope).await
         }
-        Command::Subscribe { filters, output } => {
+        Command::Subscribe {
+            filters,
+            output,
+            ack,
+        } => {
             let filters = filters
                 .iter()
                 .map(|filter| parse_filter(filter))
                 .collect::<std::io::Result<Vec<_>>>()?;
-            subscribe_and_print(&mut conn, sender, filters, output).await
+            subscribe_and_print(&mut conn, sender, filters, output, ack).await
         }
         Command::Status => status_and_print(&mut conn, sender).await,
         Command::Completions { .. } => unreachable!("returned above"),
@@ -214,14 +226,19 @@ async fn read_payload(
 
 /// Sends a `Subscribe` for every filter in `filters`, waits until each
 /// has been acked, then prints every delivered message (per `output`,
-/// see [`OutputMode`]) until interrupted (Ctrl-C).
+/// see [`OutputMode`]) until interrupted (Ctrl-C). `ack` opts every
+/// filter into at-least-once delivery (ADR-0041): each `Subscribe`
+/// carries `ack: true`, and this invocation auto-acks a message right
+/// after printing it - not after any other condition, since v1 has no
+/// notion of "processing" beyond printing.
 async fn subscribe_and_print(
     conn: &mut Compat<MaybeTlsStream>,
     sender: PeerId,
     filters: Vec<TopicFilter>,
     output: OutputMode,
+    ack: bool,
 ) -> std::io::Result<()> {
-    let backlog = subscribe_all(conn, sender, &filters).await?;
+    let backlog = subscribe_all(conn, sender, &filters, ack).await?;
     let list = filters
         .iter()
         .map(TopicFilter::to_string)
@@ -239,32 +256,61 @@ async fn subscribe_and_print(
     // another filter's ack (see its own doc comment) is real,
     // already-received traffic - print it before falling into the
     // live loop below, in the order it actually arrived.
-    for envelope in backlog {
-        print_if_publish(envelope, output)?;
+    for envelope in &backlog {
+        print_and_maybe_ack(conn, sender, envelope, output, ack).await?;
     }
 
     loop {
         tokio::select! {
-            envelope = recv(conn) => print_if_publish(envelope?, output)?,
+            envelope = recv(conn) => {
+                let envelope = envelope?;
+                print_and_maybe_ack(conn, sender, &envelope, output, ack).await?;
+            }
             _ = tokio::signal::ctrl_c() => return Ok(()),
         }
     }
 }
 
-fn print_if_publish(envelope: Envelope, output: OutputMode) -> std::io::Result<()> {
-    let MessageKind::Publish { topic, payload } = envelope.kind else {
-        return Ok(());
+/// Prints `envelope` (a no-op unless it's a `Publish`, see
+/// [`print_if_publish`]), then, if `ack` is set and it was printed,
+/// sends an `Ack` naming its own `MessageId` right back - `ack`'s
+/// whole point is to close the gap between "delivered" and
+/// "acknowledged" as tightly as this CLI can (ADR-0041).
+async fn print_and_maybe_ack(
+    conn: &mut Compat<MaybeTlsStream>,
+    sender: PeerId,
+    envelope: &Envelope,
+    output: OutputMode,
+    ack: bool,
+) -> std::io::Result<()> {
+    if let Some(id) = print_if_publish(envelope, output)?
+        && ack
+    {
+        let reply = Envelope::new(sender, MessageKind::Ack { in_reply_to: id });
+        send(conn, &reply).await?;
+    }
+    Ok(())
+}
+
+/// Prints `envelope` if it's a `Publish` (per `output`, see
+/// [`OutputMode`]); anything else is silently ignored. Returns the
+/// envelope's own `MessageId` when it was printed, `None` otherwise -
+/// what [`print_and_maybe_ack`] acks, and only ever a `Publish`'s own
+/// ID (ADR-0041).
+fn print_if_publish(envelope: &Envelope, output: OutputMode) -> std::io::Result<Option<MessageId>> {
+    let MessageKind::Publish { topic, payload } = &envelope.kind else {
+        return Ok(None);
     };
     match output {
-        OutputMode::Text => println!("[{topic}] {}", String::from_utf8_lossy(&payload)),
+        OutputMode::Text => println!("[{topic}] {}", String::from_utf8_lossy(payload)),
         OutputMode::Raw => {
             eprintln!("[{topic}] {} bytes", payload.len());
             let mut stdout = std::io::stdout();
-            stdout.write_all(&payload)?;
+            stdout.write_all(payload)?;
             stdout.flush()?;
         }
     }
-    Ok(())
+    Ok(Some(envelope.id))
 }
 
 /// Sends a `Subscribe` for `filter` and waits for the matching `Ack` -
@@ -284,7 +330,7 @@ async fn subscribe(
     sender: PeerId,
     filter: TopicFilter,
 ) -> std::io::Result<()> {
-    let envelope = Envelope::new(sender, MessageKind::Subscribe { filter });
+    let envelope = Envelope::new(sender, MessageKind::Subscribe { filter, ack: false });
     send(conn, &envelope).await?;
     loop {
         let received = recv(conn).await?;
@@ -326,6 +372,7 @@ async fn subscribe_all(
     conn: &mut Compat<MaybeTlsStream>,
     sender: PeerId,
     filters: &[TopicFilter],
+    ack: bool,
 ) -> std::io::Result<Vec<Envelope>> {
     let mut pending: HashSet<MessageId> = HashSet::new();
     for filter in filters {
@@ -333,6 +380,7 @@ async fn subscribe_all(
             sender,
             MessageKind::Subscribe {
                 filter: filter.clone(),
+                ack,
             },
         );
         send(conn, &envelope).await?;
@@ -453,6 +501,8 @@ fn print_status(reply: &StatusReply) {
             "peer_directory_evictions_total",
             m.peer_directory_evictions_total,
         ),
+        ("redelivered_messages_total", m.redelivered_messages_total),
+        ("delivery_ack_timeouts_total", m.delivery_ack_timeouts_total),
     ] {
         println!("  {name:<32} {value}");
     }
@@ -846,6 +896,7 @@ mod tests {
             command: Command::Subscribe {
                 filters: vec!["weather.#.updates".to_owned()],
                 output: OutputMode::Text,
+                ack: false,
             },
         };
         let err = timeout(TEST_TIMEOUT, run(cli))
@@ -948,6 +999,7 @@ mod tests {
                 &mut client,
                 PeerId::new(),
                 &[weather.clone(), traffic.clone()],
+                false,
             ),
         )
         .await
@@ -1058,7 +1110,12 @@ mod tests {
         let traffic: TopicFilter = "traffic.updates".parse().unwrap();
         let backlog = timeout(
             TEST_TIMEOUT,
-            subscribe_all(&mut client, PeerId::new(), &[weather.clone(), traffic]),
+            subscribe_all(
+                &mut client,
+                PeerId::new(),
+                &[weather.clone(), traffic],
+                false,
+            ),
         )
         .await
         .expect("timed out waiting for the batch ack")
@@ -1103,7 +1160,7 @@ mod tests {
         let secret: TopicFilter = "secret.topic".parse().unwrap();
         let err = timeout(
             TEST_TIMEOUT,
-            subscribe_all(&mut client, PeerId::new(), &[weather, secret]),
+            subscribe_all(&mut client, PeerId::new(), &[weather, secret], false),
         )
         .await
         .expect("timed out waiting for the rejection")

@@ -31,6 +31,7 @@ pub mod metrics;
 mod metrics_server;
 mod peer_links;
 mod peering;
+mod redelivery;
 mod shared;
 mod tls_config;
 mod topic_acl;
