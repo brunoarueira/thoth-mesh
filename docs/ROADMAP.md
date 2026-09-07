@@ -241,6 +241,15 @@ that only show up in a real topology.
 - Worth documenting explicitly: a traced message re-entering an
   already-visited node is exactly the case loop-prevention
   (ADR-0011) exists for.
+- Likely mechanism: OpenTelemetry tracing via `tracing-opentelemetry`,
+  bridging the `tracing` spans this codebase already instruments
+  connections/forwarders with (see ADR-0007 and friends) into real
+  OTel spans, exportable to a real backend (Jaeger, Tempo, etc.) -
+  rather than a bespoke trace format. This is scoped to *tracing*
+  specifically; metrics stay the hand-rolled Prometheus exposition
+  (ADR-0013) - OpenTelemetry's metrics SDK is export-oriented and
+  doesn't fit `status`'s (ADR-0037) need to read a counter's current
+  value back out synchronously.
 
 ## Phase 18 — Protocol version negotiation
 
