@@ -200,6 +200,11 @@ too long loses everything in between.
 - Durable subscriptions / consumer offsets — reconnecting resumes
   exactly where a subscriber left off.
 - Message TTL / dead-lettering for payloads nobody ever consumes.
+- Work-queue redelivery for consumer groups (ADR-0042) — today a
+  message routed to a group member that dies before processing it is
+  simply lost; this phase's durable log is what a claim/lease/requeue
+  model (reclaimable by a *different* live member, not just the
+  original recipient) would need to be built on.
 
 ## Phase 15 — Federation-specific routing
 
