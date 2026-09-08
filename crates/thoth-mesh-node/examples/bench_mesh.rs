@@ -139,6 +139,7 @@ async fn run_once(hops: usize) -> BenchResult {
         MessageKind::Subscribe {
             filter: topic.clone().into(),
             ack: false,
+            group: None,
         },
     );
     send(&mut subscriber, &sub).await;

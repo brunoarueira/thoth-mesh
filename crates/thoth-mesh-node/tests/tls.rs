@@ -188,6 +188,7 @@ async fn two_tls_nodes_federate_and_a_tls_client_publishes_and_subscribes() {
         MessageKind::Subscribe {
             filter: topic("weather.updates").into(),
             ack: false,
+            group: None,
         },
     );
     send(&mut subscriber, &sub).await;
@@ -416,6 +417,7 @@ async fn topic_acl_distinguishes_principals_by_certificate_fingerprint() {
         MessageKind::Subscribe {
             filter: topic("sensors.data").into(),
             ack: false,
+            group: None,
         },
     );
     send(&mut subscriber, &sub).await;
@@ -575,6 +577,7 @@ async fn a_publish_with_a_mismatched_sender_is_corrected_to_the_authenticated_id
         MessageKind::Subscribe {
             filter: topic("weather.updates").into(),
             ack: false,
+            group: None,
         },
     );
     send(&mut subscriber, &sub).await;

@@ -102,6 +102,17 @@ pub enum MessageKind {
         /// unchanged fire-and-forget behavior. See ADR-0041.
         #[serde(default)]
         ack: bool,
+        /// Joins the named consumer group for `filter` instead of
+        /// ordinary fan-out: each matching `Publish` goes to exactly
+        /// one currently-live member of the group, round-robin,
+        /// rather than every subscriber. `#[serde(default)]`, same
+        /// rolling-upgrade story as `ack` - an older sender omitting
+        /// this field decodes as `None`, unchanged fan-out behavior.
+        /// Combining this with `ack: true` is refused (see `Error`)
+        /// rather than guessing at what "acked" means for a group.
+        /// See ADR-0042.
+        #[serde(default)]
+        group: Option<String>,
     },
     /// Unsubscribe from a topic filter previously subscribed to.
     Unsubscribe { filter: TopicFilter },
@@ -175,10 +186,17 @@ mod tests {
             MessageKind::Subscribe {
                 filter: topic.clone().into(),
                 ack: false,
+                group: None,
             },
             MessageKind::Subscribe {
                 filter: topic.clone().into(),
                 ack: true,
+                group: None,
+            },
+            MessageKind::Subscribe {
+                filter: topic.clone().into(),
+                ack: false,
+                group: Some("workers".to_owned()),
             },
             MessageKind::Unsubscribe {
                 filter: topic.into(),
@@ -253,6 +271,48 @@ mod tests {
         )
         .unwrap();
         let decoded: MessageKind = ciborium::from_reader(&bytes[..]).unwrap();
-        assert_eq!(decoded, MessageKind::Subscribe { filter, ack: false });
+        assert_eq!(
+            decoded,
+            MessageKind::Subscribe {
+                filter,
+                ack: false,
+                group: None,
+            }
+        );
+    }
+
+    /// Same as `subscribe_without_an_ack_field_decodes_as_not_acked`,
+    /// for `group` (ADR-0042): a sender that predates the field - or
+    /// one from just after ADR-0041 that has `ack` but not yet
+    /// `group` - still decodes, defaulting to `group: None` (ordinary
+    /// fan-out).
+    #[test]
+    fn subscribe_without_a_group_field_decodes_as_no_group() {
+        let topic = Topic::from_str("weather.updates").unwrap();
+        let filter: TopicFilter = topic.into();
+
+        #[derive(Serialize)]
+        enum PreAdr0042 {
+            Subscribe { filter: TopicFilter, ack: bool },
+        }
+
+        let mut bytes = Vec::new();
+        ciborium::into_writer(
+            &PreAdr0042::Subscribe {
+                filter: filter.clone(),
+                ack: true,
+            },
+            &mut bytes,
+        )
+        .unwrap();
+        let decoded: MessageKind = ciborium::from_reader(&bytes[..]).unwrap();
+        assert_eq!(
+            decoded,
+            MessageKind::Subscribe {
+                filter,
+                ack: true,
+                group: None,
+            }
+        );
     }
 }

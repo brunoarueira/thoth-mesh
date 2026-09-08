@@ -124,6 +124,7 @@ async fn a_listed_subscribe_and_publish_still_work_normally() {
         MessageKind::Subscribe {
             filter: topic("weather.updates").into(),
             ack: false,
+            group: None,
         },
     );
     send(&mut subscriber, &sub).await;
@@ -158,6 +159,7 @@ async fn subscribing_to_an_unlisted_topic_is_rejected_but_the_connection_stays_o
         MessageKind::Subscribe {
             filter: topic("secret.topic").into(),
             ack: false,
+            group: None,
         },
     );
     send(&mut client, &rejected).await;
@@ -174,6 +176,7 @@ async fn subscribing_to_an_unlisted_topic_is_rejected_but_the_connection_stays_o
         MessageKind::Subscribe {
             filter: topic("weather.updates").into(),
             ack: false,
+            group: None,
         },
     );
     send(&mut client, &allowed).await;
@@ -199,6 +202,7 @@ async fn publishing_without_permission_is_rejected_and_never_reaches_a_subscribe
         MessageKind::Subscribe {
             filter: topic("guarded.topic").into(),
             ack: false,
+            group: None,
         },
     );
     send(&mut subscriber, &sub).await;
@@ -243,6 +247,7 @@ async fn subscribing_to_a_wildcard_filter_is_rejected_when_a_topic_acl_is_config
         MessageKind::Subscribe {
             filter: filter("weather.+"),
             ack: false,
+            group: None,
         },
     );
     send(&mut client, &rejected).await;
@@ -258,6 +263,7 @@ async fn subscribing_to_a_wildcard_filter_is_rejected_when_a_topic_acl_is_config
         MessageKind::Subscribe {
             filter: topic("weather.updates").into(),
             ack: false,
+            group: None,
         },
     );
     send(&mut client, &allowed).await;
@@ -283,6 +289,7 @@ async fn a_peer_link_permitted_to_subscribe_receives_the_forwarded_publish() {
         MessageKind::Subscribe {
             filter: topic("weather.updates").into(),
             ack: false,
+            group: None,
         },
     );
     send(&mut peer, &sub).await;
@@ -325,6 +332,7 @@ async fn a_peer_link_denied_subscribe_is_rejected_and_never_forwarded_to() {
         MessageKind::Subscribe {
             filter: topic("weather.updates").into(),
             ack: false,
+            group: None,
         },
     );
     send(&mut peer, &rejected).await;
@@ -362,6 +370,7 @@ async fn a_peer_links_wildcard_subscribe_is_rejected_when_a_peer_topic_acl_is_co
         MessageKind::Subscribe {
             filter: filter("weather.+"),
             ack: false,
+            group: None,
         },
     );
     send(&mut peer, &rejected).await;
@@ -384,6 +393,7 @@ async fn a_peer_link_permitted_to_publish_is_delivered_to_a_subscriber() {
         MessageKind::Subscribe {
             filter: topic("weather.updates").into(),
             ack: false,
+            group: None,
         },
     );
     send(&mut subscriber, &sub).await;
@@ -423,6 +433,7 @@ async fn a_peer_link_denied_publish_is_rejected_and_never_reaches_a_subscriber()
         MessageKind::Subscribe {
             filter: topic("weather.updates").into(),
             ack: false,
+            group: None,
         },
     );
     send(&mut subscriber, &sub).await;
@@ -470,6 +481,7 @@ async fn a_peer_topic_acl_does_not_restrict_an_ordinary_client() {
         MessageKind::Subscribe {
             filter: topic("unrelated.topic").into(),
             ack: false,
+            group: None,
         },
     );
     send(&mut subscriber, &sub).await;

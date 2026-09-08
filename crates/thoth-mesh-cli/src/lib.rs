@@ -105,6 +105,14 @@ pub enum Command {
         /// fresh one). See ADR-0041.
         #[arg(long)]
         ack: bool,
+        /// Join this named consumer group for every filter given,
+        /// instead of ordinary fan-out: each matching message goes to
+        /// exactly one currently-live group member, round-robin, not
+        /// every subscriber. Combining this with `--ack` is refused
+        /// by the node - what acknowledgement means for a group isn't
+        /// defined yet. See ADR-0042.
+        #[arg(long)]
+        group: Option<String>,
     },
     /// Print a tab-completion script for `shell` to stdout, then exit.
     /// See ADR-0036 for how to install the result.
@@ -183,12 +191,13 @@ pub async fn run(cli: Cli) -> std::io::Result<()> {
             filters,
             output,
             ack,
+            group,
         } => {
             let filters = filters
                 .iter()
                 .map(|filter| parse_filter(filter))
                 .collect::<std::io::Result<Vec<_>>>()?;
-            subscribe_and_print(&mut conn, sender, filters, output, ack).await
+            subscribe_and_print(&mut conn, sender, filters, output, ack, group).await
         }
         Command::Status => status_and_print(&mut conn, sender).await,
         Command::Completions { .. } => unreachable!("returned above"),
@@ -230,15 +239,20 @@ async fn read_payload(
 /// filter into at-least-once delivery (ADR-0041): each `Subscribe`
 /// carries `ack: true`, and this invocation auto-acks a message right
 /// after printing it - not after any other condition, since v1 has no
-/// notion of "processing" beyond printing.
+/// notion of "processing" beyond printing. `group` joins every filter
+/// to that named consumer group instead of ordinary fan-out
+/// (ADR-0042); combined with `ack`, the node refuses the request
+/// (surfaced as an `Err` here, same as any other `Subscribe`
+/// rejection) rather than this CLI guessing at what's supported.
 async fn subscribe_and_print(
     conn: &mut Compat<MaybeTlsStream>,
     sender: PeerId,
     filters: Vec<TopicFilter>,
     output: OutputMode,
     ack: bool,
+    group: Option<String>,
 ) -> std::io::Result<()> {
-    let backlog = subscribe_all(conn, sender, &filters, ack).await?;
+    let backlog = subscribe_all(conn, sender, &filters, ack, group).await?;
     let list = filters
         .iter()
         .map(TopicFilter::to_string)
@@ -330,7 +344,14 @@ async fn subscribe(
     sender: PeerId,
     filter: TopicFilter,
 ) -> std::io::Result<()> {
-    let envelope = Envelope::new(sender, MessageKind::Subscribe { filter, ack: false });
+    let envelope = Envelope::new(
+        sender,
+        MessageKind::Subscribe {
+            filter,
+            ack: false,
+            group: None,
+        },
+    );
     send(conn, &envelope).await?;
     loop {
         let received = recv(conn).await?;
@@ -373,6 +394,7 @@ async fn subscribe_all(
     sender: PeerId,
     filters: &[TopicFilter],
     ack: bool,
+    group: Option<String>,
 ) -> std::io::Result<Vec<Envelope>> {
     let mut pending: HashSet<MessageId> = HashSet::new();
     for filter in filters {
@@ -381,6 +403,7 @@ async fn subscribe_all(
             MessageKind::Subscribe {
                 filter: filter.clone(),
                 ack,
+                group: group.clone(),
             },
         );
         send(conn, &envelope).await?;
@@ -897,6 +920,7 @@ mod tests {
                 filters: vec!["weather.#.updates".to_owned()],
                 output: OutputMode::Text,
                 ack: false,
+                group: None,
             },
         };
         let err = timeout(TEST_TIMEOUT, run(cli))
@@ -1000,6 +1024,7 @@ mod tests {
                 PeerId::new(),
                 &[weather.clone(), traffic.clone()],
                 false,
+                None,
             ),
         )
         .await
@@ -1115,6 +1140,7 @@ mod tests {
                 PeerId::new(),
                 &[weather.clone(), traffic],
                 false,
+                None,
             ),
         )
         .await
@@ -1160,7 +1186,7 @@ mod tests {
         let secret: TopicFilter = "secret.topic".parse().unwrap();
         let err = timeout(
             TEST_TIMEOUT,
-            subscribe_all(&mut client, PeerId::new(), &[weather, secret], false),
+            subscribe_all(&mut client, PeerId::new(), &[weather, secret], false, None),
         )
         .await
         .expect("timed out waiting for the rejection")
