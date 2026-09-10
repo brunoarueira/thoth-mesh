@@ -136,5 +136,13 @@ subscriber durable offsets are explicitly out of scope - that's #134.
   cap, and the "persist failure is logged, not fatal" behavior.
   No `PROTOCOL.md` change - this is node-local behavior, invisible on
   the wire.
-- Schema carries a `meta(key, value)` row `schema_version = "1"` so a
-  future format change has a migration hook.
+- The DDL lives in `crates/thoth-mesh-node/src/schema.sql` (a real
+  SQL file, `include_str!`'d and applied idempotently on open), not
+  inline Rust string literals, so it gets proper syntax highlighting
+  and review. It carries a `meta(key, value)` row `schema_version = "1"`.
+  There is one schema version and no migrations; a real migration
+  mechanism (ordered `.sql` files, a runner that reads
+  `schema_version`) is deliberately deferred until a second version
+  is actually needed - #134's durable consumer offsets, which add
+  tables, are the expected forcing function, and it warrants its own
+  ADR then.

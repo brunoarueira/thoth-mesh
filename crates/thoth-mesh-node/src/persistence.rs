@@ -3,14 +3,11 @@
 //! `--data-dir`.
 //!
 //! The database is a plain SQLite file an operator can inspect with
-//! any SQLite tool and back up with `VACUUM INTO`. Schema:
-//!
-//! - `messages(seq, topic, ts, envelope)` - one row per distinct
-//!   publish, `envelope` the CBOR-encoded [`Envelope`]. Pruned to the
-//!   newest [`DEFAULT_PERSISTED_MESSAGES_PER_TOPIC`] per topic.
-//! - `retained(topic, envelope)` - the current retained message per
-//!   topic (ADR-0043), never pruned by retention.
-//! - `meta(key, value)` - carries `schema_version`.
+//! any SQLite tool and back up with `VACUUM INTO`. The schema lives in
+//! `schema.sql` (a real, reviewable SQL file, `include_str!`'d here
+//! and applied idempotently on open) rather than inline string
+//! literals; a real migration mechanism is deferred until a second
+//! schema version is actually needed - see the note in that file.
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -34,7 +31,15 @@ pub const DEFAULT_PERSISTED_MESSAGES_PER_TOPIC: usize = 100_000;
 /// at startup), rather than after every single one.
 const PRUNE_EVERY: u64 = 1000;
 
+/// The schema version this build's `schema.sql` creates. Written into
+/// the `meta` table on first open; a future migration mechanism will
+/// compare against it.
 const SCHEMA_VERSION: &str = "1";
+
+/// The DDL applied (idempotently) on every open. A real `.sql` file
+/// so it gets syntax highlighting and proper review, not a Rust
+/// string literal.
+const SCHEMA: &str = include_str!("schema.sql");
 
 /// A durable message log backed by a single SQLite file.
 pub struct SqliteStore {
@@ -54,26 +59,7 @@ impl SqliteStore {
     pub fn open(dir: &Path) -> std::io::Result<Self> {
         std::fs::create_dir_all(dir)?;
         let conn = Connection::open(dir.join("messages.db")).map_err(to_io)?;
-        conn.execute_batch(
-            "PRAGMA journal_mode = WAL;
-             PRAGMA synchronous = NORMAL;
-             CREATE TABLE IF NOT EXISTS meta (
-                 key   TEXT PRIMARY KEY,
-                 value TEXT NOT NULL
-             );
-             CREATE TABLE IF NOT EXISTS messages (
-                 seq      INTEGER PRIMARY KEY AUTOINCREMENT,
-                 topic    TEXT    NOT NULL,
-                 ts       INTEGER NOT NULL,
-                 envelope BLOB    NOT NULL
-             );
-             CREATE INDEX IF NOT EXISTS messages_topic_seq ON messages (topic, seq);
-             CREATE TABLE IF NOT EXISTS retained (
-                 topic    TEXT PRIMARY KEY,
-                 envelope BLOB NOT NULL
-             );",
-        )
-        .map_err(to_io)?;
+        conn.execute_batch(SCHEMA).map_err(to_io)?;
         conn.execute(
             "INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?1)",
             [SCHEMA_VERSION],
