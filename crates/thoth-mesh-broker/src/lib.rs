@@ -55,6 +55,31 @@ pub const DEFAULT_REPLAY_BUFFER_CAPACITY: usize = 1024;
 /// unbounded on purpose. Not currently configurable via a CLI flag.
 pub const DEFAULT_TOPIC_MAP_CAPACITY: usize = 4096;
 
+/// A durable sink for published messages (ADR-0045). Implemented by
+/// `thoth-mesh-node`'s SQLite-backed store; the broker only knows this
+/// trait, never the storage engine.
+///
+/// Methods are synchronous - `Broker::publish` calls [`append`](Self::append)
+/// from `tokio::task::spawn_blocking`, and [`load_recent`](Self::load_recent)/
+/// [`load_retained`](Self::load_retained) run once at startup before
+/// the node accepts connections.
+pub trait MessageStore: std::fmt::Debug + Send + Sync + 'static {
+    /// Durably record `envelope` (always a `Publish`). Called once per
+    /// distinct, non-duplicate publish, before any in-memory delivery.
+    /// A `retain: true` envelope also updates the topic's stored
+    /// retained message (an empty payload clears it - see ADR-0043).
+    fn append(&self, envelope: &Envelope) -> std::io::Result<()>;
+
+    /// Every topic's most recent `per_topic` messages, oldest-first
+    /// per topic - used to refill each topic's replay buffer
+    /// (ADR-0021) on startup.
+    fn load_recent(&self, per_topic: usize) -> std::io::Result<Vec<(Topic, Vec<Arc<Envelope>>)>>;
+
+    /// Every topic's current retained message (ADR-0043), for
+    /// refilling retained slots on startup.
+    fn load_retained(&self) -> std::io::Result<Vec<(Topic, Arc<Envelope>)>>;
+}
+
 /// An in-process pub/sub broker: routes published envelopes to the
 /// subscribers registered for their topic.
 ///
@@ -92,6 +117,15 @@ pub struct Broker {
     /// no genuinely-shared-read case here to justify the extra
     /// complexity.
     groups: Mutex<HashMap<GroupKey, GroupMembers>>,
+    /// Where each distinct publish is durably recorded (ADR-0045).
+    /// `None` - the default - is fully in-memory, exactly as before
+    /// this ADR; `Some` is wired by `thoth-mesh-node` when
+    /// `--data-dir` is set.
+    store: Option<Arc<dyn MessageStore>>,
+    /// How many publishes the store failed to durably record
+    /// (ADR-0045) - delivery still happened, but those messages
+    /// won't survive a restart. Always 0 with no store configured.
+    persist_failures: AtomicU64,
 }
 
 impl Default for Broker {
@@ -104,14 +138,60 @@ impl Default for Broker {
             topic_evictions: AtomicU64::new(0),
             pattern_evictions: AtomicU64::new(0),
             groups: Mutex::new(HashMap::new()),
+            store: None,
+            persist_failures: AtomicU64::new(0),
         }
     }
 }
 
 impl Broker {
-    /// Creates a new, empty broker.
+    /// Creates a new, empty broker with no durable store - fully
+    /// in-memory (ADR-0006/ADR-0021).
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A broker that also durably records every distinct publish to
+    /// `store` before delivering it, and whose replay buffers /
+    /// retained slots can be refilled from it on startup (ADR-0045).
+    pub fn with_store(store: Arc<dyn MessageStore>) -> Self {
+        Self {
+            store: Some(store),
+            ..Self::default()
+        }
+    }
+
+    /// Refills `topic`'s replay buffer with `envelopes` (oldest-first),
+    /// for startup rehydration from a [`MessageStore`] (ADR-0045).
+    /// Does not broadcast (there are no subscribers yet) and does not
+    /// touch the `seen` dedup set (a restart is a legitimate reset of
+    /// that bounded window - see ADR-0011). Caps at
+    /// [`DEFAULT_REPLAY_BUFFER_CAPACITY`], keeping the newest.
+    pub async fn rehydrate_buffer(&self, topic: &Topic, envelopes: Vec<Arc<Envelope>>) {
+        if envelopes.is_empty() {
+            return;
+        }
+        let channel = {
+            let mut topics = self.topics.write().await;
+            topics.get_or_insert(topic.clone(), &self.topic_evictions)
+        };
+        let mut state = channel.state.lock().unwrap();
+        for envelope in envelopes {
+            state.buffer.push_back(envelope);
+        }
+        while state.buffer.len() > DEFAULT_REPLAY_BUFFER_CAPACITY {
+            state.buffer.pop_front();
+        }
+    }
+
+    /// Sets `topic`'s retained message to `envelope`, for startup
+    /// rehydration from a [`MessageStore`] (ADR-0045).
+    pub async fn rehydrate_retained(&self, topic: &Topic, envelope: Arc<Envelope>) {
+        let channel = {
+            let mut topics = self.topics.write().await;
+            topics.get_or_insert(topic.clone(), &self.topic_evictions)
+        };
+        channel.state.lock().unwrap().retained = Some(envelope);
     }
 
     /// Subscribes to `filter`, returning its current replay backlog
@@ -249,6 +329,31 @@ impl Broker {
         }
         self.messages_published.fetch_add(1, Ordering::Relaxed);
 
+        // Durably record the message before delivering it (ADR-0045),
+        // on a blocking thread so the SQLite write doesn't stall the
+        // runtime. A failure is logged, not fatal - in-memory delivery
+        // still proceeds below, so a bad disk degrades durability
+        // rather than taking the node down.
+        if let Some(store) = &self.store {
+            let store = Arc::clone(store);
+            let envelope = Arc::clone(&envelope);
+            let recorded = match tokio::task::spawn_blocking(move || store.append(&envelope)).await
+            {
+                Ok(Ok(())) => true,
+                Ok(Err(err)) => {
+                    tracing::error!(%err, "failed to persist published message");
+                    false
+                }
+                Err(join_err) => {
+                    tracing::error!(%join_err, "message-persistence task panicked");
+                    false
+                }
+            };
+            if !recorded {
+                self.persist_failures.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
         // The retained effect (ADR-0043) is the exact topic's alone -
         // pattern channels never hold a retained value (see
         // `Broker::subscribe`), so they always get `retain: false`.
@@ -308,6 +413,12 @@ impl Broker {
     /// `patterns`.
     pub fn pattern_evictions(&self) -> u64 {
         self.pattern_evictions.load(Ordering::Relaxed)
+    }
+
+    /// How many publishes the configured [`MessageStore`] failed to
+    /// record (ADR-0045). Always 0 with no store.
+    pub fn persist_failures(&self) -> u64 {
+        self.persist_failures.load(Ordering::Relaxed)
     }
 }
 
@@ -1386,6 +1497,115 @@ mod tests {
         assert!(
             members[0].try_recv().is_err(),
             "a group member joining after a retained publish gets nothing"
+        );
+    }
+
+    /// A [`MessageStore`] that just records what `append` is handed,
+    /// and can replay a caller-supplied history back - enough to test
+    /// `Broker`'s side of ADR-0045 without a real database.
+    #[derive(Debug, Default)]
+    struct FakeStore {
+        appended: Mutex<Vec<Arc<Envelope>>>,
+        recent: Vec<(Topic, Vec<Arc<Envelope>>)>,
+        retained: Vec<(Topic, Arc<Envelope>)>,
+        fail: bool,
+    }
+
+    impl MessageStore for FakeStore {
+        fn append(&self, envelope: &Envelope) -> std::io::Result<()> {
+            if self.fail {
+                return Err(std::io::Error::other("boom"));
+            }
+            self.appended
+                .lock()
+                .unwrap()
+                .push(Arc::new(envelope.clone()));
+            Ok(())
+        }
+        fn load_recent(
+            &self,
+            _per_topic: usize,
+        ) -> std::io::Result<Vec<(Topic, Vec<Arc<Envelope>>)>> {
+            Ok(self.recent.clone())
+        }
+        fn load_retained(&self) -> std::io::Result<Vec<(Topic, Arc<Envelope>)>> {
+            Ok(self.retained.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn publish_records_every_distinct_message_to_the_store() {
+        let store = Arc::new(FakeStore::default());
+        let broker = Broker::with_store(store.clone());
+        let topic = Topic::from_str("weather.updates").unwrap();
+
+        let first = publish_envelope(&topic, b"sunny");
+        let second = publish_envelope(&topic, b"cloudy");
+        broker.publish(&topic, first.clone()).await;
+        broker.publish(&topic, second.clone()).await;
+        // A duplicate (same MessageId) is not re-recorded - it's
+        // dropped before delivery *and* before persistence (ADR-0011).
+        broker.publish(&topic, first.clone()).await;
+
+        let appended = store.appended.lock().unwrap();
+        assert_eq!(appended.len(), 2);
+        assert_eq!(appended[0].id, first.id);
+        assert_eq!(appended[1].id, second.id);
+        assert_eq!(broker.persist_failures(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_store_failure_is_counted_but_delivery_still_happens() {
+        let store = Arc::new(FakeStore {
+            fail: true,
+            ..FakeStore::default()
+        });
+        let broker = Broker::with_store(store);
+        let topic = Topic::from_str("weather.updates").unwrap();
+        let mut rx = subscribe_live(&broker, topic.clone()).await;
+
+        let envelope = publish_envelope(&topic, b"sunny");
+        let delivered = broker.publish(&topic, envelope.clone()).await;
+
+        assert_eq!(delivered, 1, "in-memory delivery still happens");
+        assert_eq!(rx.recv().await.unwrap().id, envelope.id);
+        assert_eq!(broker.persist_failures(), 1);
+    }
+
+    #[tokio::test]
+    async fn rehydrate_refills_the_replay_buffer_and_retained_slot() {
+        let topic = Topic::from_str("sensor.temp").unwrap();
+        let history = vec![
+            publish_envelope(&topic, b"20C"),
+            publish_envelope(&topic, b"21C"),
+        ];
+        let retained = retain_envelope(&topic, b"21C");
+        let store = Arc::new(FakeStore {
+            recent: vec![(topic.clone(), history.clone())],
+            retained: vec![(topic.clone(), retained.clone())],
+            ..FakeStore::default()
+        });
+        let broker = Broker::with_store(store.clone());
+
+        for (topic, envelopes) in store.load_recent(1024).unwrap() {
+            broker.rehydrate_buffer(&topic, envelopes).await;
+        }
+        for (topic, envelope) in store.load_retained().unwrap() {
+            broker.rehydrate_retained(&topic, envelope).await;
+        }
+
+        // A subscriber connecting after the rehydrate sees the
+        // rehydrated history as its replay backlog, with the rehydrated
+        // retained value folded in as the current value (ADR-0043's
+        // literal-subscribe behavior) - exactly as it would before a
+        // restart - and nothing was re-broadcast or re-persisted.
+        let (backlog, mut rx) = broker.subscribe(topic.clone().into()).await;
+        let ids: Vec<_> = backlog.iter().map(|e| e.id).collect();
+        assert_eq!(ids, vec![retained.id, history[0].id, history[1].id]);
+        assert!(rx.try_recv().is_err(), "rehydrate must not re-broadcast");
+        assert!(
+            store.appended.lock().unwrap().is_empty(),
+            "rehydrate must not re-persist"
         );
     }
 

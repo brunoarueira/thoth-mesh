@@ -50,6 +50,7 @@ thoth-mesh, using the format described in
 | [0042](0042-consumer-groups.md) | Consumer groups |
 | [0043](0043-retained-messages.md) | Retained (last-value) messages per topic |
 | [0044](0044-content-type-hint-on-publish.md) | Content-type hint on `Publish` |
+| [0045](0045-on-disk-message-persistence-via-sqlite.md) | On-disk message persistence via SQLite |
 
 To add a new one, copy the format of an existing ADR, number it
 sequentially, and set its status to `Accepted` once the decision is

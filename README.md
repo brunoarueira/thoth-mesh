@@ -9,9 +9,10 @@ deep on Rust (async networking, concurrency, protocol design, distributed
 systems) beyond CLI-toy scope.
 
 **Status:** early work in progress. A single node can broker pub/sub
-traffic over TCP end to end, and nodes federate over peer links with
-reconnect/backoff and basic metrics. See [the roadmap](docs/ROADMAP.md)
-for what's next. All crates are 0.x — the wire protocol and public
+traffic over TCP end to end, nodes federate over peer links with
+reconnect/backoff and basic metrics, and messages can optionally be
+persisted to an on-disk log that survives a restart. See
+[the roadmap](docs/ROADMAP.md) for what's next. All crates are 0.x — the wire protocol and public
 APIs are not yet stable (see ADR-0014).
 
 ## Layout

@@ -31,13 +31,16 @@ pub mod metrics;
 mod metrics_server;
 mod peer_links;
 mod peering;
+mod persistence;
 mod redelivery;
 mod shared;
 mod tls_config;
 mod topic_acl;
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use thoth_mesh_broker::{Broker, DEFAULT_REPLAY_BUFFER_CAPACITY, MessageStore};
 use thoth_mesh_core::PeerId;
 use thoth_mesh_tls::MaybeTlsStream;
 use tokio::net::TcpListener;
@@ -70,6 +73,63 @@ pub struct NodeOptions {
     /// a peer link is never checked against `topic_acl`, and a client
     /// connection is never checked against this.
     pub peer_topic_acl: Option<TopicAcl>,
+    /// Directory for the on-disk message store, `--data-dir` - see
+    /// ADR-0045. `None` (the default) keeps the node fully in-memory,
+    /// exactly as before that ADR: nothing is written, nothing
+    /// survives a restart.
+    pub data_dir: Option<PathBuf>,
+}
+
+/// Opens the on-disk message store for `data_dir` (ADR-0045), if one
+/// is configured, and swaps `shared.broker` for a store-backed
+/// broker. Returns the store so the caller can rehydrate from it
+/// before serving.
+fn attach_store(
+    shared: &mut Shared,
+    data_dir: Option<&Path>,
+) -> std::io::Result<Option<Arc<dyn MessageStore>>> {
+    let Some(dir) = data_dir else {
+        return Ok(None);
+    };
+    let store: Arc<dyn MessageStore> = Arc::new(persistence::SqliteStore::open(dir)?);
+    shared.broker = Arc::new(Broker::with_store(Arc::clone(&store)));
+    Ok(Some(store))
+}
+
+/// Refills the broker's replay buffers (ADR-0021) and retained slots
+/// (ADR-0043) from `store` so a restart is invisible to a later
+/// subscriber (ADR-0045). The blocking reads run on a blocking
+/// thread; the rehydrate calls back into the broker are cheap.
+async fn rehydrate_from_store(
+    broker: &Broker,
+    store: Arc<dyn MessageStore>,
+) -> std::io::Result<()> {
+    let (recent, retained) = tokio::task::spawn_blocking(move || {
+        Ok::<_, std::io::Error>((
+            store.load_recent(DEFAULT_REPLAY_BUFFER_CAPACITY)?,
+            store.load_retained()?,
+        ))
+    })
+    .await
+    .map_err(std::io::Error::other)??;
+
+    let mut messages = 0usize;
+    for (topic, envelopes) in recent {
+        messages += envelopes.len();
+        broker.rehydrate_buffer(&topic, envelopes).await;
+    }
+    let retained_topics = retained.len();
+    for (topic, envelope) in retained {
+        broker.rehydrate_retained(&topic, envelope).await;
+    }
+    if messages > 0 || retained_topics > 0 {
+        tracing::info!(
+            messages,
+            retained_topics,
+            "rehydrated broker state from the on-disk store"
+        );
+    }
+    Ok(())
 }
 
 /// Binds `addr` and serves connections until an unrecoverable listener
@@ -110,6 +170,7 @@ pub async fn run_with_tls(
     let node_id = PeerId::new();
     let my_listen_addr = listener.local_addr().ok().map(|addr| addr.to_string());
     let (mut shared, discovered_rx) = Shared::new_with_discovery(node_id, my_listen_addr);
+    let store = attach_store(&mut shared, options.data_dir.as_deref())?;
     if let Some(tls) = options.tls {
         let allowed_peers = tls.allowed_peers.clone();
         let (acceptor, connector, own_fingerprint) = tls.build()?;
@@ -123,6 +184,9 @@ pub async fn run_with_tls(
     }
     shared.topic_acl = options.topic_acl.map(Arc::new);
     shared.peer_topic_acl = options.peer_topic_acl.map(Arc::new);
+    if let Some(store) = store {
+        rehydrate_from_store(&shared.broker, store).await?;
+    }
     tokio::spawn(peering::spawn_discovery_dialer(
         discovered_rx,
         shared.clone(),
@@ -178,6 +242,7 @@ pub async fn serve_with_tls(
     let node_id = PeerId::new();
     let my_listen_addr = listener.local_addr().ok().map(|addr| addr.to_string());
     let (mut shared, discovered_rx) = Shared::new_with_discovery(node_id, my_listen_addr);
+    let store = attach_store(&mut shared, options.data_dir.as_deref())?;
     if let Some(tls) = options.tls {
         let allowed_peers = tls.allowed_peers.clone();
         let (acceptor, connector, own_fingerprint) = tls.build()?;
@@ -191,6 +256,9 @@ pub async fn serve_with_tls(
     }
     shared.topic_acl = options.topic_acl.map(Arc::new);
     shared.peer_topic_acl = options.peer_topic_acl.map(Arc::new);
+    if let Some(store) = store {
+        rehydrate_from_store(&shared.broker, store).await?;
+    }
     tokio::spawn(peering::spawn_discovery_dialer(
         discovered_rx,
         shared.clone(),
@@ -243,6 +311,7 @@ pub fn spawn_with_tls(
     let node_id = PeerId::new();
     let my_listen_addr = listener.local_addr().ok().map(|addr| addr.to_string());
     let (mut shared, discovered_rx) = Shared::new_with_discovery(node_id, my_listen_addr);
+    let store = attach_store(&mut shared, options.data_dir.as_deref())?;
     if let Some(tls) = options.tls {
         let allowed_peers = tls.allowed_peers.clone();
         let (acceptor, connector, own_fingerprint) = tls.build()?;
@@ -256,6 +325,18 @@ pub fn spawn_with_tls(
     }
     shared.topic_acl = options.topic_acl.map(Arc::new);
     shared.peer_topic_acl = options.peer_topic_acl.map(Arc::new);
+    if let Some(store) = store {
+        // spawn_with_tls isn't async; rehydration runs in the
+        // background. Every rehydrate_from_store consumer that needs
+        // the data visible *before* the first read uses the async
+        // run_with_tls/serve_with_tls path instead.
+        let broker = Arc::clone(&shared.broker);
+        tokio::spawn(async move {
+            if let Err(err) = rehydrate_from_store(&broker, store).await {
+                tracing::error!(%err, "rehydrating broker state from disk failed");
+            }
+        });
+    }
     tokio::spawn(peering::spawn_discovery_dialer(
         discovered_rx,
         shared.clone(),

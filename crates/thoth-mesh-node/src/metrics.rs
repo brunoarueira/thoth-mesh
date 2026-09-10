@@ -169,6 +169,7 @@ pub fn summary(
         peer_directory_evictions_total: discover.evictions(),
         redelivered_messages_total: metrics.redelivered_messages_total(),
         delivery_ack_timeouts_total: metrics.delivery_ack_timeouts_total(),
+        persist_failures_total: broker.persist_failures(),
     }
 }
 
@@ -209,7 +210,9 @@ pub fn render_prometheus(
          # TYPE thothmesh_redelivered_messages_total counter\n\
          thothmesh_redelivered_messages_total {}\n\
          # TYPE thothmesh_delivery_ack_timeouts_total counter\n\
-         thothmesh_delivery_ack_timeouts_total {}\n",
+         thothmesh_delivery_ack_timeouts_total {}\n\
+         # TYPE thothmesh_persist_failures_total counter\n\
+         thothmesh_persist_failures_total {}\n",
         s.peers_connected,
         s.messages_published,
         s.forwarder_lag_total,
@@ -224,6 +227,7 @@ pub fn render_prometheus(
         s.peer_directory_evictions_total,
         s.redelivered_messages_total,
         s.delivery_ack_timeouts_total,
+        s.persist_failures_total,
     )
 }
 
@@ -307,7 +311,7 @@ mod tests {
     }
 
     #[test]
-    fn render_prometheus_includes_all_fourteen_metrics() {
+    fn render_prometheus_includes_all_fifteen_metrics() {
         let membership = Membership::new();
         membership.mark_connected(thoth_mesh_core::PeerId::new(), None);
         let broker = Broker::new();
@@ -343,6 +347,8 @@ mod tests {
         assert!(rendered.contains("thothmesh_lag_recovered_total 5"));
         assert!(rendered.contains("thothmesh_redelivered_messages_total 3"));
         assert!(rendered.contains("thothmesh_delivery_ack_timeouts_total 1"));
+        // A broker with no configured store never fails to persist.
+        assert!(rendered.contains("thothmesh_persist_failures_total 0"));
     }
 
     #[test]
@@ -373,6 +379,7 @@ mod tests {
         assert_eq!(s.peer_directory_evictions_total, 0);
         assert_eq!(s.redelivered_messages_total, 0);
         assert_eq!(s.delivery_ack_timeouts_total, 0);
+        assert_eq!(s.persist_failures_total, 0);
 
         let rendered = render_prometheus(&membership, &broker, &discover, &metrics);
         assert!(rendered.contains("thothmesh_peers_connected 1"));

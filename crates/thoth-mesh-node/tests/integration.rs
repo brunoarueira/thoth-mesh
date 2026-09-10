@@ -1409,3 +1409,107 @@ async fn status_request_reports_a_metrics_summary_reflecting_activity() {
         other => panic!("expected a StatusReply, got {other:?}"),
     }
 }
+
+/// A node run with `--data-dir` persists every publish to disk, and a
+/// fresh node pointed at the same directory rehydrates its replay
+/// buffers and retained values from it (ADR-0045) - so a restart is
+/// invisible to a subscriber that connects afterward.
+#[tokio::test]
+async fn a_restarted_node_rehydrates_replay_history_and_retained_values_from_disk() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let opts = || thoth_mesh_node::NodeOptions {
+        data_dir: Some(data_dir.path().to_path_buf()),
+        ..Default::default()
+    };
+
+    // --- node A: publish a retained value and a plain message ---
+    let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_a = listener_a.local_addr().unwrap();
+    let node_a = tokio::spawn(thoth_mesh_node::serve_with_tls(
+        listener_a,
+        Vec::new(),
+        opts(),
+    ));
+
+    let mut publisher = connect(addr_a).await;
+    let retained = Envelope::new(
+        PeerId::new(),
+        MessageKind::Publish {
+            topic: topic("sensor.temp"),
+            payload: b"21C".to_vec(),
+            retain: true,
+            content_type: Some("text/plain".to_owned()),
+        },
+    );
+    let plain = Envelope::new(
+        PeerId::new(),
+        MessageKind::Publish {
+            topic: topic("weather.updates"),
+            payload: b"sunny".to_vec(),
+            retain: false,
+            content_type: None,
+        },
+    );
+    send(&mut publisher, &retained).await;
+    send(&mut publisher, &plain).await;
+    // Round-trip a StatusRequest so both publishes are known to have
+    // been processed (and persisted) before the restart.
+    send(
+        &mut publisher,
+        &Envelope::new(PeerId::new(), MessageKind::StatusRequest),
+    )
+    .await;
+    recv(&mut publisher).await;
+    drop(publisher);
+
+    // --- stop node A, fully, so it releases the SQLite file ---
+    node_a.abort();
+    let _ = node_a.await;
+
+    // --- node B: same data dir, brand new listener ---
+    let listener_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_b = listener_b.local_addr().unwrap();
+    let _node_b = tokio::spawn(thoth_mesh_node::serve_with_tls(
+        listener_b,
+        Vec::new(),
+        opts(),
+    ));
+
+    let mut subscriber = connect(addr_b).await;
+    let sub = Envelope::new(
+        PeerId::new(),
+        MessageKind::Subscribe {
+            filter: topic("weather.updates").into(),
+            ack: false,
+            group: None,
+        },
+    );
+    send(&mut subscriber, &sub).await;
+    recv(&mut subscriber).await; // subscribe ack
+
+    // The plain message, published to a node that no longer exists,
+    // is replayed from the rehydrated buffer.
+    let replayed = recv(&mut subscriber).await;
+    assert_eq!(replayed.id, plain.id);
+
+    // And a wildcard subscribe to a fresh pattern (empty replay
+    // buffer, ADR-0022) still gets the rehydrated retained value.
+    let wild = Envelope::new(
+        PeerId::new(),
+        MessageKind::Subscribe {
+            filter: filter("sensor.+"),
+            ack: false,
+            group: None,
+        },
+    );
+    send(&mut subscriber, &wild).await;
+    recv(&mut subscriber).await; // subscribe ack
+    let retained_delivery = recv(&mut subscriber).await;
+    assert_eq!(retained_delivery.id, retained.id);
+    match retained_delivery.kind {
+        MessageKind::Publish { content_type, .. } => {
+            assert_eq!(content_type, Some("text/plain".to_owned()));
+        }
+        other => panic!("expected a Publish, got {other:?}"),
+    }
+}
