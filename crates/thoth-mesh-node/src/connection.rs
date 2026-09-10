@@ -532,11 +532,19 @@ impl ConnectionContext {
             topic,
             payload,
             retain,
+            content_type,
         } = &envelope.kind
         else {
             unreachable!("handle_publish is only ever called for a Publish envelope");
         };
-        tracing::debug!(sender = ?envelope.sender, %topic, len = payload.len(), retain, "publish");
+        tracing::debug!(
+            sender = ?envelope.sender,
+            %topic,
+            len = payload.len(),
+            retain,
+            content_type = content_type.as_deref().unwrap_or("-"),
+            "publish"
+        );
         let topic = topic.clone();
         let is_peer = self.is_peer();
         if !acl_permits(
@@ -1305,6 +1313,7 @@ mod tests {
                     topic: topic.clone(),
                     payload: i.to_be_bytes().to_vec(),
                     retain: false,
+                    content_type: None,
                 },
             );
             broker.publish(topic, Arc::new(envelope)).await;
@@ -1433,6 +1442,7 @@ mod tests {
                 topic: topic.clone(),
                 payload: b"sunny".to_vec(),
                 retain: false,
+                content_type: None,
             },
         );
         broker.publish(&topic, Arc::new(envelope.clone())).await;
@@ -1488,6 +1498,7 @@ mod tests {
                 topic: topic.clone(),
                 payload: b"sunny".to_vec(),
                 retain: false,
+                content_type: None,
             },
         );
         broker.publish(&topic, Arc::new(envelope.clone())).await;

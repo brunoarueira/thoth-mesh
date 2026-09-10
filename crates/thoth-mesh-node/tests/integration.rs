@@ -76,6 +76,7 @@ async fn publish_until_delivered(
         topic: topic.clone(),
         payload: payload.to_vec(),
         retain: false,
+        content_type: None,
     };
     let deadline = tokio::time::Instant::now() + TEST_TIMEOUT;
     loop {
@@ -193,6 +194,7 @@ async fn publish_delivers_to_subscriber() {
             topic: topic("weather.updates"),
             payload: b"sunny".to_vec(),
             retain: false,
+            content_type: None,
         },
     );
     send(&mut publisher, &publish).await;
@@ -200,6 +202,49 @@ async fn publish_delivers_to_subscriber() {
     let delivered = recv(&mut subscriber).await;
     assert_eq!(delivered.id, publish.id);
     assert_eq!(delivered.kind, publish.kind);
+}
+
+/// A `content_type` hint (ADR-0044) is carried through delivery
+/// verbatim - the node never touches it. Asserting `delivered.kind`
+/// equals the published one already covers this (the field is part of
+/// the variant), but a dedicated test documents it and would catch a
+/// forwarding path that reconstructed the `Publish` instead of
+/// passing it through.
+#[tokio::test]
+async fn a_content_type_hint_reaches_the_subscriber_unchanged() {
+    let addr = spawn_test_node().await;
+    let mut subscriber = connect(addr).await;
+    let mut publisher = connect(addr).await;
+
+    let sub = Envelope::new(
+        PeerId::new(),
+        MessageKind::Subscribe {
+            filter: topic("weather.updates").into(),
+            ack: false,
+            group: None,
+        },
+    );
+    send(&mut subscriber, &sub).await;
+    recv(&mut subscriber).await; // subscribe ack
+
+    let publish = Envelope::new(
+        PeerId::new(),
+        MessageKind::Publish {
+            topic: topic("weather.updates"),
+            payload: br#"{"temp":21}"#.to_vec(),
+            retain: false,
+            content_type: Some("application/json".to_owned()),
+        },
+    );
+    send(&mut publisher, &publish).await;
+
+    let delivered = recv(&mut subscriber).await;
+    match delivered.kind {
+        MessageKind::Publish { content_type, .. } => {
+            assert_eq!(content_type, Some("application/json".to_owned()));
+        }
+        other => panic!("expected a Publish, got {other:?}"),
+    }
 }
 
 /// A `Subscribe { ack: true }` (ADR-0041) still delivers exactly like
@@ -231,6 +276,7 @@ async fn an_acked_subscription_delivers_and_accepts_the_clients_ack() {
             topic: topic("weather.updates"),
             payload: b"sunny".to_vec(),
             retain: false,
+            content_type: None,
         },
     );
     send(&mut publisher, &publish).await;
@@ -254,6 +300,7 @@ async fn an_acked_subscription_delivers_and_accepts_the_clients_ack() {
             topic: topic("weather.updates"),
             payload: b"cloudy".to_vec(),
             retain: false,
+            content_type: None,
         },
     );
     send(&mut publisher, &second_publish).await;
@@ -341,6 +388,7 @@ async fn consumer_group_round_robins_across_two_members() {
                 topic: topic("weather.updates"),
                 payload: format!("update {i}").into_bytes(),
                 retain: false,
+                content_type: None,
             },
         );
         send(&mut publisher, &publish).await;
@@ -404,6 +452,7 @@ async fn a_group_member_that_unsubscribes_is_dropped_from_the_rotation() {
                 topic: topic("weather.updates"),
                 payload: format!("update {i}").into_bytes(),
                 retain: false,
+                content_type: None,
             },
         );
         send(&mut publisher, &publish).await;
@@ -455,6 +504,7 @@ async fn unsubscribing_from_a_group_leaves_it() {
             topic: topic("weather.updates"),
             payload: b"anybody?".to_vec(),
             retain: false,
+            content_type: None,
         },
     );
     send(&mut publisher, &publish).await;
@@ -488,6 +538,7 @@ async fn multiple_subscribers_all_receive() {
             topic: topic("weather.updates"),
             payload: b"sunny".to_vec(),
             retain: false,
+            content_type: None,
         },
     );
     send(&mut publisher, &publish).await;
@@ -507,6 +558,7 @@ async fn a_late_subscriber_is_replayed_a_publish_that_happened_before_it_subscri
             topic: topic("weather.updates"),
             payload: b"sunny".to_vec(),
             retain: false,
+            content_type: None,
         },
     );
     send(&mut publisher, &publish).await;
@@ -546,6 +598,7 @@ async fn a_retained_publish_reaches_a_wildcard_subscriber_that_connects_afterwar
             topic: topic("sensor.temp"),
             payload: b"21C".to_vec(),
             retain: true,
+            content_type: None,
         },
     );
     send(&mut publisher, &retained).await;
@@ -582,6 +635,7 @@ async fn an_empty_retained_publish_clears_the_retained_message() {
                 topic: topic("sensor.temp"),
                 payload: payload.to_vec(),
                 retain: true,
+                content_type: None,
             },
         );
         send(&mut publisher, &publish).await;
@@ -625,6 +679,7 @@ async fn resubscribing_to_an_already_subscribed_topic_does_not_replay_again() {
             topic: topic("weather.updates"),
             payload: b"sunny".to_vec(),
             retain: false,
+            content_type: None,
         },
     );
     send(&mut publisher, &publish).await;
@@ -686,6 +741,7 @@ async fn unsubscribed_client_does_not_receive_publish() {
             topic: topic("weather.updates"),
             payload: b"sunny".to_vec(),
             retain: false,
+            content_type: None,
         },
     );
     send(&mut publisher, &publish).await;
@@ -716,6 +772,7 @@ async fn distinct_topics_do_not_cross_deliver() {
             topic: topic("traffic.updates"),
             payload: b"jam".to_vec(),
             retain: false,
+            content_type: None,
         },
     );
     send(&mut publisher, &publish).await;
@@ -748,6 +805,7 @@ async fn a_wildcard_subscriber_receives_a_matching_publish() {
             topic: topic("weather.updates"),
             payload: b"sunny".to_vec(),
             retain: false,
+            content_type: None,
         },
     );
     send(&mut publisher, &publish).await;
@@ -779,6 +837,7 @@ async fn a_wildcard_subscriber_does_not_receive_a_non_matching_publish() {
             topic: topic("traffic.updates"),
             payload: b"jam".to_vec(),
             retain: false,
+            content_type: None,
         },
     );
     send(&mut publisher, &publish).await;
@@ -813,6 +872,7 @@ async fn an_exact_and_a_matching_wildcard_subscriber_on_the_same_connection_both
             topic: topic("weather.updates"),
             payload: b"sunny".to_vec(),
             retain: false,
+            content_type: None,
         },
     );
     send(&mut publisher, &publish).await;
@@ -974,6 +1034,7 @@ async fn dial_side_peer_link_forwards_local_publishes_once_subscribed() {
             topic: topic("weather.updates"),
             payload: b"sunny".to_vec(),
             retain: false,
+            content_type: None,
         },
     );
     send(&mut publisher, &publish).await;
@@ -1028,6 +1089,7 @@ async fn a_peer_links_wildcard_interest_propagates_and_receives_a_matching_publi
             topic: topic("weather.updates"),
             payload: b"sunny".to_vec(),
             retain: false,
+            content_type: None,
         },
     );
     send(&mut publisher, &publish).await;
@@ -1078,6 +1140,7 @@ async fn multi_hop_interest_propagates_across_a_chain_of_peers() {
             topic: topic("weather.updates"),
             payload: b"sunny".to_vec(),
             retain: false,
+            content_type: None,
         }
     );
 }
@@ -1144,6 +1207,7 @@ async fn loop_prevention_stops_a_publish_from_bouncing_forever() {
             topic: topic("weather.updates"),
             payload: b"final".to_vec(),
             retain: false,
+            content_type: None,
         },
     );
     send(&mut connect(addr_a).await, &publish).await;
@@ -1324,6 +1388,7 @@ async fn status_request_reports_a_metrics_summary_reflecting_activity() {
             topic: topic("weather.updates"),
             payload: b"sunny".to_vec(),
             retain: false,
+            content_type: None,
         },
     );
     send(&mut client, &publish).await;

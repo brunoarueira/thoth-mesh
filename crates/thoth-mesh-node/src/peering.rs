@@ -358,6 +358,7 @@ mod tests {
                 topic: topic.clone(),
                 payload: b"sunny".to_vec(),
                 retain: false,
+                content_type: None,
             },
         );
         broker

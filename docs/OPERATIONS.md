@@ -205,6 +205,16 @@ in the topic doesn't get the earlier retained value), and it can be
 evicted along with an idle topic on a very busy node - see
 [ADR-0043](adr/0043-retained-messages.md).
 
+`publish --content-type <string>` attaches an informational hint at
+what the payload is - `application/json`, `text/plain`,
+`application/octet-stream`, whatever - carried alongside the payload
+so a subscriber knows how to read it without a schema registry.
+`subscribe` prints it in parentheses when present
+(`[weather.updates] (application/json) {...}`) and omits it when it
+isn't. A MIME type is only a convention: the node never checks or
+interprets the value, it just forwards it (see
+[ADR-0044](adr/0044-content-type-hint-on-publish.md)).
+
 Every node and CLI invocation picks a fresh random `PeerId` on
 startup, with one exception: given `--tls-cert`/`--tls-key`, a node or
 CLI invocation derives its `PeerId` from that certificate's SHA-256

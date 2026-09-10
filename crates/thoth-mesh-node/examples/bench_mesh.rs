@@ -166,6 +166,7 @@ async fn run_once(hops: usize) -> BenchResult {
                     topic: publish_topic.clone(),
                     payload: vec![0u8; PAYLOAD_SIZE],
                     retain: false,
+                    content_type: None,
                 },
             );
             send(&mut publisher, &envelope).await;

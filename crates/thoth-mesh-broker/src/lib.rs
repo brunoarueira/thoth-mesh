@@ -578,6 +578,7 @@ mod tests {
                 topic: topic.clone(),
                 payload: payload.to_vec(),
                 retain: false,
+                content_type: None,
             },
         ))
     }
@@ -1193,6 +1194,7 @@ mod tests {
                 topic: topic.clone(),
                 payload: payload.to_vec(),
                 retain: true,
+                content_type: None,
             },
         ))
     }

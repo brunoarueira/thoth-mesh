@@ -86,6 +86,12 @@ pub enum Command {
         /// instead. See ADR-0043.
         #[arg(long)]
         retain: bool,
+        /// Optional hint at what the payload is, carried alongside it
+        /// for subscribers - a MIME type by convention
+        /// (application/json, text/plain, ...). Never interpreted by
+        /// the node. See ADR-0044.
+        #[arg(long)]
+        content_type: Option<String>,
     },
     /// Subscribe to one or more topic filters and print delivered
     /// messages until interrupted (Ctrl-C).
@@ -191,6 +197,7 @@ pub async fn run(cli: Cli) -> std::io::Result<()> {
             topic,
             payload,
             retain,
+            content_type,
         } => {
             let topic = parse_topic(&topic)?;
             let payload = read_payload(&payload, tokio::io::stdin()).await?;
@@ -200,6 +207,7 @@ pub async fn run(cli: Cli) -> std::io::Result<()> {
                     topic,
                     payload,
                     retain,
+                    content_type,
                 },
             );
             send(&mut conn, &envelope).await
@@ -329,13 +337,25 @@ async fn print_and_maybe_ack(
 /// what [`print_and_maybe_ack`] acks, and only ever a `Publish`'s own
 /// ID (ADR-0041).
 fn print_if_publish(envelope: &Envelope, output: OutputMode) -> std::io::Result<Option<MessageId>> {
-    let MessageKind::Publish { topic, payload, .. } = &envelope.kind else {
+    let MessageKind::Publish {
+        topic,
+        payload,
+        content_type,
+        ..
+    } = &envelope.kind
+    else {
         return Ok(None);
     };
+    // Shown only when the publisher sent one (ADR-0044), so an
+    // unhinted message looks exactly as it did before this field.
+    let hint = match content_type {
+        Some(ct) => format!(" ({ct})"),
+        None => String::new(),
+    };
     match output {
-        OutputMode::Text => println!("[{topic}] {}", String::from_utf8_lossy(payload)),
+        OutputMode::Text => println!("[{topic}]{hint} {}", String::from_utf8_lossy(payload)),
         OutputMode::Raw => {
-            eprintln!("[{topic}] {} bytes", payload.len());
+            eprintln!("[{topic}]{hint} {} bytes", payload.len());
             let mut stdout = std::io::stdout();
             stdout.write_all(payload)?;
             stdout.flush()?;
@@ -750,6 +770,7 @@ mod tests {
                 topic: "weather.updates".into(),
                 payload: "sunny".into(),
                 retain: false,
+                content_type: None,
             },
         };
         run(cli).await.unwrap();
@@ -782,6 +803,7 @@ mod tests {
                 topic: "sensor.temp".into(),
                 payload: "21C".into(),
                 retain: true,
+                content_type: None,
             },
         })
         .await
@@ -803,6 +825,47 @@ mod tests {
             MessageKind::Publish { topic, payload, .. } => {
                 assert_eq!(topic, "sensor.temp".parse().unwrap());
                 assert_eq!(payload, b"21C");
+            }
+            other => panic!("expected a Publish, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_publish_forwards_the_content_type_hint() {
+        let addr = spawn_test_node().await;
+
+        let mut subscriber = connect(addr).await;
+        subscribe(
+            &mut subscriber,
+            PeerId::new(),
+            "weather.updates".parse().unwrap(),
+        )
+        .await
+        .unwrap();
+
+        run(Cli {
+            addr: Some(addr.to_string()),
+            config: Some(nonexistent_config_path()),
+            tls_ca: None,
+            tls_cert: None,
+            tls_key: None,
+            command: Command::Publish {
+                topic: "weather.updates".into(),
+                payload: "sunny".into(),
+                retain: false,
+                content_type: Some("text/plain".into()),
+            },
+        })
+        .await
+        .unwrap();
+
+        let delivered = timeout(TEST_TIMEOUT, recv(&mut subscriber))
+            .await
+            .expect("timed out waiting for the publish")
+            .unwrap();
+        match delivered.kind {
+            MessageKind::Publish { content_type, .. } => {
+                assert_eq!(content_type, Some("text/plain".to_owned()));
             }
             other => panic!("expected a Publish, got {other:?}"),
         }
@@ -834,6 +897,7 @@ mod tests {
                     topic: topic.clone(),
                     payload: b"jam".to_vec(),
                     retain: false,
+                    content_type: None,
                 },
             ),
         )
@@ -850,6 +914,7 @@ mod tests {
                 topic,
                 payload: b"jam".to_vec(),
                 retain: false,
+                content_type: None,
             }
         );
     }
@@ -1026,6 +1091,7 @@ mod tests {
                     topic: topic.clone(),
                     payload: b"sunny".to_vec(),
                     retain: false,
+                    content_type: None,
                 },
             ),
         )
@@ -1042,6 +1108,7 @@ mod tests {
                 topic,
                 payload: b"sunny".to_vec(),
                 retain: false,
+                content_type: None,
             }
         );
     }
@@ -1111,6 +1178,7 @@ mod tests {
                         topic: topic.parse().unwrap(),
                         payload,
                         retain: false,
+                        content_type: None,
                     },
                 ),
             )
@@ -1177,6 +1245,7 @@ mod tests {
                         topic: "weather.updates".parse().unwrap(),
                         payload: b"sunny".to_vec(),
                         retain: false,
+                        content_type: None,
                     },
                 ),
             )
@@ -1229,6 +1298,7 @@ mod tests {
                 topic: weather.as_topic().unwrap(),
                 payload: b"sunny".to_vec(),
                 retain: false,
+                content_type: None,
             }
         );
     }
@@ -1304,6 +1374,7 @@ mod tests {
                 topic: "weather.updates".into(),
                 payload: "sunny".into(),
                 retain: false,
+                content_type: None,
             },
         }
     }
@@ -1429,6 +1500,7 @@ mod tests {
                 topic: "weather.updates".parse().unwrap(),
                 payload: b"sunny".to_vec(),
                 retain: false,
+                content_type: None,
             }
         );
 

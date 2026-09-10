@@ -142,6 +142,7 @@ async fn a_listed_subscribe_and_publish_still_work_normally() {
             topic: topic("weather.updates"),
             payload: b"sunny".to_vec(),
             retain: false,
+            content_type: None,
         },
     );
     send(&mut publisher, &publish).await;
@@ -221,6 +222,7 @@ async fn publishing_without_permission_is_rejected_and_never_reaches_a_subscribe
             topic: topic("guarded.topic"),
             payload: b"shouldn't arrive".to_vec(),
             retain: false,
+            content_type: None,
         },
     );
     send(&mut publisher, &publish).await;
@@ -312,6 +314,7 @@ async fn a_peer_link_permitted_to_subscribe_receives_the_forwarded_publish() {
             topic: topic("weather.updates"),
             payload: b"sunny".to_vec(),
             retain: false,
+            content_type: None,
         },
     );
     send(&mut publisher, &publish).await;
@@ -351,6 +354,7 @@ async fn a_peer_link_denied_subscribe_is_rejected_and_never_forwarded_to() {
             topic: topic("weather.updates"),
             payload: b"sunny".to_vec(),
             retain: false,
+            content_type: None,
         },
     );
     send(&mut publisher, &publish).await;
@@ -416,6 +420,7 @@ async fn a_peer_link_permitted_to_publish_is_delivered_to_a_subscriber() {
             topic: topic("weather.updates"),
             payload: b"sunny".to_vec(),
             retain: false,
+            content_type: None,
         },
     );
     send(&mut peer, &publish).await;
@@ -457,6 +462,7 @@ async fn a_peer_link_denied_publish_is_rejected_and_never_reaches_a_subscriber()
             topic: topic("weather.updates"),
             payload: b"shouldn't arrive".to_vec(),
             retain: false,
+            content_type: None,
         },
     );
     send(&mut peer, &rejected).await;
@@ -505,6 +511,7 @@ async fn a_peer_topic_acl_does_not_restrict_an_ordinary_client() {
             topic: topic("unrelated.topic"),
             payload: b"fine".to_vec(),
             retain: false,
+            content_type: None,
         },
     );
     send(&mut publisher, &publish).await;
