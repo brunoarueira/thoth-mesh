@@ -23,9 +23,11 @@ late subscribers), and
 [ADR-0022](docs/adr/0022-wildcard-topic-filters.md) (wildcard topic
 filters), [ADR-0041](docs/adr/0041-at-least-once-delivery-with-ack-based-redelivery.md)
 (at-least-once delivery with ack-based redelivery),
-[ADR-0042](docs/adr/0042-consumer-groups.md) (consumer groups), and
+[ADR-0042](docs/adr/0042-consumer-groups.md) (consumer groups),
 [ADR-0043](docs/adr/0043-retained-messages.md) (retained/last-value
-messages). For diagrams of several of these flows, see
+messages), and
+[ADR-0044](docs/adr/0044-content-type-hint-on-publish.md) (content-type
+hint on `Publish`). For diagrams of several of these flows, see
 [docs/FLOWS.md](docs/FLOWS.md).
 
 **Status:** version 1, and explicitly unstable — see ADR-0014. Nothing
@@ -181,7 +183,7 @@ out: it's a bare string, not a one-entry map with a `null` value.
 ### `Publish`
 
 ```
-{"Publish": {"topic": <Topic>, "payload": <bytes>, "retain": <bool>}}
+{"Publish": {"topic": <Topic>, "payload": <bytes>, "retain": <bool>, "content_type": <string | null>}}
 ```
 
 Publishes `payload` to `topic`. `payload` is an arbitrary byte string
@@ -193,6 +195,17 @@ implementation's `Vec<u8>` field serializes by default, not a
 deliberate format choice — a byte string would be considerably more
 compact, but an implementation reading this protocol needs to accept
 what's actually on the wire today.
+
+`content_type` (`#[serde(default)]` — an older sender that omits it
+means `null`) is an optional, **purely informational** hint at what
+`payload` is
+([ADR-0044](docs/adr/0044-content-type-hint-on-publish.md)): a MIME
+type by convention (`application/json`, `text/plain; charset=utf-8`,
+`application/octet-stream`), but a node never validates, normalizes,
+rejects, or otherwise interprets it — it's carried through delivery,
+replay, retention, and cross-peer forwarding verbatim, and a
+subscriber does whatever it likes with it (or ignores it). `null` and
+an empty string both just mean "no useful hint".
 
 `retain` (`#[serde(default)]` — an older sender that omits it means
 `false`) makes this publish *also* become the topic's retained

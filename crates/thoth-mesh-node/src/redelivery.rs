@@ -126,6 +126,7 @@ mod tests {
                 topic: "weather.updates".parse::<Topic>().unwrap(),
                 payload: b"sunny".to_vec(),
                 retain: false,
+                content_type: None,
             },
         ))
     }
