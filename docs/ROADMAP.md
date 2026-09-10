@@ -230,6 +230,9 @@ and visibility beyond `status`/metrics.
   restart.
 - Health/readiness endpoints for orchestration (k8s, systemd),
   distinct from metrics/status.
+- A config file for `thoth-mesh-node`'s ~14 daemon flags, mirroring
+  `thoth-mesh-cli`'s (ADR-0034) — pairs naturally with the config
+  reload above.
 
 ## Phase 17 — Per-message tracing across peer hops
 
