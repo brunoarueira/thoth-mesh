@@ -122,6 +122,7 @@ async fn subscribe_receives_ack() {
         MessageKind::Subscribe {
             filter: topic("weather.updates").into(),
             ack: false,
+            group: None,
         },
     );
     send(&mut client, &sub).await;
@@ -145,6 +146,7 @@ async fn unsubscribe_receives_ack() {
         MessageKind::Subscribe {
             filter: topic("weather.updates").into(),
             ack: false,
+            group: None,
         },
     );
     send(&mut client, &sub).await;
@@ -178,6 +180,7 @@ async fn publish_delivers_to_subscriber() {
         MessageKind::Subscribe {
             filter: topic("weather.updates").into(),
             ack: false,
+            group: None,
         },
     );
     send(&mut subscriber, &sub).await;
@@ -214,6 +217,7 @@ async fn an_acked_subscription_delivers_and_accepts_the_clients_ack() {
         MessageKind::Subscribe {
             filter: topic("weather.updates").into(),
             ack: true,
+            group: None,
         },
     );
     send(&mut subscriber, &sub).await;
@@ -253,6 +257,204 @@ async fn an_acked_subscription_delivers_and_accepts_the_clients_ack() {
     assert_eq!(second_delivered.id, second_publish.id);
 }
 
+/// `ack: true` and `group: Some(_)` together is refused outright
+/// (ADR-0042) - the node hasn't defined what acknowledgement means
+/// for a group. The connection stays open and usable afterward, same
+/// as any other `Subscribe` rejection (ADR-0018).
+#[tokio::test]
+async fn ack_and_group_together_is_rejected() {
+    let addr = spawn_test_node().await;
+    let mut client = connect(addr).await;
+
+    let sub = Envelope::new(
+        PeerId::new(),
+        MessageKind::Subscribe {
+            filter: topic("weather.updates").into(),
+            ack: true,
+            group: Some("workers".to_owned()),
+        },
+    );
+    send(&mut client, &sub).await;
+
+    let reply = recv(&mut client).await;
+    assert_eq!(
+        reply.kind,
+        MessageKind::Error {
+            in_reply_to: Some(sub.id),
+            message: "ack and group are not supported together".to_owned(),
+        }
+    );
+
+    // The connection is still usable - an ordinary (non-group,
+    // non-ack) subscribe on it still works.
+    let ordinary = Envelope::new(
+        PeerId::new(),
+        MessageKind::Subscribe {
+            filter: topic("weather.updates").into(),
+            ack: false,
+            group: None,
+        },
+    );
+    send(&mut client, &ordinary).await;
+    let ack = recv(&mut client).await;
+    assert_eq!(
+        ack.kind,
+        MessageKind::Ack {
+            in_reply_to: ordinary.id
+        }
+    );
+}
+
+/// Two connections joining the same named group for the same filter
+/// each get every other publish, round-robin - not both getting
+/// everything (ordinary fan-out) and not either one starved
+/// (ADR-0042).
+#[tokio::test]
+async fn consumer_group_round_robins_across_two_members() {
+    let addr = spawn_test_node().await;
+    let mut member_a = connect(addr).await;
+    let mut member_b = connect(addr).await;
+    let mut publisher = connect(addr).await;
+
+    for member in [&mut member_a, &mut member_b] {
+        let sub = Envelope::new(
+            PeerId::new(),
+            MessageKind::Subscribe {
+                filter: topic("weather.updates").into(),
+                ack: false,
+                group: Some("workers".to_owned()),
+            },
+        );
+        send(member, &sub).await;
+        recv(member).await; // subscribe ack
+    }
+
+    let mut published = Vec::with_capacity(4);
+    for i in 0..4u32 {
+        let publish = Envelope::new(
+            PeerId::new(),
+            MessageKind::Publish {
+                topic: topic("weather.updates"),
+                payload: format!("update {i}").into_bytes(),
+            },
+        );
+        send(&mut publisher, &publish).await;
+        published.push(publish);
+    }
+
+    let received_a = [recv(&mut member_a).await.id, recv(&mut member_a).await.id];
+    let received_b = [recv(&mut member_b).await.id, recv(&mut member_b).await.id];
+    assert_eq!(received_a, [published[0].id, published[2].id]);
+    assert_eq!(received_b, [published[1].id, published[3].id]);
+    assert!(recv_times_out(&mut member_a).await);
+    assert!(recv_times_out(&mut member_b).await);
+}
+
+/// A group member that `Unsubscribe`s is dropped from the round-robin
+/// rotation - the remaining member then gets every message, and the
+/// one that left gets nothing (ADR-0042). Deliberately tests the
+/// `Unsubscribe` path rather than a disconnect: an `Unsubscribe`
+/// leaves the connection *open*, so if `leave_group` weren't actually
+/// called, `member_b` would still be a live channel and round-robin
+/// would send it half the messages - which `recv_times_out(member_b)`
+/// below would catch. A disconnect can't isolate that: a dropped
+/// connection's channel also closes, and `Broker`'s delivery already
+/// skips a closed channel on its own, so the two paths are
+/// indistinguishable from the wire. The disconnect path itself just
+/// reuses this same `leave_group` call from `shut_down`.
+#[tokio::test]
+async fn a_group_member_that_unsubscribes_is_dropped_from_the_rotation() {
+    let addr = spawn_test_node().await;
+    let mut member_a = connect(addr).await;
+    let mut member_b = connect(addr).await;
+    let mut publisher = connect(addr).await;
+
+    for member in [&mut member_a, &mut member_b] {
+        let sub = Envelope::new(
+            PeerId::new(),
+            MessageKind::Subscribe {
+                filter: topic("weather.updates").into(),
+                ack: false,
+                group: Some("workers".to_owned()),
+            },
+        );
+        send(member, &sub).await;
+        recv(member).await; // subscribe ack
+    }
+
+    let unsub = Envelope::new(
+        PeerId::new(),
+        MessageKind::Unsubscribe {
+            filter: topic("weather.updates").into(),
+        },
+    );
+    send(&mut member_b, &unsub).await;
+    recv(&mut member_b).await; // unsubscribe ack
+
+    let mut published = Vec::with_capacity(4);
+    for i in 0..4u32 {
+        let publish = Envelope::new(
+            PeerId::new(),
+            MessageKind::Publish {
+                topic: topic("weather.updates"),
+                payload: format!("update {i}").into_bytes(),
+            },
+        );
+        send(&mut publisher, &publish).await;
+        published.push(publish);
+    }
+
+    // Every message goes to the one member still in the group, in
+    // order - if `member_b` were still in the rotation, it would have
+    // taken messages 1 and 3 and these `recv`s would hang.
+    for publish in &published {
+        assert_eq!(recv(&mut member_a).await.id, publish.id);
+    }
+    // And the member that left gets nothing at all.
+    assert!(recv_times_out(&mut member_b).await);
+}
+
+/// Unsubscribing from a group leaves it - `Broker::leave_group` is
+/// wired up the same way an ordinary forwarder's teardown is
+/// (ADR-0042).
+#[tokio::test]
+async fn unsubscribing_from_a_group_leaves_it() {
+    let addr = spawn_test_node().await;
+    let mut member = connect(addr).await;
+    let mut publisher = connect(addr).await;
+
+    let sub = Envelope::new(
+        PeerId::new(),
+        MessageKind::Subscribe {
+            filter: topic("weather.updates").into(),
+            ack: false,
+            group: Some("workers".to_owned()),
+        },
+    );
+    send(&mut member, &sub).await;
+    recv(&mut member).await; // subscribe ack
+
+    let unsub = Envelope::new(
+        PeerId::new(),
+        MessageKind::Unsubscribe {
+            filter: topic("weather.updates").into(),
+        },
+    );
+    send(&mut member, &unsub).await;
+    recv(&mut member).await; // unsubscribe ack
+
+    let publish = Envelope::new(
+        PeerId::new(),
+        MessageKind::Publish {
+            topic: topic("weather.updates"),
+            payload: b"anybody?".to_vec(),
+        },
+    );
+    send(&mut publisher, &publish).await;
+
+    assert!(recv_times_out(&mut member).await);
+}
+
 #[tokio::test]
 async fn multiple_subscribers_all_receive() {
     let addr = spawn_test_node().await;
@@ -266,6 +468,7 @@ async fn multiple_subscribers_all_receive() {
             MessageKind::Subscribe {
                 filter: topic("weather.updates").into(),
                 ack: false,
+                group: None,
             },
         );
         send(client, &sub).await;
@@ -305,6 +508,7 @@ async fn a_late_subscriber_is_replayed_a_publish_that_happened_before_it_subscri
         MessageKind::Subscribe {
             filter: topic("weather.updates").into(),
             ack: false,
+            group: None,
         },
     );
     send(&mut subscriber, &sub).await;
@@ -328,6 +532,7 @@ async fn resubscribing_to_an_already_subscribed_topic_does_not_replay_again() {
         MessageKind::Subscribe {
             filter: topic("weather.updates").into(),
             ack: false,
+            group: None,
         },
     );
     send(&mut subscriber, &sub).await;
@@ -353,6 +558,7 @@ async fn resubscribing_to_an_already_subscribed_topic_does_not_replay_again() {
         MessageKind::Subscribe {
             filter: topic("weather.updates").into(),
             ack: false,
+            group: None,
         },
     );
     send(&mut subscriber, &resub).await;
@@ -377,6 +583,7 @@ async fn unsubscribed_client_does_not_receive_publish() {
         MessageKind::Subscribe {
             filter: topic("weather.updates").into(),
             ack: false,
+            group: None,
         },
     );
     send(&mut client, &sub).await;
@@ -414,6 +621,7 @@ async fn distinct_topics_do_not_cross_deliver() {
         MessageKind::Subscribe {
             filter: topic("weather.updates").into(),
             ack: false,
+            group: None,
         },
     );
     send(&mut subscriber, &sub).await;
@@ -444,6 +652,7 @@ async fn a_wildcard_subscriber_receives_a_matching_publish() {
         MessageKind::Subscribe {
             filter: filter("weather.+"),
             ack: false,
+            group: None,
         },
     );
     send(&mut subscriber, &sub).await;
@@ -473,6 +682,7 @@ async fn a_wildcard_subscriber_does_not_receive_a_non_matching_publish() {
         MessageKind::Subscribe {
             filter: filter("weather.+"),
             ack: false,
+            group: None,
         },
     );
     send(&mut subscriber, &sub).await;
@@ -504,6 +714,7 @@ async fn an_exact_and_a_matching_wildcard_subscriber_on_the_same_connection_both
             MessageKind::Subscribe {
                 filter: sub_filter,
                 ack: false,
+                group: None,
             },
         );
         send(&mut subscriber, &sub).await;
@@ -642,6 +853,7 @@ async fn dial_side_peer_link_forwards_local_publishes_once_subscribed() {
         MessageKind::Subscribe {
             filter: topic("weather.updates").into(),
             ack: false,
+            group: None,
         },
     );
     send(&mut peer, &sub).await;
@@ -663,6 +875,7 @@ async fn dial_side_peer_link_forwards_local_publishes_once_subscribed() {
         MessageKind::Subscribe {
             filter: topic("weather.updates").into(),
             ack: false,
+            group: None,
         }
     );
 
@@ -713,6 +926,7 @@ async fn a_peer_links_wildcard_interest_propagates_and_receives_a_matching_publi
         MessageKind::Subscribe {
             filter: filter("weather.+"),
             ack: false,
+            group: None,
         },
     );
     send(&mut peer, &sub).await;
@@ -761,6 +975,7 @@ async fn multi_hop_interest_propagates_across_a_chain_of_peers() {
         MessageKind::Subscribe {
             filter: topic("weather.updates").into(),
             ack: false,
+            group: None,
         },
     );
     send(&mut subscriber, &sub).await;
@@ -806,6 +1021,7 @@ async fn loop_prevention_stops_a_publish_from_bouncing_forever() {
             MessageKind::Subscribe {
                 filter: topic("weather.updates").into(),
                 ack: false,
+                group: None,
             },
         );
         send(client, &sub).await;

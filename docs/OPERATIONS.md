@@ -182,6 +182,18 @@ exactly as before: fire-and-forget, once, best-effort. See
 [ADR-0041](adr/0041-at-least-once-delivery-with-ack-based-redelivery.md)
 and [`PROTOCOL.md`](../PROTOCOL.md#delivery-semantics).
 
+`subscribe --group <name>` joins a named consumer group instead of
+ordinary fan-out: run several instances with the same `--group` name
+against the same topic, and each published message goes to exactly
+one of them, round-robin - a quick way to load-balance work across a
+pool of CLI-driven workers without writing one. Combining `--group`
+with `--ack` is refused by the node - the two aren't supported
+together yet (see [ADR-0042](adr/0042-consumer-groups.md)). A group
+member gets no catch-up on messages published before it joined, and
+no lag recovery if it falls behind - a materially weaker guarantee
+than ordinary fan-out subscribing, worth knowing before relying on it
+for anything that can't tolerate a missed message.
+
 Every node and CLI invocation picks a fresh random `PeerId` on
 startup, with one exception: given `--tls-cert`/`--tls-key`, a node or
 CLI invocation derives its `PeerId` from that certificate's SHA-256

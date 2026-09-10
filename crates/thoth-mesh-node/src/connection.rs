@@ -206,10 +206,11 @@ async fn run_connection(socket: MaybeTlsStream, shared: Shared, initial_peer: Op
         envelope.sender = ctx.authenticated_sender(envelope.sender);
 
         let keep_going = match &envelope.kind {
-            MessageKind::Subscribe { filter, ack } => {
+            MessageKind::Subscribe { filter, ack, group } => {
                 let filter = filter.clone();
                 let ack = *ack;
-                ctx.handle_subscribe(&envelope, filter, ack).await
+                let group = group.clone();
+                ctx.handle_subscribe(&envelope, filter, ack, group).await
             }
             MessageKind::Unsubscribe { filter } => {
                 let filter = filter.clone();
@@ -279,9 +280,10 @@ struct ConnectionContext {
     peer_topic_acl: Option<Arc<TopicAcl>>,
     outgoing_tx: mpsc::Sender<Arc<Envelope>>,
     /// Every topic filter a `Subscribe` on this connection is
-    /// currently forwarding for, keyed by the same filter a matching
-    /// `Unsubscribe` removes it by.
-    forwarders: HashMap<TopicFilter, Forwarder>,
+    /// currently registered for - an ordinary forwarder or consumer-
+    /// group membership (ADR-0042), see `Subscription` - keyed by the
+    /// same filter a matching `Unsubscribe` removes it by.
+    forwarders: HashMap<TopicFilter, Subscription>,
     /// Set once this connection is known to be a peer link - either
     /// passed in already-known (dial side, ADR-0010) or learned from
     /// an incoming `Hello` (accept side) - so `shut_down` knows whose
@@ -380,25 +382,38 @@ impl ConnectionContext {
         true
     }
 
-    /// Handles a `Subscribe { filter, ack }` request: authorizes it
-    /// against whichever ACL applies (ADR-0018/ADR-0020) - refusing a
-    /// wildcard filter outright wherever one does, regardless of what
-    /// it would expand to (ADR-0022) - spawns a forwarder for a
-    /// genuinely new filter (ADR-0021), acks, and, only on this
-    /// connection's first subscriber for `filter`, propagates the
-    /// interest transition to every peer link (ADR-0011). `ack` opts
-    /// this subscription into at-least-once delivery (ADR-0041); it's
+    /// Handles a `Subscribe { filter, ack, group }` request: refuses
+    /// `ack: true` combined with a `group` outright (see the `Error`
+    /// case below), authorizes it against whichever ACL applies
+    /// (ADR-0018/ADR-0020) - refusing a wildcard filter outright
+    /// wherever one does, regardless of what it would expand to
+    /// (ADR-0022) - registers a genuinely new filter (ADR-0021, or
+    /// ADR-0042 for a group), acks, and, only on this connection's
+    /// first subscriber for `filter`, propagates the interest
+    /// transition to every peer link (ADR-0011). `ack`/`group` are
     /// only read the first time `filter` is subscribed to on this
     /// connection - same as the rest of a no-op re-`Subscribe`, it
-    /// doesn't retroactively change an already-running forwarder's
-    /// mode. Returns `false` if the outgoing queue has closed and the
-    /// read loop should stop.
+    /// doesn't retroactively change an already-registered
+    /// subscription's mode. Returns `false` if the outgoing queue has
+    /// closed and the read loop should stop.
     async fn handle_subscribe(
         &mut self,
         envelope: &Envelope,
         filter: TopicFilter,
         ack: bool,
+        group: Option<String>,
     ) -> bool {
+        if ack && group.is_some() {
+            tracing::warn!(sender = ?envelope.sender, %filter, "rejected: ack and group are not supported together (ADR-0042)");
+            let error = Envelope::new(
+                self.node_id,
+                MessageKind::Error {
+                    in_reply_to: Some(envelope.id),
+                    message: "ack and group are not supported together".to_owned(),
+                },
+            );
+            return self.send(error).await;
+        }
         let is_peer = self.is_peer();
         if !filter_acl_permits(
             &self.topic_acl,
@@ -423,26 +438,32 @@ impl ConnectionContext {
             );
             return self.send(error).await;
         }
-        tracing::info!(sender = ?envelope.sender, %filter, ack, "subscribed");
+        tracing::info!(sender = ?envelope.sender, %filter, ack, ?group, "subscribed");
         let is_new_forwarder = !self.forwarders.contains_key(&filter);
         let broker = Arc::clone(&self.broker);
         let outgoing_tx = self.outgoing_tx.clone();
         let metrics = self.metrics.clone();
         self.forwarders.entry(filter.clone()).or_insert_with(|| {
-            if ack {
-                spawn_ack_forwarder(
+            if let Some(group) = group {
+                // Direct push onto this connection's own outgoing_tx
+                // (ADR-0042) - no forwarder task, unlike every branch
+                // below.
+                broker.join_group(filter.clone(), group.clone(), outgoing_tx);
+                Subscription::Group(group)
+            } else if ack {
+                Subscription::Forwarder(spawn_ack_forwarder(
                     &broker,
                     filter.clone(),
                     outgoing_tx,
                     metrics,
                     DEFAULT_ACK_TIMEOUT,
                     DEFAULT_MAX_REDELIVERY_ATTEMPTS,
-                )
+                ))
             } else {
-                Forwarder {
+                Subscription::Forwarder(Forwarder {
                     handle: spawn_forwarder(&broker, filter.clone(), outgoing_tx, metrics),
                     ack_tx: None,
-                }
+                })
             }
         });
         // The ack goes out before the interest-propagation echo below
@@ -473,10 +494,16 @@ impl ConnectionContext {
     /// and the read loop should stop.
     async fn handle_unsubscribe(&mut self, envelope: &Envelope, filter: TopicFilter) -> bool {
         tracing::info!(sender = ?envelope.sender, %filter, "unsubscribed");
-        let had_forwarder = self
-            .forwarders
-            .remove(&filter)
-            .inspect(|forwarder| forwarder.handle.abort());
+        let had_forwarder =
+            self.forwarders
+                .remove(&filter)
+                .inspect(|subscription| match subscription {
+                    Subscription::Forwarder(forwarder) => forwarder.handle.abort(),
+                    Subscription::Group(group) => {
+                        self.broker
+                            .leave_group(filter.clone(), group.clone(), &self.outgoing_tx);
+                    }
+                });
         // Ack before the echo - see handle_subscribe above.
         let ack = Envelope::new(
             self.node_id,
@@ -610,7 +637,9 @@ impl ConnectionContext {
     /// Handles an `Ack { in_reply_to }` received from a client:
     /// forwards it to every forwarder on this connection that's
     /// tracking pending acknowledgements (ADR-0041) - i.e. every
-    /// filter subscribed to with `ack: true`. Best-effort
+    /// filter subscribed to with `ack: true`; a consumer-group
+    /// subscription (ADR-0042) never has one, since `ack: true` and
+    /// `group` are mutually exclusive. Best-effort
     /// (`try_send`, not awaited): a forwarder whose ack channel is
     /// momentarily full just resends on its next timeout instead of
     /// retiring the entry a little early - at-least-once delivery
@@ -621,8 +650,12 @@ impl ConnectionContext {
     /// forwarders (e.g. a stale or malicious ack) is simply ignored
     /// everywhere it's tried.
     fn handle_ack(&self, in_reply_to: MessageId) {
-        for forwarder in self.forwarders.values() {
-            if let Some(ack_tx) = &forwarder.ack_tx {
+        for subscription in self.forwarders.values() {
+            if let Subscription::Forwarder(Forwarder {
+                ack_tx: Some(ack_tx),
+                ..
+            }) = subscription
+            {
                 let _ = ack_tx.try_send(in_reply_to);
             }
         }
@@ -672,9 +705,15 @@ impl ConnectionContext {
     /// this connection turned out to be a peer link, unregisters it
     /// and marks it disconnected.
     fn shut_down(&mut self) {
-        for (filter, forwarder) in self.forwarders.drain() {
+        for (filter, subscription) in self.forwarders.drain() {
             tracing::debug!(%filter, "stopping forwarder");
-            forwarder.handle.abort();
+            match subscription {
+                Subscription::Forwarder(forwarder) => forwarder.handle.abort(),
+                Subscription::Group(group) => {
+                    self.broker
+                        .leave_group(filter.clone(), group, &self.outgoing_tx);
+                }
+            }
             if self.interest.unsubscribe(&filter) {
                 propagate_interest(&self.peer_links, self.node_id, filter, false);
             }
@@ -710,12 +749,14 @@ fn register_peer_link(
     for filter in interest.snapshot() {
         let envelope = Arc::new(Envelope::new(
             node_id,
-            // Always ack: false - interest propagation is a routing
-            // signal between peers, not a real consumer wanting
-            // delivery guarantees. See ADR-0041's Scope.
+            // Always ack: false, group: None - interest propagation
+            // is a routing signal between peers, not a real consumer
+            // wanting delivery guarantees or group membership. See
+            // ADR-0041's Scope and ADR-0042.
             MessageKind::Subscribe {
                 filter: filter.clone(),
                 ack: false,
+                group: None,
             },
         ));
         if outgoing_tx.try_send(envelope).is_err() {
@@ -828,9 +869,15 @@ fn propagate_interest(
     now_interested: bool,
 ) {
     let kind = if now_interested {
-        // Always ack: false - see register_peer_link's interest
-        // catch-up above and ADR-0041's Scope.
-        MessageKind::Subscribe { filter, ack: false }
+        // Always ack: false, group: None - see register_peer_link's
+        // interest catch-up above, ADR-0041's Scope, and ADR-0042
+        // (a peer link forwards interest in a filter, not membership
+        // in any particular local consumer group).
+        MessageKind::Subscribe {
+            filter,
+            ack: false,
+            group: None,
+        }
     } else {
         MessageKind::Unsubscribe { filter }
     };
@@ -976,13 +1023,31 @@ impl<T> std::future::Future for AbortOnDrop<T> {
     }
 }
 
-/// One connection's forwarder for a single `Subscribe`d filter: the
-/// task itself, plus - only for a filter subscribed to with
-/// `ack: true` (ADR-0041) - the channel `ConnectionContext::handle_ack`
-/// uses to tell it a delivery was acknowledged. `None` for an
-/// ordinary, fire-and-forget subscription; `handle.abort()` alone is
-/// enough to stop either kind (see `shut_down`/`handle_unsubscribe`),
-/// `ack_tx` doesn't need its own explicit teardown.
+/// One connection's `forwarders` entry: either an ordinary,
+/// fan-out subscription (a spawned task pulling from the broker's
+/// broadcast channel) or membership in a named consumer group
+/// (ADR-0042) - the two are mutually exclusive per filter on one
+/// connection, decided once by whichever `Subscribe` first registers
+/// this filter (see `ConnectionContext::handle_subscribe`).
+enum Subscription {
+    Forwarder(Forwarder),
+    /// This connection joined the named group for this filter -
+    /// nothing to abort on `Unsubscribe`/shutdown, since there's no
+    /// task: `Broker::join_group` pushes directly onto this
+    /// connection's own `outgoing_tx`. Leaving the group (removing
+    /// `outgoing_tx` from the broker's registry) is `handle_unsubscribe`/
+    /// `shut_down`'s job, via `Broker::leave_group`.
+    Group(String),
+}
+
+/// One connection's forwarder for a single, ordinary (non-group)
+/// `Subscribe`d filter: the task itself, plus - only for a filter
+/// subscribed to with `ack: true` (ADR-0041) - the channel
+/// `ConnectionContext::handle_ack` uses to tell it a delivery was
+/// acknowledged. `None` for an ordinary, fire-and-forget subscription;
+/// `handle.abort()` alone is enough to stop either kind (see
+/// `shut_down`/`handle_unsubscribe`), `ack_tx` doesn't need its own
+/// explicit teardown.
 struct Forwarder {
     handle: JoinHandle<()>,
     ack_tx: Option<mpsc::Sender<MessageId>>,

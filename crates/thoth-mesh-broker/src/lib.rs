@@ -5,8 +5,11 @@
 //! per-topic replay buffer that lets a late subscriber catch up on
 //! recent history, ADR-0022 for wildcard topic filters, ADR-0024 for
 //! why the replay buffer is sized larger than the broadcast channel it
-//! sits alongside, and ADR-0025 for why `topics`/`patterns` are each
-//! capped, never evicting an entry with a live subscriber.
+//! sits alongside, ADR-0025 for why `topics`/`patterns` are each
+//! capped, never evicting an entry with a live subscriber, and
+//! ADR-0042 for consumer groups - `publish`'s other delivery path,
+//! exactly one member per message rather than fan-out to every
+//! subscriber.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::Hash;
@@ -14,7 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use thoth_mesh_core::{Envelope, MessageId, Topic, TopicFilter};
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::{RwLock, broadcast, mpsc};
 
 /// Default channel capacity for a topic's broadcast channel.
 ///
@@ -79,6 +82,15 @@ pub struct Broker {
     topic_evictions: AtomicU64,
     /// Same as `topic_evictions`, for `patterns`.
     pattern_evictions: AtomicU64,
+    /// Consumer groups (ADR-0042), keyed by `(filter, group name)`.
+    /// Scanned linearly on every publish - same tradeoff `patterns`
+    /// already accepts (ADR-0022) - to find every group whose filter
+    /// matches the topic being published. A plain (sync) `Mutex`,
+    /// not an `RwLock` like `topics`/`patterns`: every access either
+    /// mutates the round-robin cursor or the member list, so there's
+    /// no genuinely-shared-read case here to justify the extra
+    /// complexity.
+    groups: Mutex<HashMap<GroupKey, GroupMembers>>,
 }
 
 impl Default for Broker {
@@ -90,6 +102,7 @@ impl Default for Broker {
             messages_published: AtomicU64::new(0),
             topic_evictions: AtomicU64::new(0),
             pattern_evictions: AtomicU64::new(0),
+            groups: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -133,24 +146,75 @@ impl Broker {
         channel.subscribe()
     }
 
+    /// Joins `sender` to the named consumer `group` for `filter`
+    /// (ADR-0042): each `Publish` whose topic `filter` matches from
+    /// this point on goes to exactly one *current* member of the
+    /// group, round-robin, rather than every member - a fundamentally
+    /// different delivery model than [`subscribe`](Self::subscribe)'s
+    /// fan-out. Delivery is a direct push onto `sender` itself
+    /// (`try_send`, see [`publish`](Self::publish)), not a
+    /// `broadcast::Receiver` - there is no backlog replay (ADR-0021)
+    /// or lag recovery (ADR-0024) for a group; a member only ever
+    /// sees what's published while it's a live, keeping-up member.
+    pub fn join_group(
+        &self,
+        filter: TopicFilter,
+        group: String,
+        sender: mpsc::Sender<Arc<Envelope>>,
+    ) {
+        self.groups
+            .lock()
+            .unwrap()
+            .entry((filter, group))
+            .or_default()
+            .members
+            .push(sender);
+    }
+
+    /// Removes `sender` from the named consumer `group` for `filter`,
+    /// if it's still a member - matched by comparing the exact
+    /// channel (`Sender::same_channel`), the same guard
+    /// `thoth_mesh_node::PeerLinks::unregister` uses, so a stale
+    /// teardown can't remove a different connection's still-live
+    /// membership. A no-op if `sender` was never a member of this
+    /// `(filter, group)` (or already removed) - safe to call
+    /// unconditionally on disconnect.
+    pub fn leave_group(
+        &self,
+        filter: TopicFilter,
+        group: String,
+        sender: &mpsc::Sender<Arc<Envelope>>,
+    ) {
+        let mut groups = self.groups.lock().unwrap();
+        if let Some(members) = groups.get_mut(&(filter, group)) {
+            members
+                .members
+                .retain(|member| !member.same_channel(sender));
+        }
+    }
+
     /// Publishes `envelope` to every subscriber currently registered
     /// for `topic` - exact-match subscribers and every currently
     /// registered pattern filter that matches `topic` (ADR-0022) -
-    /// returning how many subscribers received it live in total.
+    /// plus, for every consumer group whose filter matches `topic`
+    /// (ADR-0042), exactly one of its current members - returning how
+    /// many receivers got it live in total (each such group counts as
+    /// at most one).
     ///
-    /// `envelope` is also appended to each matching channel's replay
-    /// buffer (ADR-0021) regardless of whether anyone is currently
-    /// subscribed there - a topic (or pattern) with no subscribers yet
-    /// still builds up a backlog for whoever subscribes later. A
-    /// connection holding both an exact subscribe and an independently
-    /// matching pattern subscribe receives the envelope twice, once
-    /// per subscription - each is delivered through its own
-    /// `TopicChannel`, same as two distinct clients would be. Returns
-    /// `0` if there are no live subscribers right now - this is not an
-    /// error, publishing to a topic nobody is listening to is normal -
-    /// or if an envelope with this same `MessageId` has already been
-    /// published here before, which is dropped rather than redelivered
-    /// or re-buffered (see ADR-0011).
+    /// `envelope` is also appended to each matching *fan-out* channel's
+    /// replay buffer (ADR-0021) regardless of whether anyone is
+    /// currently subscribed there - a topic (or pattern) with no
+    /// subscribers yet still builds up a backlog for whoever
+    /// subscribes later; a consumer group has no such backlog (see
+    /// [`join_group`](Self::join_group)). A connection holding both an
+    /// exact subscribe and an independently matching pattern subscribe
+    /// receives the envelope twice, once per subscription - each is
+    /// delivered through its own `TopicChannel`, same as two distinct
+    /// clients would be. Returns `0` if there are no live subscribers
+    /// right now - this is not an error, publishing to a topic nobody
+    /// is listening to is normal - or if an envelope with this same
+    /// `MessageId` has already been published here before, which is
+    /// dropped rather than redelivered or re-buffered (see ADR-0011).
     pub async fn publish(&self, topic: &Topic, envelope: Arc<Envelope>) -> usize {
         let is_new = self.seen.lock().unwrap().record(envelope.id);
         if !is_new {
@@ -178,6 +242,18 @@ impl Broker {
         for (filter, channel) in patterns.iter() {
             if filter.matches(topic) {
                 delivered += channel.publish(Arc::clone(&envelope));
+            }
+        }
+        drop(patterns);
+
+        // Consumer groups (ADR-0042): same linear-scan tradeoff as
+        // patterns above, expected to matter even less at scale - a
+        // handful of named groups per filter, not thousands of
+        // individual subscribers.
+        let mut groups = self.groups.lock().unwrap();
+        for (key, members) in groups.iter_mut() {
+            if key.0.matches(topic) && members.deliver(Arc::clone(&envelope)) {
+                delivered += 1;
             }
         }
         delivered
@@ -330,6 +406,46 @@ impl TopicChannel {
             buffer.pop_front();
         }
         self.sender.send(envelope).unwrap_or(0)
+    }
+}
+
+/// Identifies one consumer group (ADR-0042): the filter it's
+/// registered against, paired with its own name - two different
+/// names on the same filter are two independent groups.
+type GroupKey = (TopicFilter, String);
+
+/// One consumer group's currently registered members, plus a
+/// round-robin cursor into them. See [`Broker::join_group`].
+#[derive(Debug, Default)]
+struct GroupMembers {
+    members: Vec<mpsc::Sender<Arc<Envelope>>>,
+    /// Index into `members` to try first on the *next* delivery -
+    /// always kept within bounds of whatever `members.len()` is at
+    /// the time, even as membership changes.
+    next: usize,
+}
+
+impl GroupMembers {
+    /// Round-robins through this group's currently registered
+    /// members, `try_send`ing to each in turn starting from `next`,
+    /// until one accepts it or every member has been tried once.
+    /// Returns whether *any* member accepted it - `false` only when
+    /// the group is empty or every member's channel is currently full
+    /// or already closed, the same "no live receiver right now" case
+    /// [`Broker::publish`] already treats as normal, not an error.
+    fn deliver(&mut self, envelope: Arc<Envelope>) -> bool {
+        let len = self.members.len();
+        if len == 0 {
+            return false;
+        }
+        for offset in 0..len {
+            let idx = (self.next + offset) % len;
+            if self.members[idx].try_send(Arc::clone(&envelope)).is_ok() {
+                self.next = (idx + 1) % len;
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -779,6 +895,215 @@ mod tests {
         assert_eq!(broker.topic_evictions(), 0, "topics is a separate cap");
         let (backlog, _rx) = broker.subscribe(evicted).await;
         assert!(backlog.is_empty());
+    }
+
+    /// Registers `count` fresh members for `(filter, group)`, returning
+    /// their receivers in join order - what `deliver`'s round-robin
+    /// cursor starts iterating from.
+    async fn join_members(
+        broker: &Broker,
+        filter: TopicFilter,
+        group: &str,
+        count: usize,
+    ) -> Vec<mpsc::Receiver<Arc<Envelope>>> {
+        let mut receivers = Vec::with_capacity(count);
+        for _ in 0..count {
+            let (tx, rx) = mpsc::channel(8);
+            broker.join_group(filter.clone(), group.to_owned(), tx);
+            receivers.push(rx);
+        }
+        receivers
+    }
+
+    #[tokio::test]
+    async fn a_publish_goes_to_exactly_one_group_member() {
+        let broker = Broker::new();
+        let topic = Topic::from_str("weather.updates").unwrap();
+        let mut members = join_members(&broker, topic.clone().into(), "workers", 2).await;
+
+        let envelope = publish_envelope(&topic, b"sunny");
+        let delivered = broker.publish(&topic, envelope.clone()).await;
+
+        assert_eq!(delivered, 1, "exactly one group member, not both");
+        let got: Vec<bool> = members.iter_mut().map(|rx| rx.try_recv().is_ok()).collect();
+        assert_eq!(
+            got.iter().filter(|&&got_it| got_it).count(),
+            1,
+            "exactly one member's channel actually received it: {got:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn group_delivery_round_robins_across_members() {
+        let broker = Broker::new();
+        let topic = Topic::from_str("weather.updates").unwrap();
+        let mut members = join_members(&broker, topic.clone().into(), "workers", 2).await;
+
+        let mut published = Vec::with_capacity(4);
+        for i in 0..4u32 {
+            let envelope = publish_envelope(&topic, format!("update {i}").as_bytes());
+            broker.publish(&topic, envelope.clone()).await;
+            published.push(envelope);
+        }
+
+        // Each member got every other message, alternating starting
+        // with the first member joined - not both getting everything,
+        // and not one member starved.
+        let member_0: Vec<_> = std::iter::from_fn(|| members[0].try_recv().ok())
+            .map(|e| e.id)
+            .collect();
+        let member_1: Vec<_> = std::iter::from_fn(|| members[1].try_recv().ok())
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(member_0, vec![published[0].id, published[2].id]);
+        assert_eq!(member_1, vec![published[1].id, published[3].id]);
+    }
+
+    #[tokio::test]
+    async fn leave_group_removes_a_matching_member() {
+        let broker = Broker::new();
+        let topic = Topic::from_str("weather.updates").unwrap();
+        let filter: TopicFilter = topic.clone().into();
+        let (tx_a, mut rx_a) = mpsc::channel(8);
+        let (tx_b, mut rx_b) = mpsc::channel(8);
+        broker.join_group(filter.clone(), "workers".to_owned(), tx_a.clone());
+        broker.join_group(filter.clone(), "workers".to_owned(), tx_b);
+        broker.leave_group(filter, "workers".to_owned(), &tx_a);
+
+        // Two publishes - if `tx_a` were still a member, round-robin
+        // would alternate; since only `tx_b` remains, both go to it.
+        broker
+            .publish(&topic, publish_envelope(&topic, b"one"))
+            .await;
+        broker
+            .publish(&topic, publish_envelope(&topic, b"two"))
+            .await;
+
+        assert!(rx_a.try_recv().is_err(), "removed member got nothing");
+        assert!(rx_b.try_recv().is_ok());
+        assert!(rx_b.try_recv().is_ok());
+    }
+
+    #[tokio::test]
+    async fn leave_group_is_a_no_op_for_a_non_member() {
+        let broker = Broker::new();
+        let topic = Topic::from_str("weather.updates").unwrap();
+        let filter: TopicFilter = topic.clone().into();
+        let (tx, mut rx) = mpsc::channel(8);
+        broker.join_group(filter.clone(), "workers".to_owned(), tx);
+
+        let (never_joined, _never_joined_rx) = mpsc::channel(8);
+        broker.leave_group(filter, "workers".to_owned(), &never_joined);
+
+        broker
+            .publish(&topic, publish_envelope(&topic, b"still here"))
+            .await;
+        assert!(rx.try_recv().is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_group_member_with_a_full_channel_is_skipped_in_favor_of_the_next() {
+        let broker = Broker::new();
+        let topic = Topic::from_str("weather.updates").unwrap();
+        let filter: TopicFilter = topic.clone().into();
+        let (tx_full, rx_full) = mpsc::channel(1);
+        // Fill tx_full's one slot without ever draining it.
+        tx_full
+            .try_send(publish_envelope(&topic, b"already queued"))
+            .unwrap();
+        let (tx_open, mut rx_open) = mpsc::channel(8);
+        broker.join_group(filter, "workers".to_owned(), tx_full);
+        broker.join_group(topic.clone().into(), "workers".to_owned(), tx_open);
+
+        let envelope = publish_envelope(&topic, b"sunny");
+        let delivered = broker.publish(&topic, envelope.clone()).await;
+
+        assert_eq!(delivered, 1);
+        assert_eq!(rx_open.try_recv().unwrap().id, envelope.id);
+        drop(rx_full); // only ever held the one pre-queued message
+    }
+
+    #[tokio::test]
+    async fn a_wildcard_group_filter_matches_a_publish_on_it() {
+        let broker = Broker::new();
+        let mut members = join_members(&broker, filter("weather.+"), "workers", 1).await;
+
+        let topic = Topic::from_str("weather.updates").unwrap();
+        let envelope = publish_envelope(&topic, b"sunny");
+        let delivered = broker.publish(&topic, envelope.clone()).await;
+
+        assert_eq!(delivered, 1);
+        assert_eq!(members[0].try_recv().unwrap().id, envelope.id);
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_subscriber_and_a_consumer_group_on_the_same_filter_both_independently_receive()
+     {
+        let broker = Broker::new();
+        let topic = Topic::from_str("weather.updates").unwrap();
+        let mut fanout_rx = subscribe_live(&broker, topic.clone()).await;
+        let mut members = join_members(&broker, topic.clone().into(), "workers", 1).await;
+
+        let envelope = publish_envelope(&topic, b"sunny");
+        let delivered = broker.publish(&topic, envelope.clone()).await;
+
+        assert_eq!(delivered, 2, "one fan-out subscriber plus one group member");
+        assert_eq!(fanout_rx.recv().await.unwrap().id, envelope.id);
+        assert_eq!(members[0].try_recv().unwrap().id, envelope.id);
+    }
+
+    #[tokio::test]
+    async fn two_differently_named_groups_on_the_same_filter_are_independent() {
+        let broker = Broker::new();
+        let topic = Topic::from_str("weather.updates").unwrap();
+        let mut group_a = join_members(&broker, topic.clone().into(), "a", 1).await;
+        let mut group_b = join_members(&broker, topic.clone().into(), "b", 1).await;
+
+        let envelope = publish_envelope(&topic, b"sunny");
+        let delivered = broker.publish(&topic, envelope.clone()).await;
+
+        assert_eq!(delivered, 2, "each group gets its own copy");
+        assert_eq!(group_a[0].try_recv().unwrap().id, envelope.id);
+        assert_eq!(group_b[0].try_recv().unwrap().id, envelope.id);
+    }
+
+    #[tokio::test]
+    async fn a_group_member_does_not_see_a_publish_that_happened_before_it_joined() {
+        // Unlike an ordinary subscribe (ADR-0021's replay buffer), a
+        // consumer group has no backlog - see ADR-0042.
+        let broker = Broker::new();
+        let topic = Topic::from_str("weather.updates").unwrap();
+        broker
+            .publish(&topic, publish_envelope(&topic, b"before"))
+            .await;
+
+        let mut members = join_members(&broker, topic.clone().into(), "workers", 1).await;
+        let after = publish_envelope(&topic, b"after");
+        broker.publish(&topic, after.clone()).await;
+
+        assert_eq!(members[0].try_recv().unwrap().id, after.id);
+        assert!(
+            members[0].try_recv().is_err(),
+            "nothing else should have arrived - no backlog for a group"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_publish_to_a_group_with_no_current_members_is_not_an_error() {
+        let broker = Broker::new();
+        let topic = Topic::from_str("weather.updates").unwrap();
+        let filter: TopicFilter = topic.clone().into();
+        let (tx, _rx) = mpsc::channel(8);
+        broker.join_group(filter.clone(), "workers".to_owned(), tx.clone());
+        broker.leave_group(filter, "workers".to_owned(), &tx);
+
+        // The group entry still exists (now with zero members) -
+        // publishing to it contributes nothing to `delivered`, same as
+        // publishing to a topic nobody is subscribed to at all.
+        let delivered = broker
+            .publish(&topic, publish_envelope(&topic, b"anybody?"))
+            .await;
+        assert_eq!(delivered, 0);
     }
 
     #[test]

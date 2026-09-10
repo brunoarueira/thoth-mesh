@@ -47,6 +47,7 @@ thoth-mesh, using the format described in
 | [0039](0039-silently-correct-mismatched-peerid.md) | Silently correct a mismatched `PeerId` claim |
 | [0040](0040-membership-trusts-only-authenticated-identity.md) | Membership and loop-prevention trust only the authenticated identity |
 | [0041](0041-at-least-once-delivery-with-ack-based-redelivery.md) | At-least-once delivery with ack-based redelivery |
+| [0042](0042-consumer-groups.md) | Consumer groups |
 
 To add a new one, copy the format of an existing ADR, number it
 sequentially, and set its status to `Accepted` once the decision is

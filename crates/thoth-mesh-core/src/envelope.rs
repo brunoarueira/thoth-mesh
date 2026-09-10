@@ -59,6 +59,7 @@ mod tests {
             MessageKind::Subscribe {
                 filter: topic.clone().into(),
                 ack: false,
+                group: None,
             },
             MessageKind::Unsubscribe {
                 filter: topic.into(),

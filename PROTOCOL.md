@@ -21,9 +21,10 @@ peer-link authorization),
 [ADR-0021](docs/adr/0021-message-replay-ring-buffer.md) (replay for
 late subscribers), and
 [ADR-0022](docs/adr/0022-wildcard-topic-filters.md) (wildcard topic
-filters), and [ADR-0041](docs/adr/0041-at-least-once-delivery-with-ack-based-redelivery.md)
-(at-least-once delivery with ack-based redelivery). For diagrams of
-several of these flows, see [docs/FLOWS.md](docs/FLOWS.md).
+filters), [ADR-0041](docs/adr/0041-at-least-once-delivery-with-ack-based-redelivery.md)
+(at-least-once delivery with ack-based redelivery), and
+[ADR-0042](docs/adr/0042-consumer-groups.md) (consumer groups). For
+diagrams of several of these flows, see [docs/FLOWS.md](docs/FLOWS.md).
 
 **Status:** version 1, and explicitly unstable — see ADR-0014. Nothing
 here should be assumed to hold across a breaking change; check
@@ -203,21 +204,22 @@ reply. See [Delivery semantics](#delivery-semantics) for what
 ### `Subscribe`
 
 ```
-{"Subscribe": {"filter": <TopicFilter>, "ack": <bool>}}
+{"Subscribe": {"filter": <TopicFilter>, "ack": <bool>, "group": <string | null>}}
 ```
 
 Registers interest in `filter` on this connection - a literal topic
 name or a wildcard pattern alike (ADR-0022). The node replies with an
 `Ack` once registered, or an `Error` instead if a `--topic-acl` (or,
-for a peer link, a `--peer-topic-acl`) refuses it. A wildcard `filter`
+for a peer link, a `--peer-topic-acl`) refuses it, or if `ack` and
+`group` are both set (see `group` below). A wildcard `filter`
 is refused outright wherever either ACL is configured for this
 connection's role, regardless of what it would actually expand to -
 neither ACL is pattern-aware, and this codebase doesn't attempt to
 make one covering-pattern imply anything about another. Sending
 `Subscribe` for a filter this connection is already subscribed to is a
-no-op (still gets an `Ack`) - including for `ack`: it's only read the
-first time a filter is subscribed to, the same as everything else a
-no-op re-`Subscribe` doesn't retroactively change.
+no-op (still gets an `Ack`) - including for `ack`/`group`: both are
+only read the first time a filter is subscribed to, the same as
+everything else a no-op re-`Subscribe` doesn't retroactively change.
 
 `ack` opts this subscription into at-least-once delivery
 ([ADR-0041](docs/adr/0041-at-least-once-delivery-with-ack-based-redelivery.md)):
@@ -251,6 +253,23 @@ filter string* has been subscribed to at least once - unlike a literal
 topic, there's no way to pre-buffer for a pattern nobody has used yet
 (see ADR-0022's Consequences). A replay-buffer delivery is held for
 acknowledgement exactly like a live one when `ack: true`.
+
+`group` joins the named consumer group for `filter` instead of
+ordinary fan-out
+([ADR-0042](docs/adr/0042-consumer-groups.md)): each `Publish`
+matching `filter` goes to exactly one currently-live member of the
+group, round-robin, rather than every subscriber. Two different
+`group` names on the same `filter` are two independent groups, each
+getting its own copy; *within* one group, only one member gets each
+message. A group member gets no replay-buffer catch-up on join and no
+lag recovery if it falls behind (unlike ordinary fan-out, ADR-0021/
+ADR-0024) - live delivery only, exactly as strong a guarantee as
+ordinary fire-and-forget, just applied once across the group instead
+of fanned out to everyone. `group: Some(_)` combined with `ack: true`
+is refused with an `Error` - what acknowledgement means for a group
+isn't defined by this protocol version. `#[serde(default)]` on the
+implementation side, same rolling-upgrade story as `ack`: a sender
+that omits `group` entirely gets `None`, unchanged fan-out behavior.
 
 ### `Unsubscribe`
 
@@ -486,3 +505,12 @@ guarantee:
   subscriptions (ADR-0022) — a connection holding both receives the
   matching `Publish` once per subscription, not deduplicated down to
   one.
+- **A consumer group has no replay buffer and no lag recovery.**
+  `group` (ADR-0042) picks exactly one live member per message instead
+  of fan-out, but that member gets it only if it's live and keeping up
+  *at that moment* - no backlog on joining (ADR-0021 doesn't apply to
+  a group), and a member that falls behind just misses what it missed,
+  rather than recovering it the way an ordinary fan-out forwarder does
+  (ADR-0024). A group's overall delivery guarantee is exactly
+  fire-and-forget, applied once across the group rather than fanned
+  out to everyone in it.

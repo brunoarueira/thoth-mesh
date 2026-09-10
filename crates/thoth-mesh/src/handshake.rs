@@ -181,6 +181,7 @@ mod tests {
                 MessageKind::Subscribe {
                     filter: "weather.updates".parse().unwrap(),
                     ack: false,
+                    group: None,
                 },
             );
             let mut preloaded = Vec::new();
