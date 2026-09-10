@@ -350,46 +350,49 @@ async fn consumer_group_round_robins_across_two_members() {
     assert!(recv_times_out(&mut member_b).await);
 }
 
-/// A group member that disconnects is no longer round-robined to -
-/// the remaining member gets everything, same as `leave_group` being
-/// called explicitly (ADR-0042's `shut_down` integration).
+/// A group member that `Unsubscribe`s is dropped from the round-robin
+/// rotation - the remaining member then gets every message, and the
+/// one that left gets nothing (ADR-0042). Deliberately tests the
+/// `Unsubscribe` path rather than a disconnect: an `Unsubscribe`
+/// leaves the connection *open*, so if `leave_group` weren't actually
+/// called, `member_b` would still be a live channel and round-robin
+/// would send it half the messages - which `recv_times_out(member_b)`
+/// below would catch. A disconnect can't isolate that: a dropped
+/// connection's channel also closes, and `Broker`'s delivery already
+/// skips a closed channel on its own, so the two paths are
+/// indistinguishable from the wire. The disconnect path itself just
+/// reuses this same `leave_group` call from `shut_down`.
 #[tokio::test]
-async fn a_disconnected_group_member_is_no_longer_delivered_to() {
+async fn a_group_member_that_unsubscribes_is_dropped_from_the_rotation() {
     let addr = spawn_test_node().await;
     let mut member_a = connect(addr).await;
     let mut member_b = connect(addr).await;
     let mut publisher = connect(addr).await;
 
-    let sub_a = Envelope::new(
+    for member in [&mut member_a, &mut member_b] {
+        let sub = Envelope::new(
+            PeerId::new(),
+            MessageKind::Subscribe {
+                filter: topic("weather.updates").into(),
+                ack: false,
+                group: Some("workers".to_owned()),
+            },
+        );
+        send(member, &sub).await;
+        recv(member).await; // subscribe ack
+    }
+
+    let unsub = Envelope::new(
         PeerId::new(),
-        MessageKind::Subscribe {
+        MessageKind::Unsubscribe {
             filter: topic("weather.updates").into(),
-            ack: false,
-            group: Some("workers".to_owned()),
         },
     );
-    send(&mut member_a, &sub_a).await;
-    recv(&mut member_a).await; // subscribe ack
+    send(&mut member_b, &unsub).await;
+    recv(&mut member_b).await; // unsubscribe ack
 
-    let sub_b = Envelope::new(
-        PeerId::new(),
-        MessageKind::Subscribe {
-            filter: topic("weather.updates").into(),
-            ack: false,
-            group: Some("workers".to_owned()),
-        },
-    );
-    send(&mut member_b, &sub_b).await;
-    recv(&mut member_b).await; // subscribe ack
-
-    drop(member_b); // disconnects - shut_down should call leave_group
-
-    // Give the disconnect's shut_down a moment to actually run before
-    // publishing - it's a background task this test doesn't otherwise
-    // synchronize with.
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    for i in 0..2u32 {
+    let mut published = Vec::with_capacity(4);
+    for i in 0..4u32 {
         let publish = Envelope::new(
             PeerId::new(),
             MessageKind::Publish {
@@ -398,9 +401,17 @@ async fn a_disconnected_group_member_is_no_longer_delivered_to() {
             },
         );
         send(&mut publisher, &publish).await;
-        let delivered = recv(&mut member_a).await;
-        assert_eq!(delivered.id, publish.id);
+        published.push(publish);
     }
+
+    // Every message goes to the one member still in the group, in
+    // order - if `member_b` were still in the rotation, it would have
+    // taken messages 1 and 3 and these `recv`s would hang.
+    for publish in &published {
+        assert_eq!(recv(&mut member_a).await.id, publish.id);
+    }
+    // And the member that left gets nothing at all.
+    assert!(recv_times_out(&mut member_b).await);
 }
 
 /// Unsubscribing from a group leaves it - `Broker::leave_group` is
