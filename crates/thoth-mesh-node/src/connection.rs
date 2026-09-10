@@ -528,10 +528,15 @@ impl ConnectionContext {
     /// closed and the read loop should stop.
     async fn handle_publish(&mut self, envelope: Envelope) -> bool {
         let envelope = Arc::new(envelope);
-        let MessageKind::Publish { topic, payload } = &envelope.kind else {
+        let MessageKind::Publish {
+            topic,
+            payload,
+            retain,
+        } = &envelope.kind
+        else {
             unreachable!("handle_publish is only ever called for a Publish envelope");
         };
-        tracing::debug!(sender = ?envelope.sender, %topic, len = payload.len(), "publish");
+        tracing::debug!(sender = ?envelope.sender, %topic, len = payload.len(), retain, "publish");
         let topic = topic.clone();
         let is_peer = self.is_peer();
         if !acl_permits(
@@ -1299,6 +1304,7 @@ mod tests {
                 MessageKind::Publish {
                     topic: topic.clone(),
                     payload: i.to_be_bytes().to_vec(),
+                    retain: false,
                 },
             );
             broker.publish(topic, Arc::new(envelope)).await;
@@ -1426,6 +1432,7 @@ mod tests {
             MessageKind::Publish {
                 topic: topic.clone(),
                 payload: b"sunny".to_vec(),
+                retain: false,
             },
         );
         broker.publish(&topic, Arc::new(envelope.clone())).await;
@@ -1480,6 +1487,7 @@ mod tests {
             MessageKind::Publish {
                 topic: topic.clone(),
                 payload: b"sunny".to_vec(),
+                retain: false,
             },
         );
         broker.publish(&topic, Arc::new(envelope.clone())).await;

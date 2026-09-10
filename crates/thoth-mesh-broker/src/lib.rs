@@ -6,17 +6,18 @@
 //! recent history, ADR-0022 for wildcard topic filters, ADR-0024 for
 //! why the replay buffer is sized larger than the broadcast channel it
 //! sits alongside, ADR-0025 for why `topics`/`patterns` are each
-//! capped, never evicting an entry with a live subscriber, and
-//! ADR-0042 for consumer groups - `publish`'s other delivery path,
-//! exactly one member per message rather than fan-out to every
-//! subscriber.
+//! capped, never evicting an entry with a live subscriber, ADR-0042
+//! for consumer groups - `publish`'s other delivery path, exactly one
+//! member per message rather than fan-out to every subscriber - and
+//! ADR-0043 for retained (last-value) messages, delivered to a later
+//! subscriber even after they've fallen out of the replay window.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::Hash;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use thoth_mesh_core::{Envelope, MessageId, Topic, TopicFilter};
+use thoth_mesh_core::{Envelope, MessageId, MessageKind, Topic, TopicFilter};
 use tokio::sync::{RwLock, broadcast, mpsc};
 
 /// Default channel capacity for a topic's broadcast channel.
@@ -133,17 +134,43 @@ impl Broker {
         &self,
         filter: TopicFilter,
     ) -> (Vec<Arc<Envelope>>, broadcast::Receiver<Arc<Envelope>>) {
-        let channel = match filter.as_topic() {
+        match filter.as_topic() {
+            // Exact topic: its own channel's `subscribe` already folds
+            // in that topic's retained message (ADR-0043) under the
+            // same lock as the buffer snapshot, so it's race-free.
             Some(topic) => {
                 let mut topics = self.topics.write().await;
-                topics.get_or_insert(topic, &self.topic_evictions)
+                topics
+                    .get_or_insert(topic, &self.topic_evictions)
+                    .subscribe()
             }
+            // Wildcard: the pattern channel has no retained slot of its
+            // own (ADR-0043) - gather each matching *exact* topic's
+            // retained message by scanning `topics`, merge them into
+            // the pattern's replay backlog deduplicated by `MessageId`,
+            // and sort the whole thing by id (a UUIDv7, monotonic by
+            // creation time) so retained values and replay history land
+            // in a coherent order.
             None => {
-                let mut patterns = self.patterns.write().await;
-                patterns.get_or_insert(filter, &self.pattern_evictions)
+                let (mut backlog, receiver) = {
+                    let mut patterns = self.patterns.write().await;
+                    patterns
+                        .get_or_insert(filter.clone(), &self.pattern_evictions)
+                        .subscribe()
+                };
+                let topics = self.topics.read().await;
+                for (topic, channel) in topics.iter() {
+                    if filter.matches(topic)
+                        && let Some(retained) = channel.retained_snapshot()
+                        && !backlog.iter().any(|e| e.id == retained.id)
+                    {
+                        backlog.push(retained);
+                    }
+                }
+                backlog.sort_by_key(|e| e.id);
+                (backlog, receiver)
             }
-        };
-        channel.subscribe()
+        }
     }
 
     /// Joins `sender` to the named consumer `group` for `filter`
@@ -222,11 +249,16 @@ impl Broker {
         }
         self.messages_published.fetch_add(1, Ordering::Relaxed);
 
+        // The retained effect (ADR-0043) is the exact topic's alone -
+        // pattern channels never hold a retained value (see
+        // `Broker::subscribe`), so they always get `retain: false`.
+        let retain = matches!(&envelope.kind, MessageKind::Publish { retain: true, .. });
+
         let exact_channel = {
             let mut topics = self.topics.write().await;
             topics.get_or_insert(topic.clone(), &self.topic_evictions)
         };
-        let mut delivered = exact_channel.publish(Arc::clone(&envelope));
+        let mut delivered = exact_channel.publish(Arc::clone(&envelope), retain);
 
         // Every *currently registered* pattern is checked against
         // `topic` on each publish - O(number of distinct active
@@ -241,7 +273,7 @@ impl Broker {
         let patterns = self.patterns.read().await;
         for (filter, channel) in patterns.iter() {
             if filter.matches(topic) {
-                delivered += channel.publish(Arc::clone(&envelope));
+                delivered += channel.publish(Arc::clone(&envelope), false);
             }
         }
         drop(patterns);
@@ -364,46 +396,93 @@ impl<K: Eq + Hash + Clone> TopicMap<K> {
     }
 }
 
-/// One topic's live broadcast channel paired with its bounded replay
-/// buffer (ADR-0021), guarded by the same lock so a new subscriber's
-/// backlog snapshot and its receiver registration happen as one atomic
-/// step relative to a concurrent [`publish`](TopicChannel::publish).
+/// The part of a [`TopicChannel`] that has to move atomically with a
+/// publish: the replay buffer (ADR-0021) and the retained/last-value
+/// message (ADR-0043). Both live under one lock so a new subscriber's
+/// snapshot of them and its receiver registration are one atomic step
+/// relative to a concurrent publish.
+#[derive(Debug, Default)]
+struct ChannelState {
+    buffer: VecDeque<Arc<Envelope>>,
+    /// The topic's retained message, if one has been set and not
+    /// cleared - delivered to any later subscriber even after it's
+    /// fallen out of `buffer`'s window. See ADR-0043. Only ever set on
+    /// an *exact-topic* channel, never a pattern one.
+    retained: Option<Arc<Envelope>>,
+}
+
+/// One topic's live broadcast channel paired with its [`ChannelState`]
+/// (replay buffer + retained message), guarded by one lock so a new
+/// subscriber's snapshot and its receiver registration happen as one
+/// atomic step relative to a concurrent
+/// [`publish`](TopicChannel::publish).
 #[derive(Debug)]
 struct TopicChannel {
     sender: broadcast::Sender<Arc<Envelope>>,
-    buffer: Mutex<VecDeque<Arc<Envelope>>>,
+    state: Mutex<ChannelState>,
 }
 
 impl TopicChannel {
     fn new() -> Self {
         Self {
             sender: broadcast::channel(DEFAULT_TOPIC_CHANNEL_CAPACITY).0,
-            buffer: Mutex::new(VecDeque::with_capacity(DEFAULT_REPLAY_BUFFER_CAPACITY)),
+            state: Mutex::new(ChannelState {
+                buffer: VecDeque::with_capacity(DEFAULT_REPLAY_BUFFER_CAPACITY),
+                retained: None,
+            }),
         }
     }
 
     /// Registers a new receiver and snapshots the current replay
-    /// buffer under the same lock, so a concurrent
-    /// [`publish`](Self::publish) can never land in neither (a lost
-    /// envelope) or both (a duplicate): the two are strictly ordered by
-    /// the lock, so whichever runs first completes in full - buffer
-    /// push *and* broadcast send - before the other starts. See
-    /// ADR-0021.
+    /// buffer *and* retained message under the same lock, so a
+    /// concurrent [`publish`](Self::publish) can never land in neither
+    /// (a lost envelope) or both (a duplicate): the two are strictly
+    /// ordered by the lock, so whichever runs first completes in full -
+    /// buffer push, retained update *and* broadcast send - before the
+    /// other starts. See ADR-0021 and ADR-0043.
+    ///
+    /// The returned backlog is the buffer contents, plus the retained
+    /// message prepended *if* it's not already in the buffer (i.e.
+    /// it's fallen out of the replay window) - "here's the current
+    /// value, then recent history since".
     fn subscribe(&self) -> (Vec<Arc<Envelope>>, broadcast::Receiver<Arc<Envelope>>) {
-        let buffer = self.buffer.lock().unwrap();
+        let state = self.state.lock().unwrap();
         let receiver = self.sender.subscribe();
-        (buffer.iter().cloned().collect(), receiver)
+        let mut backlog: Vec<Arc<Envelope>> = state.buffer.iter().cloned().collect();
+        if let Some(retained) = &state.retained
+            && !backlog.iter().any(|e| e.id == retained.id)
+        {
+            backlog.insert(0, Arc::clone(retained));
+        }
+        (backlog, receiver)
+    }
+
+    /// This channel's retained message right now, if any - a
+    /// standalone snapshot for a *wildcard* subscribe, which has to
+    /// gather retained values from every matching exact-topic channel
+    /// (ADR-0043) rather than from one channel's own
+    /// [`subscribe`](Self::subscribe).
+    fn retained_snapshot(&self) -> Option<Arc<Envelope>> {
+        self.state.lock().unwrap().retained.clone()
     }
 
     /// Appends `envelope` to the replay buffer (evicting the oldest
-    /// entry once over [`DEFAULT_REPLAY_BUFFER_CAPACITY`]) and
-    /// broadcasts it to every live receiver, as one critical section
-    /// under the same lock [`subscribe`](Self::subscribe) uses.
-    fn publish(&self, envelope: Arc<Envelope>) -> usize {
-        let mut buffer = self.buffer.lock().unwrap();
-        buffer.push_back(Arc::clone(&envelope));
-        if buffer.len() > DEFAULT_REPLAY_BUFFER_CAPACITY {
-            buffer.pop_front();
+    /// entry once over [`DEFAULT_REPLAY_BUFFER_CAPACITY`]), applies its
+    /// retained effect if `retain` is set (an empty payload *clears*
+    /// the retained message, any other payload *sets* it - ADR-0043),
+    /// and broadcasts it to every live receiver, as one critical
+    /// section under the same lock [`subscribe`](Self::subscribe) uses.
+    fn publish(&self, envelope: Arc<Envelope>, retain: bool) -> usize {
+        let mut state = self.state.lock().unwrap();
+        state.buffer.push_back(Arc::clone(&envelope));
+        if state.buffer.len() > DEFAULT_REPLAY_BUFFER_CAPACITY {
+            state.buffer.pop_front();
+        }
+        if retain {
+            state.retained = match &envelope.kind {
+                MessageKind::Publish { payload, .. } if payload.is_empty() => None,
+                _ => Some(Arc::clone(&envelope)),
+            };
         }
         self.sender.send(envelope).unwrap_or(0)
     }
@@ -498,6 +577,7 @@ mod tests {
             MessageKind::Publish {
                 topic: topic.clone(),
                 payload: payload.to_vec(),
+                retain: false,
             },
         ))
     }
@@ -1104,6 +1184,207 @@ mod tests {
             .publish(&topic, publish_envelope(&topic, b"anybody?"))
             .await;
         assert_eq!(delivered, 0);
+    }
+
+    fn retain_envelope(topic: &Topic, payload: &[u8]) -> Arc<Envelope> {
+        Arc::new(Envelope::new(
+            PeerId::new(),
+            MessageKind::Publish {
+                topic: topic.clone(),
+                payload: payload.to_vec(),
+                retain: true,
+            },
+        ))
+    }
+
+    #[tokio::test]
+    async fn a_retained_message_is_delivered_to_a_later_subscriber_exactly_once() {
+        let broker = Broker::new();
+        let topic = Topic::from_str("sensor.temp").unwrap();
+
+        let retained = retain_envelope(&topic, b"21C");
+        broker.publish(&topic, Arc::clone(&retained)).await;
+
+        // Subscribing afterward gets the retained value in the backlog,
+        // and only once (not also via the replay buffer entry it also
+        // created, not also live).
+        let (backlog, mut rx) = broker.subscribe(topic.clone().into()).await;
+        assert_eq!(backlog.len(), 1);
+        assert_eq!(backlog[0].id, retained.id);
+        assert!(rx.try_recv().is_err(), "already delivered via the backlog");
+    }
+
+    #[tokio::test]
+    async fn a_retained_message_survives_past_the_replay_window() {
+        let broker = Broker::new();
+        let topic = Topic::from_str("sensor.temp").unwrap();
+
+        let retained = retain_envelope(&topic, b"21C");
+        broker.publish(&topic, Arc::clone(&retained)).await;
+
+        // Flood the topic with enough non-retained traffic to evict the
+        // retained message from the bounded replay buffer entirely.
+        for i in 0..=DEFAULT_REPLAY_BUFFER_CAPACITY {
+            broker
+                .publish(
+                    &topic,
+                    publish_envelope(&topic, format!("noise {i}").as_bytes()),
+                )
+                .await;
+        }
+
+        let (backlog, _rx) = broker.subscribe(topic.clone().into()).await;
+        assert_eq!(
+            backlog.len(),
+            DEFAULT_REPLAY_BUFFER_CAPACITY + 1,
+            "the full replay window plus the retained message prepended"
+        );
+        assert_eq!(
+            backlog[0].id, retained.id,
+            "the retained message is the oldest entry - 'current value, then history since'"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_newer_retained_publish_replaces_the_previous_one() {
+        let broker = Broker::new();
+        let topic = Topic::from_str("sensor.temp").unwrap();
+
+        broker
+            .publish(&topic, retain_envelope(&topic, b"21C"))
+            .await;
+        let newer = retain_envelope(&topic, b"22C");
+        broker.publish(&topic, Arc::clone(&newer)).await;
+
+        // Evict both from the replay buffer so only the retained slot
+        // can answer.
+        for i in 0..=DEFAULT_REPLAY_BUFFER_CAPACITY {
+            broker
+                .publish(
+                    &topic,
+                    publish_envelope(&topic, format!("noise {i}").as_bytes()),
+                )
+                .await;
+        }
+
+        let (backlog, _rx) = broker.subscribe(topic.clone().into()).await;
+        assert_eq!(backlog[0].id, newer.id);
+        assert!(
+            !backlog.iter().any(|e| {
+                let MessageKind::Publish { payload, .. } = &e.kind else {
+                    return false;
+                };
+                payload == b"21C"
+            }),
+            "the superseded retained value is gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_retained_publish_with_an_empty_payload_clears_the_retained_message() {
+        let broker = Broker::new();
+        let topic = Topic::from_str("sensor.temp").unwrap();
+
+        broker
+            .publish(&topic, retain_envelope(&topic, b"21C"))
+            .await;
+        broker.publish(&topic, retain_envelope(&topic, b"")).await;
+
+        for i in 0..=DEFAULT_REPLAY_BUFFER_CAPACITY {
+            broker
+                .publish(
+                    &topic,
+                    publish_envelope(&topic, format!("noise {i}").as_bytes()),
+                )
+                .await;
+        }
+
+        let (backlog, _rx) = broker.subscribe(topic.clone().into()).await;
+        assert_eq!(
+            backlog.len(),
+            DEFAULT_REPLAY_BUFFER_CAPACITY,
+            "no retained message prepended - it was cleared"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_non_retained_publish_never_becomes_the_retained_message() {
+        let broker = Broker::new();
+        let topic = Topic::from_str("sensor.temp").unwrap();
+
+        broker
+            .publish(&topic, publish_envelope(&topic, b"not retained"))
+            .await;
+        for i in 0..=DEFAULT_REPLAY_BUFFER_CAPACITY {
+            broker
+                .publish(
+                    &topic,
+                    publish_envelope(&topic, format!("noise {i}").as_bytes()),
+                )
+                .await;
+        }
+
+        let (backlog, _rx) = broker.subscribe(topic.clone().into()).await;
+        assert_eq!(backlog.len(), DEFAULT_REPLAY_BUFFER_CAPACITY);
+    }
+
+    #[tokio::test]
+    async fn a_retained_message_and_a_live_publish_never_double_deliver() {
+        let broker = Broker::new();
+        let topic = Topic::from_str("sensor.temp").unwrap();
+
+        let retained = retain_envelope(&topic, b"21C");
+        broker.publish(&topic, Arc::clone(&retained)).await;
+
+        let (backlog, mut rx) = broker.subscribe(topic.clone().into()).await;
+        assert_eq!(backlog, vec![Arc::clone(&retained)]);
+
+        let live = publish_envelope(&topic, b"live");
+        broker.publish(&topic, Arc::clone(&live)).await;
+
+        assert_eq!(rx.recv().await.unwrap().id, live.id);
+        assert!(
+            rx.try_recv().is_err(),
+            "only the post-subscribe publish arrives live"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_wildcard_subscriber_gets_retained_values_from_every_matching_concrete_topic() {
+        let broker = Broker::new();
+        let temp = Topic::from_str("sensor.temp").unwrap();
+        let humidity = Topic::from_str("sensor.humidity").unwrap();
+
+        let temp_retained = retain_envelope(&temp, b"21C");
+        let humidity_retained = retain_envelope(&humidity, b"40%");
+        broker.publish(&temp, Arc::clone(&temp_retained)).await;
+        broker
+            .publish(&humidity, Arc::clone(&humidity_retained))
+            .await;
+
+        let (backlog, _rx) = broker.subscribe(filter("sensor.+")).await;
+        let ids: HashSet<_> = backlog.iter().map(|e| e.id).collect();
+        assert_eq!(ids, HashSet::from([temp_retained.id, humidity_retained.id]));
+        // Sorted by MessageId (UUIDv7), so the earlier publish comes
+        // first.
+        assert_eq!(backlog[0].id, temp_retained.id);
+        assert_eq!(backlog[1].id, humidity_retained.id);
+    }
+
+    #[tokio::test]
+    async fn a_consumer_group_does_not_receive_a_retained_message() {
+        // A group gets no catch-up of any kind - see ADR-0042/ADR-0043.
+        let broker = Broker::new();
+        let topic = Topic::from_str("sensor.temp").unwrap();
+        broker
+            .publish(&topic, retain_envelope(&topic, b"21C"))
+            .await;
+
+        let mut members = join_members(&broker, topic.clone().into(), "workers", 1).await;
+        assert!(
+            members[0].try_recv().is_err(),
+            "a group member joining after a retained publish gets nothing"
+        );
     }
 
     #[test]

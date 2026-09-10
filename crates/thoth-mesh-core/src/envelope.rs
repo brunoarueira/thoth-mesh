@@ -55,6 +55,7 @@ mod tests {
             MessageKind::Publish {
                 topic: topic.clone(),
                 payload: vec![1, 2, 3],
+                retain: false,
             },
             MessageKind::Subscribe {
                 filter: topic.clone().into(),

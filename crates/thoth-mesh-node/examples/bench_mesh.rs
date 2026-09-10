@@ -165,6 +165,7 @@ async fn run_once(hops: usize) -> BenchResult {
                 MessageKind::Publish {
                     topic: publish_topic.clone(),
                     payload: vec![0u8; PAYLOAD_SIZE],
+                    retain: false,
                 },
             );
             send(&mut publisher, &envelope).await;

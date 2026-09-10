@@ -90,7 +90,18 @@ pub struct MetricsSummary {
 pub enum MessageKind {
     /// Publish a payload to a topic. Always a concrete [`Topic`], never
     /// a filter - there's no such thing as publishing to a pattern.
-    Publish { topic: Topic, payload: Vec<u8> },
+    Publish {
+        topic: Topic,
+        payload: Vec<u8>,
+        /// Also make this the topic's retained (last-value) message,
+        /// delivered immediately to any later subscriber - see
+        /// ADR-0043. `#[serde(default)]` so an older sender omitting
+        /// this field decodes as `false` (unchanged behavior). A
+        /// `retain: true` publish with an empty `payload` clears the
+        /// topic's retained message instead of setting one.
+        #[serde(default)]
+        retain: bool,
+    },
     /// Subscribe to a topic filter - a plain topic name, or one
     /// containing MQTT-style wildcard segments (see ADR-0022).
     Subscribe {
@@ -182,6 +193,12 @@ mod tests {
             MessageKind::Publish {
                 topic: topic.clone(),
                 payload: vec![1, 2, 3],
+                retain: false,
+            },
+            MessageKind::Publish {
+                topic: topic.clone(),
+                payload: vec![1, 2, 3],
+                retain: true,
             },
             MessageKind::Subscribe {
                 filter: topic.clone().into(),
@@ -312,6 +329,38 @@ mod tests {
                 filter,
                 ack: true,
                 group: None,
+            }
+        );
+    }
+
+    /// A `Publish` encoded without a `retain` field - what every
+    /// sender that predates ADR-0043 puts on the wire - still decodes,
+    /// defaulting to `retain: false` (unchanged behavior).
+    #[test]
+    fn publish_without_a_retain_field_decodes_as_not_retained() {
+        let topic = Topic::from_str("weather.updates").unwrap();
+
+        #[derive(Serialize)]
+        enum PreAdr0043 {
+            Publish { topic: Topic, payload: Vec<u8> },
+        }
+
+        let mut bytes = Vec::new();
+        ciborium::into_writer(
+            &PreAdr0043::Publish {
+                topic: topic.clone(),
+                payload: vec![1, 2, 3],
+            },
+            &mut bytes,
+        )
+        .unwrap();
+        let decoded: MessageKind = ciborium::from_reader(&bytes[..]).unwrap();
+        assert_eq!(
+            decoded,
+            MessageKind::Publish {
+                topic,
+                payload: vec![1, 2, 3],
+                retain: false,
             }
         );
     }

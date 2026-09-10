@@ -80,6 +80,12 @@ pub enum Command {
         /// send a binary payload, or one too large for a CLI argument.
         /// See ADR-0035.
         payload: String,
+        /// Also make this the topic's retained (last-value) message,
+        /// delivered immediately to any later subscriber. Publishing
+        /// an empty payload with --retain clears the retained message
+        /// instead. See ADR-0043.
+        #[arg(long)]
+        retain: bool,
     },
     /// Subscribe to one or more topic filters and print delivered
     /// messages until interrupted (Ctrl-C).
@@ -181,10 +187,21 @@ pub async fn run(cli: Cli) -> std::io::Result<()> {
         .unwrap_or_else(PeerId::new);
 
     match cli.command {
-        Command::Publish { topic, payload } => {
+        Command::Publish {
+            topic,
+            payload,
+            retain,
+        } => {
             let topic = parse_topic(&topic)?;
             let payload = read_payload(&payload, tokio::io::stdin()).await?;
-            let envelope = Envelope::new(sender, MessageKind::Publish { topic, payload });
+            let envelope = Envelope::new(
+                sender,
+                MessageKind::Publish {
+                    topic,
+                    payload,
+                    retain,
+                },
+            );
             send(&mut conn, &envelope).await
         }
         Command::Subscribe {
@@ -312,7 +329,7 @@ async fn print_and_maybe_ack(
 /// what [`print_and_maybe_ack`] acks, and only ever a `Publish`'s own
 /// ID (ADR-0041).
 fn print_if_publish(envelope: &Envelope, output: OutputMode) -> std::io::Result<Option<MessageId>> {
-    let MessageKind::Publish { topic, payload } = &envelope.kind else {
+    let MessageKind::Publish { topic, payload, .. } = &envelope.kind else {
         return Ok(None);
     };
     match output {
@@ -732,6 +749,7 @@ mod tests {
             command: Command::Publish {
                 topic: "weather.updates".into(),
                 payload: "sunny".into(),
+                retain: false,
             },
         };
         run(cli).await.unwrap();
@@ -741,9 +759,50 @@ mod tests {
             .expect("timed out waiting for the publish")
             .unwrap();
         match delivered.kind {
-            MessageKind::Publish { topic, payload } => {
+            MessageKind::Publish { topic, payload, .. } => {
                 assert_eq!(topic, "weather.updates".parse().unwrap());
                 assert_eq!(payload, b"sunny");
+            }
+            other => panic!("expected a Publish, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_publish_retain_flag_reaches_a_later_subscriber() {
+        let addr = spawn_test_node().await;
+
+        // Publish with --retain before anyone is subscribed.
+        run(Cli {
+            addr: Some(addr.to_string()),
+            config: Some(nonexistent_config_path()),
+            tls_ca: None,
+            tls_cert: None,
+            tls_key: None,
+            command: Command::Publish {
+                topic: "sensor.temp".into(),
+                payload: "21C".into(),
+                retain: true,
+            },
+        })
+        .await
+        .unwrap();
+
+        // A wildcard subscriber to a fresh pattern - its own replay
+        // buffer is empty (ADR-0022), so this delivery is the retained
+        // value (ADR-0043), not ordinary replay.
+        let mut subscriber = connect(addr).await;
+        subscribe(&mut subscriber, PeerId::new(), "sensor.+".parse().unwrap())
+            .await
+            .unwrap();
+
+        let delivered = timeout(TEST_TIMEOUT, recv(&mut subscriber))
+            .await
+            .expect("timed out waiting for the retained value")
+            .unwrap();
+        match delivered.kind {
+            MessageKind::Publish { topic, payload, .. } => {
+                assert_eq!(topic, "sensor.temp".parse().unwrap());
+                assert_eq!(payload, b"21C");
             }
             other => panic!("expected a Publish, got {other:?}"),
         }
@@ -774,6 +833,7 @@ mod tests {
                 MessageKind::Publish {
                     topic: topic.clone(),
                     payload: b"jam".to_vec(),
+                    retain: false,
                 },
             ),
         )
@@ -789,6 +849,7 @@ mod tests {
             MessageKind::Publish {
                 topic,
                 payload: b"jam".to_vec(),
+                retain: false,
             }
         );
     }
@@ -964,6 +1025,7 @@ mod tests {
                 MessageKind::Publish {
                     topic: topic.clone(),
                     payload: b"sunny".to_vec(),
+                    retain: false,
                 },
             ),
         )
@@ -979,6 +1041,7 @@ mod tests {
             MessageKind::Publish {
                 topic,
                 payload: b"sunny".to_vec(),
+                retain: false,
             }
         );
     }
@@ -1047,6 +1110,7 @@ mod tests {
                     MessageKind::Publish {
                         topic: topic.parse().unwrap(),
                         payload,
+                        retain: false,
                     },
                 ),
             )
@@ -1060,7 +1124,7 @@ mod tests {
                 .await
                 .expect("timed out waiting for a publish")
                 .unwrap();
-            if let MessageKind::Publish { topic, payload } = envelope.kind {
+            if let MessageKind::Publish { topic, payload, .. } = envelope.kind {
                 delivered.push((topic.to_string(), payload));
             }
         }
@@ -1112,6 +1176,7 @@ mod tests {
                     MessageKind::Publish {
                         topic: "weather.updates".parse().unwrap(),
                         payload: b"sunny".to_vec(),
+                        retain: false,
                     },
                 ),
             )
@@ -1163,6 +1228,7 @@ mod tests {
             MessageKind::Publish {
                 topic: weather.as_topic().unwrap(),
                 payload: b"sunny".to_vec(),
+                retain: false,
             }
         );
     }
@@ -1237,6 +1303,7 @@ mod tests {
             command: Command::Publish {
                 topic: "weather.updates".into(),
                 payload: "sunny".into(),
+                retain: false,
             },
         }
     }
@@ -1361,6 +1428,7 @@ mod tests {
             MessageKind::Publish {
                 topic: "weather.updates".parse().unwrap(),
                 payload: b"sunny".to_vec(),
+                retain: false,
             }
         );
 
