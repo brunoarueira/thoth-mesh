@@ -22,9 +22,11 @@ peer-link authorization),
 late subscribers), and
 [ADR-0022](docs/adr/0022-wildcard-topic-filters.md) (wildcard topic
 filters), [ADR-0041](docs/adr/0041-at-least-once-delivery-with-ack-based-redelivery.md)
-(at-least-once delivery with ack-based redelivery), and
-[ADR-0042](docs/adr/0042-consumer-groups.md) (consumer groups). For
-diagrams of several of these flows, see [docs/FLOWS.md](docs/FLOWS.md).
+(at-least-once delivery with ack-based redelivery),
+[ADR-0042](docs/adr/0042-consumer-groups.md) (consumer groups), and
+[ADR-0043](docs/adr/0043-retained-messages.md) (retained/last-value
+messages). For diagrams of several of these flows, see
+[docs/FLOWS.md](docs/FLOWS.md).
 
 **Status:** version 1, and explicitly unstable — see ADR-0014. Nothing
 here should be assumed to hold across a breaking change; check
@@ -179,7 +181,7 @@ out: it's a bare string, not a one-entry map with a `null` value.
 ### `Publish`
 
 ```
-{"Publish": {"topic": <Topic>, "payload": <bytes>}}
+{"Publish": {"topic": <Topic>, "payload": <bytes>, "retain": <bool>}}
 ```
 
 Publishes `payload` to `topic`. `payload` is an arbitrary byte string
@@ -191,6 +193,23 @@ implementation's `Vec<u8>` field serializes by default, not a
 deliberate format choice — a byte string would be considerably more
 compact, but an implementation reading this protocol needs to accept
 what's actually on the wire today.
+
+`retain` (`#[serde(default)]` — an older sender that omits it means
+`false`) makes this publish *also* become the topic's retained
+(last-value) message
+([ADR-0043](docs/adr/0043-retained-messages.md)): it's delivered
+immediately to any connection that subscribes to a matching filter
+afterward, even long after it was published and after it's fallen out
+of the replay window ([ADR-0021](docs/adr/0021-message-replay-ring-buffer.md)).
+A `retain: true` publish with an **empty** `payload` *clears* the
+topic's retained message instead of setting one. Retained delivery is
+folded into the same backlog the replay buffer uses — a subscriber
+sees it as an ordinary `Publish`, deduplicated by `MessageId` against
+anything the replay window would also deliver. A retained value is
+*not* delivered to a consumer-group (`group`) subscribe, and it rides
+along in a forwarded envelope so a peer that receives a `retain: true`
+publish retains it locally too (this is not a mesh-wide retained-state
+sync — see ADR-0043).
 
 No reply is sent for a `Publish` — it's fire-and-forget from the
 sender's point of view, unless a `--topic-acl`
@@ -514,3 +533,12 @@ guarantee:
   (ADR-0024). A group's overall delivery guarantee is exactly
   fire-and-forget, applied once across the group rather than fanned
   out to everyone in it.
+- **A retained message is per node, not per mesh.** `retain: true`
+  (ADR-0043) gives a topic a last-value message that a later
+  subscriber gets immediately, but each node only retains what it
+  actually received: a node that gains interest in a topic *after* a
+  `retain: true` publish landed on another node does not have that
+  earlier value back-filled to it. A retained value can also be lost
+  to the same topic-map eviction the replay buffer is subject to
+  (ADR-0025) - a retained topic with no live subscriber, on a node
+  churning through more than 4096 distinct topics.

@@ -194,6 +194,17 @@ no lag recovery if it falls behind - a materially weaker guarantee
 than ordinary fan-out subscribing, worth knowing before relying on it
 for anything that can't tolerate a missed message.
 
+`publish --retain` also stores the payload as the topic's
+last-value message: any subscriber that connects afterward is handed
+it immediately, even long after it was published and after it's aged
+out of the normal replay window. Publishing an empty payload with
+`--retain` clears it. Handy for config/state topics where a new
+subscriber needs the current value without waiting for the next
+update. Caveats: it's per node (a node that only later gains interest
+in the topic doesn't get the earlier retained value), and it can be
+evicted along with an idle topic on a very busy node - see
+[ADR-0043](adr/0043-retained-messages.md).
+
 Every node and CLI invocation picks a fresh random `PeerId` on
 startup, with one exception: given `--tls-cert`/`--tls-key`, a node or
 CLI invocation derives its `PeerId` from that certificate's SHA-256

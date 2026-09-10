@@ -125,6 +125,7 @@ mod tests {
             MessageKind::Publish {
                 topic: "weather.updates".parse::<Topic>().unwrap(),
                 payload: b"sunny".to_vec(),
+                retain: false,
             },
         ))
     }

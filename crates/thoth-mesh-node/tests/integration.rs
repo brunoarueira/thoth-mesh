@@ -75,6 +75,7 @@ async fn publish_until_delivered(
     let expected_kind = MessageKind::Publish {
         topic: topic.clone(),
         payload: payload.to_vec(),
+        retain: false,
     };
     let deadline = tokio::time::Instant::now() + TEST_TIMEOUT;
     loop {
@@ -191,6 +192,7 @@ async fn publish_delivers_to_subscriber() {
         MessageKind::Publish {
             topic: topic("weather.updates"),
             payload: b"sunny".to_vec(),
+            retain: false,
         },
     );
     send(&mut publisher, &publish).await;
@@ -228,6 +230,7 @@ async fn an_acked_subscription_delivers_and_accepts_the_clients_ack() {
         MessageKind::Publish {
             topic: topic("weather.updates"),
             payload: b"sunny".to_vec(),
+            retain: false,
         },
     );
     send(&mut publisher, &publish).await;
@@ -250,6 +253,7 @@ async fn an_acked_subscription_delivers_and_accepts_the_clients_ack() {
         MessageKind::Publish {
             topic: topic("weather.updates"),
             payload: b"cloudy".to_vec(),
+            retain: false,
         },
     );
     send(&mut publisher, &second_publish).await;
@@ -336,6 +340,7 @@ async fn consumer_group_round_robins_across_two_members() {
             MessageKind::Publish {
                 topic: topic("weather.updates"),
                 payload: format!("update {i}").into_bytes(),
+                retain: false,
             },
         );
         send(&mut publisher, &publish).await;
@@ -398,6 +403,7 @@ async fn a_group_member_that_unsubscribes_is_dropped_from_the_rotation() {
             MessageKind::Publish {
                 topic: topic("weather.updates"),
                 payload: format!("update {i}").into_bytes(),
+                retain: false,
             },
         );
         send(&mut publisher, &publish).await;
@@ -448,6 +454,7 @@ async fn unsubscribing_from_a_group_leaves_it() {
         MessageKind::Publish {
             topic: topic("weather.updates"),
             payload: b"anybody?".to_vec(),
+            retain: false,
         },
     );
     send(&mut publisher, &publish).await;
@@ -480,6 +487,7 @@ async fn multiple_subscribers_all_receive() {
         MessageKind::Publish {
             topic: topic("weather.updates"),
             payload: b"sunny".to_vec(),
+            retain: false,
         },
     );
     send(&mut publisher, &publish).await;
@@ -498,6 +506,7 @@ async fn a_late_subscriber_is_replayed_a_publish_that_happened_before_it_subscri
         MessageKind::Publish {
             topic: topic("weather.updates"),
             payload: b"sunny".to_vec(),
+            retain: false,
         },
     );
     send(&mut publisher, &publish).await;
@@ -519,6 +528,78 @@ async fn a_late_subscriber_is_replayed_a_publish_that_happened_before_it_subscri
     let delivered = recv(&mut subscriber).await;
     assert_eq!(delivered.id, publish.id);
     assert_eq!(delivered.kind, publish.kind);
+}
+
+/// A `retain: true` publish (ADR-0043) reaches a subscriber that only
+/// connects afterward. Uses a *wildcard* subscribe to a pattern
+/// nobody has used before - whose own replay buffer is therefore
+/// empty (ADR-0022) - so the delivery can only be the retained value,
+/// not ordinary replay: an equivalent non-retained publish would not
+/// be retroactively matched into a fresh pattern at all.
+#[tokio::test]
+async fn a_retained_publish_reaches_a_wildcard_subscriber_that_connects_afterward() {
+    let addr = spawn_test_node().await;
+    let mut publisher = connect(addr).await;
+    let retained = Envelope::new(
+        PeerId::new(),
+        MessageKind::Publish {
+            topic: topic("sensor.temp"),
+            payload: b"21C".to_vec(),
+            retain: true,
+        },
+    );
+    send(&mut publisher, &retained).await;
+
+    let mut subscriber = connect(addr).await;
+    let sub = Envelope::new(
+        PeerId::new(),
+        MessageKind::Subscribe {
+            filter: filter("sensor.+"),
+            ack: false,
+            group: None,
+        },
+    );
+    send(&mut subscriber, &sub).await;
+    recv(&mut subscriber).await; // subscribe ack
+
+    let delivered = recv(&mut subscriber).await;
+    assert_eq!(delivered.id, retained.id);
+    assert_eq!(delivered.kind, retained.kind);
+}
+
+/// Publishing an empty payload with `retain: true` clears the topic's
+/// retained message (ADR-0043) - a later wildcard subscriber to a
+/// fresh pattern then gets nothing.
+#[tokio::test]
+async fn an_empty_retained_publish_clears_the_retained_message() {
+    let addr = spawn_test_node().await;
+    let mut publisher = connect(addr).await;
+
+    for payload in [b"21C".as_slice(), b"".as_slice()] {
+        let publish = Envelope::new(
+            PeerId::new(),
+            MessageKind::Publish {
+                topic: topic("sensor.temp"),
+                payload: payload.to_vec(),
+                retain: true,
+            },
+        );
+        send(&mut publisher, &publish).await;
+    }
+
+    let mut subscriber = connect(addr).await;
+    let sub = Envelope::new(
+        PeerId::new(),
+        MessageKind::Subscribe {
+            filter: filter("sensor.+"),
+            ack: false,
+            group: None,
+        },
+    );
+    send(&mut subscriber, &sub).await;
+    recv(&mut subscriber).await; // subscribe ack
+
+    assert!(recv_times_out(&mut subscriber).await);
 }
 
 #[tokio::test]
@@ -543,6 +624,7 @@ async fn resubscribing_to_an_already_subscribed_topic_does_not_replay_again() {
         MessageKind::Publish {
             topic: topic("weather.updates"),
             payload: b"sunny".to_vec(),
+            retain: false,
         },
     );
     send(&mut publisher, &publish).await;
@@ -603,6 +685,7 @@ async fn unsubscribed_client_does_not_receive_publish() {
         MessageKind::Publish {
             topic: topic("weather.updates"),
             payload: b"sunny".to_vec(),
+            retain: false,
         },
     );
     send(&mut publisher, &publish).await;
@@ -632,6 +715,7 @@ async fn distinct_topics_do_not_cross_deliver() {
         MessageKind::Publish {
             topic: topic("traffic.updates"),
             payload: b"jam".to_vec(),
+            retain: false,
         },
     );
     send(&mut publisher, &publish).await;
@@ -663,6 +747,7 @@ async fn a_wildcard_subscriber_receives_a_matching_publish() {
         MessageKind::Publish {
             topic: topic("weather.updates"),
             payload: b"sunny".to_vec(),
+            retain: false,
         },
     );
     send(&mut publisher, &publish).await;
@@ -693,6 +778,7 @@ async fn a_wildcard_subscriber_does_not_receive_a_non_matching_publish() {
         MessageKind::Publish {
             topic: topic("traffic.updates"),
             payload: b"jam".to_vec(),
+            retain: false,
         },
     );
     send(&mut publisher, &publish).await;
@@ -726,6 +812,7 @@ async fn an_exact_and_a_matching_wildcard_subscriber_on_the_same_connection_both
         MessageKind::Publish {
             topic: topic("weather.updates"),
             payload: b"sunny".to_vec(),
+            retain: false,
         },
     );
     send(&mut publisher, &publish).await;
@@ -886,6 +973,7 @@ async fn dial_side_peer_link_forwards_local_publishes_once_subscribed() {
         MessageKind::Publish {
             topic: topic("weather.updates"),
             payload: b"sunny".to_vec(),
+            retain: false,
         },
     );
     send(&mut publisher, &publish).await;
@@ -939,6 +1027,7 @@ async fn a_peer_links_wildcard_interest_propagates_and_receives_a_matching_publi
         MessageKind::Publish {
             topic: topic("weather.updates"),
             payload: b"sunny".to_vec(),
+            retain: false,
         },
     );
     send(&mut publisher, &publish).await;
@@ -988,6 +1077,7 @@ async fn multi_hop_interest_propagates_across_a_chain_of_peers() {
         MessageKind::Publish {
             topic: topic("weather.updates"),
             payload: b"sunny".to_vec(),
+            retain: false,
         }
     );
 }
@@ -1053,6 +1143,7 @@ async fn loop_prevention_stops_a_publish_from_bouncing_forever() {
         MessageKind::Publish {
             topic: topic("weather.updates"),
             payload: b"final".to_vec(),
+            retain: false,
         },
     );
     send(&mut connect(addr_a).await, &publish).await;
@@ -1232,6 +1323,7 @@ async fn status_request_reports_a_metrics_summary_reflecting_activity() {
         MessageKind::Publish {
             topic: topic("weather.updates"),
             payload: b"sunny".to_vec(),
+            retain: false,
         },
     );
     send(&mut client, &publish).await;

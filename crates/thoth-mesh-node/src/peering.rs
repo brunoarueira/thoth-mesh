@@ -357,6 +357,7 @@ mod tests {
             MessageKind::Publish {
                 topic: topic.clone(),
                 payload: b"sunny".to_vec(),
+                retain: false,
             },
         );
         broker

@@ -209,6 +209,7 @@ async fn two_tls_nodes_federate_and_a_tls_client_publishes_and_subscribes() {
             MessageKind::Publish {
                 topic: topic("weather.updates"),
                 payload: b"sunny".to_vec(),
+                retain: false,
             },
         );
         send(&mut publisher, &publish).await;
@@ -435,6 +436,7 @@ async fn topic_acl_distinguishes_principals_by_certificate_fingerprint() {
         MessageKind::Publish {
             topic: topic("sensors.data"),
             payload: b"42".to_vec(),
+            retain: false,
         },
     );
     send(&mut allowed_conn, &publish).await;
@@ -448,6 +450,7 @@ async fn topic_acl_distinguishes_principals_by_certificate_fingerprint() {
         MessageKind::Publish {
             topic: topic("sensors.data"),
             payload: b"should not arrive".to_vec(),
+            retain: false,
         },
     );
     send(&mut other_conn, &rejected).await;
@@ -589,6 +592,7 @@ async fn a_publish_with_a_mismatched_sender_is_corrected_to_the_authenticated_id
         MessageKind::Publish {
             topic: topic("weather.updates"),
             payload: b"sunny".to_vec(),
+            retain: false,
         },
     );
     send(&mut publisher, &publish).await;

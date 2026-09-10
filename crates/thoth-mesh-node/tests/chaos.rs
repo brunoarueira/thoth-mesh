@@ -93,6 +93,7 @@ async fn a_restarted_peer_reconnects_as_a_new_identity_with_no_leftover_duplicat
         MessageKind::Publish {
             topic: topic("weather.updates"),
             payload: b"before".to_vec(),
+            retain: false,
         },
     );
     send(&mut connect(addr_b).await, &before).await;
@@ -146,6 +147,7 @@ async fn a_restarted_peer_reconnects_as_a_new_identity_with_no_leftover_duplicat
         MessageKind::Publish {
             topic: topic("weather.updates"),
             payload: b"after".to_vec(),
+            retain: false,
         },
     );
     send(&mut connect(addr_b).await, &after).await;
