@@ -32,6 +32,13 @@ struct Cli {
     #[arg(long)]
     metrics_addr: Option<String>,
 
+    /// Directory for the on-disk message store (a plain SQLite file,
+    /// `messages.db`). With none given the node is fully in-memory and
+    /// a restart loses everything, unchanged from before this flag
+    /// existed. See ADR-0045 and docs/OPERATIONS.md.
+    #[arg(long)]
+    data_dir: Option<PathBuf>,
+
     /// This node's TLS certificate (PEM). Requires --tls-key and
     /// --tls-ca too - TLS is off (plaintext, as before) unless all
     /// three are given. See ADR-0016 and docs/OPERATIONS.md.
@@ -151,6 +158,7 @@ async fn main() -> std::io::Result<()> {
         tls,
         topic_acl,
         peer_topic_acl,
+        data_dir: cli.data_dir,
     };
 
     thoth_mesh_node::run_with_tls(

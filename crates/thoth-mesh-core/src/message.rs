@@ -83,6 +83,10 @@ pub struct MetricsSummary {
     /// Deliveries given up on after exhausting every redelivery
     /// attempt without ever being acked (ADR-0041).
     pub delivery_ack_timeouts_total: u64,
+    /// Publishes the on-disk store failed to durably record
+    /// (ADR-0045) - delivery still happened, but those messages won't
+    /// survive a restart. Always 0 with no `--data-dir` configured.
+    pub persist_failures_total: u64,
 }
 
 /// The payload of an [`Envelope`](crate::Envelope).

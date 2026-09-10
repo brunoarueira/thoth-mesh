@@ -351,16 +351,18 @@ thothmesh_peer_directory_evictions_total 0
 thothmesh_redelivered_messages_total 0
 # TYPE thothmesh_delivery_ack_timeouts_total counter
 thothmesh_delivery_ack_timeouts_total 0
+# TYPE thothmesh_persist_failures_total counter
+thothmesh_persist_failures_total 0
 ```
 
-Fourteen metrics today (ADR-0013, plus `topic_acl_rejections_total`
+Fifteen metrics today (ADR-0013, plus `topic_acl_rejections_total`
 added by ADR-0018, `metrics_auth_rejections_total` added by ADR-0019,
 `peer_topic_acl_rejections_total` added by ADR-0020,
 `replayed_messages_total` added by ADR-0021, `lag_recovered_total`
 added by ADR-0024, `topic_evictions_total`/`pattern_evictions_total`/
 `membership_evictions_total`/`peer_directory_evictions_total` added by
-ADR-0025, and `redelivered_messages_total`/`delivery_ack_timeouts_total`
-added by ADR-0041):
+ADR-0025, `redelivered_messages_total`/`delivery_ack_timeouts_total`
+added by ADR-0041, and `persist_failures_total` added by ADR-0045):
 
 | Metric | Type | Meaning |
 | --- | --- | --- |
@@ -378,6 +380,7 @@ added by ADR-0041):
 | `thothmesh_peer_directory_evictions_total` | counter | Peers this node stops remembering as dialable, once over the cap - distinct from `membership_evictions_total`: this is every peer ever learned about (gossip or handshake), not just ones this node itself connected to. |
 | `thothmesh_redelivered_messages_total` | counter | Deliveries resent because an `ack: true` subscription's acknowledgement didn't arrive within the redelivery timeout (see [ADR-0041](adr/0041-at-least-once-delivery-with-ack-based-redelivery.md)). Zero on a node with no `ack: true` subscribers, or whose subscribers ack promptly. |
 | `thothmesh_delivery_ack_timeouts_total` | counter | Deliveries an `ack: true` subscription's forwarder gave up on after exhausting every redelivery attempt with no ack - counted, not retried further or dead-lettered. Nonzero here means a subscriber is missing messages it asked to be guaranteed. |
+| `thothmesh_persist_failures_total` | counter | Publishes the on-disk store failed to durably record (see [Persistence](#persistence)). Delivery still happened, but those messages won't survive a restart. Always 0 without `--data-dir`. Nonzero means the disk is full or failing. |
 
 Point a Prometheus `scrape_configs` target at `--metrics-addr` the
 same way you would any other exporter; there's no special
@@ -611,15 +614,54 @@ interest via `--peer` (a peer's own `Subscribe`, sent to catch it up on
 this node's aggregate interest, spawns a forwarder exactly the way a
 client's does).
 
-This is **not** durability across a restart — the buffer is in-memory
-only and empties on every node restart, the same as everything else
-`Broker` tracks. A subscriber connecting after a topic's buffer has
-rolled past its capacity still misses whatever fell off the oldest
-end, silently — the same posture `PROTOCOL.md`'s
-[Delivery semantics](../PROTOCOL.md#delivery-semantics) already
-accepts for a live subscriber that falls behind.
+On its own the buffer is **not** durability across a restart — it's
+in-memory and empties on every node restart. A subscriber connecting
+after a topic's buffer has rolled past its capacity still misses
+whatever fell off the oldest end, silently — the same posture
+`PROTOCOL.md`'s [Delivery semantics](../PROTOCOL.md#delivery-semantics)
+already accepts for a live subscriber that falls behind.
 `thothmesh_replayed_messages_total` (see [Metrics](#metrics)) counts
 how many envelopes have gone out via replay rather than live delivery.
+Run the node with [`--data-dir`](#persistence) to back the buffer with
+an on-disk log that *does* survive a restart.
+
+## Persistence
+
+By default a node keeps nothing on disk. Pass `--data-dir <path>` and
+it opens `<path>/messages.db` — a plain SQLite database — and durably
+records every published message there before delivering it (see
+[ADR-0045](adr/0045-on-disk-message-persistence-via-sqlite.md)):
+
+```sh
+cargo run -p thoth-mesh-node -- --addr 127.0.0.1:49500 --data-dir /var/lib/thoth-mesh
+```
+
+On startup the node reads that file back and refills each topic's
+replay buffer (the newest 1024 messages) and retained values
+([`--retain`](#single-node-quickstart)) from it, so a restart is
+invisible to a subscriber that connects afterward — it catches up on
+recent history and gets the current retained value exactly as it
+would have before.
+
+- **Retention.** The log keeps the newest 100,000 messages per topic
+  (a hardcoded cap, like the replay buffer's 1024); older rows are
+  pruned in the background. Retained values live in a separate table
+  and are never pruned. The total on disk is that cap times the
+  number of distinct topics the node has ever seen — a node cycling
+  through unboundedly many topics still grows unboundedly; age-based
+  expiry is a later addition (see the roadmap's Phase 14).
+- **Failure is not fatal.** If a write to the store fails (disk full,
+  I/O error), the node logs it, bumps
+  `thothmesh_persist_failures_total`, and delivers the message
+  in-memory anyway. Durability is degraded, the node keeps running.
+- **Backup.** It's an ordinary SQLite file. Copy it while the node is
+  stopped, or take a live consistent snapshot with
+  `sqlite3 /var/lib/thoth-mesh/messages.db "VACUUM INTO 'backup.db'"`,
+  and move that single file wherever you keep backups. Any SQLite
+  tool can open it to inspect what's stored.
+- **Not mesh-wide.** Each node persists only what it actually
+  received. A node that gains interest in a topic *after* a publish
+  landed elsewhere does not get that earlier message back-filled.
 
 ## Lagged-forwarder recovery
 
@@ -647,10 +689,11 @@ lost.
 
 ## Bounded memory footprint
 
-A node's live mesh state is entirely in-memory, with no persistence
-layer (see [Message replay](#message-replay) above for the one form of
-history that does get kept) - several of the structures holding it are
-audited and capped in [ADR-0025](adr/0025-bound-per-node-memory-footprint.md)
+A node's live mesh state is in-memory (message history can be backed
+by an on-disk log with [`--data-dir`](#persistence), but membership,
+peer directory, interest, and the rest are not) - several of the
+structures holding it are audited and capped in
+[ADR-0025](adr/0025-bound-per-node-memory-footprint.md)
 so a long-running node's memory use doesn't grow without limit.
 Currently-subscribed topics and patterns are never bounded themselves
 - that's live, wanted state - but an exact-match topic or wildcard
@@ -854,11 +897,12 @@ Worth knowing before running this anywhere that matters:
   token for the whole endpoint, not a per-scraper identity, and with
   no token file configured, anyone who can reach the port still gets
   the current render, same as before ADR-0019.
-- **No persistence across a restart.** [Message replay](#message-replay)
-  (ADR-0021) lets a subscriber that connects after a publish catch up
-  on recent history, but only within a bounded in-memory buffer that's
-  gone the moment a node restarts — there's still no durable,
-  on-disk store. See [docs/ROADMAP.md](ROADMAP.md) Phase 8.
+- **Persistence is message-history only, and opt-in.** With
+  [`--data-dir`](#persistence) (ADR-0045) a node's replay buffers and
+  retained values survive a restart via an on-disk SQLite log;
+  without it, nothing does. Even with it, per-subscriber resume
+  offsets, message TTL/expiry, and mesh-wide retained-state sync are
+  still to come — see [docs/ROADMAP.md](ROADMAP.md) Phase 14.
 None of these are hidden defaults — they're the honest current state
 of a project still in early phases. See [docs/ROADMAP.md](ROADMAP.md)
 for what's planned next.
