@@ -71,9 +71,11 @@ impl PendingAcks {
     /// Sweeps every entry that's gone `timeout` without an ack:
     /// resends it (bumping its attempt count and resetting its clock
     /// to `now`) if it hasn't yet hit `max_attempts`, or drops it -
-    /// reported as given up on - if it has. Returns what to resend
-    /// and what was given up on; neither is in any particular order.
-    pub fn sweep(&mut self, now: Instant) -> (Vec<Arc<Envelope>>, Vec<MessageId>) {
+    /// reported as given up on - if it has. Returns what to resend and
+    /// what was given up on; neither is in any particular order. The
+    /// given-up-on half carries the full envelope, not just its id -
+    /// what the caller needs to dead-letter it (ADR-0047).
+    pub fn sweep(&mut self, now: Instant) -> (Vec<Arc<Envelope>>, Vec<Arc<Envelope>>) {
         let expired: Vec<MessageId> = self
             .entries
             .iter()
@@ -89,7 +91,7 @@ impl PendingAcks {
                 .get_mut(&id)
                 .expect("id was just collected from entries above");
             if entry.attempts >= self.max_attempts {
-                given_up_on.push(id);
+                given_up_on.push(Arc::clone(&entry.envelope));
                 self.entries.remove(&id);
                 continue;
             }
@@ -196,7 +198,7 @@ mod tests {
         now += Duration::from_millis(20);
         let (to_resend, given_up_on) = pending.sweep(now);
         assert!(to_resend.is_empty());
-        assert_eq!(given_up_on, vec![sent.id]);
+        assert_eq!(given_up_on, vec![sent]);
         assert_eq!(pending.pending_count(), 0);
     }
 

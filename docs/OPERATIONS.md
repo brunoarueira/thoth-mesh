@@ -353,16 +353,22 @@ thothmesh_redelivered_messages_total 0
 thothmesh_delivery_ack_timeouts_total 0
 # TYPE thothmesh_persist_failures_total counter
 thothmesh_persist_failures_total 0
+# TYPE thothmesh_expired_messages_total counter
+thothmesh_expired_messages_total 0
+# TYPE thothmesh_dead_lettered_messages_total counter
+thothmesh_dead_lettered_messages_total 0
 ```
 
-Fifteen metrics today (ADR-0013, plus `topic_acl_rejections_total`
+Seventeen metrics today (ADR-0013, plus `topic_acl_rejections_total`
 added by ADR-0018, `metrics_auth_rejections_total` added by ADR-0019,
 `peer_topic_acl_rejections_total` added by ADR-0020,
 `replayed_messages_total` added by ADR-0021, `lag_recovered_total`
 added by ADR-0024, `topic_evictions_total`/`pattern_evictions_total`/
 `membership_evictions_total`/`peer_directory_evictions_total` added by
 ADR-0025, `redelivered_messages_total`/`delivery_ack_timeouts_total`
-added by ADR-0041, and `persist_failures_total` added by ADR-0045):
+added by ADR-0041, `persist_failures_total` added by ADR-0045, and
+`expired_messages_total`/`dead_lettered_messages_total` added by
+ADR-0047):
 
 | Metric | Type | Meaning |
 | --- | --- | --- |
@@ -379,8 +385,10 @@ added by ADR-0041, and `persist_failures_total` added by ADR-0045):
 | `thothmesh_membership_evictions_total` | counter | Disconnected peers this node stopped remembering an address for, once over the cap (see [Bounded memory footprint](#bounded-memory-footprint)). A currently-*connected* peer is never counted here. |
 | `thothmesh_peer_directory_evictions_total` | counter | Peers this node stops remembering as dialable, once over the cap - distinct from `membership_evictions_total`: this is every peer ever learned about (gossip or handshake), not just ones this node itself connected to. |
 | `thothmesh_redelivered_messages_total` | counter | Deliveries resent because an `ack: true` subscription's acknowledgement didn't arrive within the redelivery timeout (see [ADR-0041](adr/0041-at-least-once-delivery-with-ack-based-redelivery.md)). Zero on a node with no `ack: true` subscribers, or whose subscribers ack promptly. |
-| `thothmesh_delivery_ack_timeouts_total` | counter | Deliveries an `ack: true` subscription's forwarder gave up on after exhausting every redelivery attempt with no ack - counted, not retried further or dead-lettered. Nonzero here means a subscriber is missing messages it asked to be guaranteed. |
+| `thothmesh_delivery_ack_timeouts_total` | counter | Deliveries an `ack: true` subscription's forwarder gave up on after exhausting every redelivery attempt with no ack - counted, and republished to [`--dead-letter-topic`](#message-ttl-and-dead-lettering) if one is configured, otherwise just dropped. Nonzero here means a subscriber is missing messages it asked to be guaranteed. |
 | `thothmesh_persist_failures_total` | counter | Publishes the on-disk store failed to durably record (see [Persistence](#persistence)). Delivery still happened, but those messages won't survive a restart. Always 0 without `--data-dir`. Nonzero means the disk is full or failing. |
+| `thothmesh_expired_messages_total` | counter | Messages deleted from the on-disk store for having aged past [`--message-ttl-secs`](#message-ttl-and-dead-lettering). Always 0 without a TTL configured. |
+| `thothmesh_dead_lettered_messages_total` | counter | Messages republished to [`--dead-letter-topic`](#message-ttl-and-dead-lettering) - from TTL expiry above or an exhausted `ack: true` redelivery alike. Always 0 without a dead-letter topic configured. |
 
 Point a Prometheus `scrape_configs` target at `--metrics-addr` the
 same way you would any other exporter; there's no special
@@ -648,8 +656,9 @@ would have before.
   pruned in the background. Retained values live in a separate table
   and are never pruned. The total on disk is that cap times the
   number of distinct topics the node has ever seen — a node cycling
-  through unboundedly many topics still grows unboundedly; age-based
-  expiry is a later addition (see the roadmap's Phase 14).
+  through unboundedly many topics still grows unboundedly by this cap
+  alone; add [`--message-ttl-secs`](#message-ttl-and-dead-lettering)
+  for age-based expiry on top of it.
 - **Failure is not fatal.** If a write to the store fails (disk full,
   I/O error), the node logs it, bumps
   `thothmesh_persist_failures_total`, and delivers the message
@@ -706,6 +715,56 @@ message as the new position, best-effort, the same "log and move on,
 never fatal" posture as the persist path itself. A position is never
 rewound or replayed on demand — there's no seek/rewind command in this
 protocol version.
+
+## Message TTL and dead-lettering
+
+Two independent, optional flags, both introduced by
+[ADR-0047](adr/0047-message-ttl-and-dead-lettering.md):
+
+- **`--message-ttl-secs <N>`** — how long (in seconds) a persisted
+  message survives before a background sweep deletes it. Requires
+  `--data-dir` — there's no on-disk log to expire anything from
+  otherwise. With none given, the log is only ever pruned by count
+  (see [Persistence](#persistence) above), unchanged from before this
+  flag existed. The sweep runs once a minute, checking every
+  persisted message's age against the configured TTL — not
+  configurable, and not tied to the TTL's own magnitude (a multi-day
+  TTL is still checked every minute, not proportionally less often).
+
+  ```sh
+  thoth-mesh-node --data-dir /var/lib/thoth-mesh --message-ttl-secs 604800  # 7 days
+  ```
+
+- **`--dead-letter-topic <topic>`** — a literal topic (not a
+  wildcard) to republish an otherwise-unconsumed message to, instead
+  of just dropping it. Feeds from two independent sources: a message
+  aged past `--message-ttl-secs` above, and an `ack: true` delivery
+  that exhausts every redelivery attempt (ADR-0041,
+  `thothmesh_delivery_ack_timeouts_total`) — the latter works
+  standalone, with no `--data-dir`/`--message-ttl-secs` at all. With
+  none given, both sources behave exactly as before this flag
+  existed: silently dropped, only counted. A dead-lettered message is
+  republished as a fresh `Publish` (its own new `id`, this node's own
+  identity as `sender`, `retain: false`) to
+  `<dead-letter-topic>.<original topic>` — e.g.
+  `dead-letter.weather.updates` — so `thoth-mesh subscribe
+  dead-letter.#` watches everything dead-lettered at once, still
+  knowing which topic each one fell off of. A fresh `id` is
+  deliberate: reusing the original would risk the republish being
+  silently swallowed by this node's own loop-prevention dedup
+  (ADR-0011) if that `id` was ever seen before.
+
+  ```sh
+  thoth-mesh-node --data-dir /var/lib/thoth-mesh --message-ttl-secs 604800 \
+      --dead-letter-topic dead-letter
+  ```
+
+`thothmesh_expired_messages_total` counts messages deleted by the TTL
+sweep (zero without `--message-ttl-secs`); `thothmesh_dead_lettered_messages_total`
+counts messages actually republished, from either source (zero
+without `--dead-letter-topic`). Comparing the two shows how much of
+what expired was actually captured somewhere inspectable versus lost
+outright.
 
 ## Lagged-forwarder recovery
 
@@ -943,10 +1002,12 @@ Worth knowing before running this anywhere that matters:
   the current render, same as before ADR-0019.
 - **Persistence is message-history only, and opt-in.** With
   [`--data-dir`](#persistence) (ADR-0045) a node's replay buffers and
-  retained values survive a restart via an on-disk SQLite log;
-  without it, nothing does. Even with it, per-subscriber resume
-  offsets, message TTL/expiry, and mesh-wide retained-state sync are
-  still to come — see [docs/ROADMAP.md](ROADMAP.md) Phase 14.
+  retained values survive a restart via an on-disk SQLite log, and
+  [durable subscriptions](#durable-subscriptions) (ADR-0046) and
+  [message TTL/dead-lettering](#message-ttl-and-dead-lettering)
+  (ADR-0047) build on it; without `--data-dir`, none of that does.
+  Mesh-wide retained-state sync is still to come — see
+  [docs/ROADMAP.md](ROADMAP.md) Phase 14.
 None of these are hidden defaults — they're the honest current state
 of a project still in early phases. See [docs/ROADMAP.md](ROADMAP.md)
 for what's planned next.

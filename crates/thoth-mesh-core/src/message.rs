@@ -102,6 +102,15 @@ pub struct MetricsSummary {
     /// (ADR-0045) - delivery still happened, but those messages won't
     /// survive a restart. Always 0 with no `--data-dir` configured.
     pub persist_failures_total: u64,
+    /// Messages deleted from the on-disk store for having aged past
+    /// `--message-ttl-secs` (ADR-0047). Always 0 with no TTL
+    /// configured.
+    pub expired_messages_total: u64,
+    /// Messages republished to a configured `--dead-letter-topic`
+    /// (ADR-0047) - from TTL expiry above or an exhausted `ack: true`
+    /// redelivery (ADR-0041) alike. Always 0 with no dead-letter topic
+    /// configured.
+    pub dead_lettered_messages_total: u64,
 }
 
 /// The payload of an [`Envelope`](crate::Envelope).

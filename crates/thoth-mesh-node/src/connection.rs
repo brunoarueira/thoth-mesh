@@ -114,6 +114,7 @@ async fn run_connection(socket: MaybeTlsStream, shared: Shared, initial_peer: Op
         allowed_peers,
         topic_acl,
         peer_topic_acl,
+        dead_letter_topic,
     } = shared;
     let (reader, writer) = split(socket);
     let mut reader = reader.compat();
@@ -159,6 +160,7 @@ async fn run_connection(socket: MaybeTlsStream, shared: Shared, initial_peer: Op
         allowed_peers,
         topic_acl,
         peer_topic_acl,
+        dead_letter_topic,
         outgoing_tx,
         forwarders: HashMap::new(),
         peer_identity: None,
@@ -285,6 +287,10 @@ struct ConnectionContext {
     allowed_peers: Option<Arc<HashSet<[u8; 32]>>>,
     topic_acl: Option<Arc<TopicAcl>>,
     peer_topic_acl: Option<Arc<TopicAcl>>,
+    /// `--dead-letter-topic` (ADR-0047): where an `ack: true`
+    /// forwarder that exhausts its redelivery attempts republishes the
+    /// original message, if configured at all.
+    dead_letter_topic: Option<Topic>,
     outgoing_tx: mpsc::Sender<Arc<Envelope>>,
     /// Every topic filter a `Subscribe` on this connection is
     /// currently registered for - an ordinary forwarder or consumer-
@@ -481,6 +487,8 @@ impl ConnectionContext {
         let outgoing_tx = self.outgoing_tx.clone();
         let metrics = self.metrics.clone();
         let subscriber = envelope.sender;
+        let node_id = self.node_id;
+        let dead_letter_topic = self.dead_letter_topic.clone();
         self.forwarders.entry(filter.clone()).or_insert_with(|| {
             if let Some(group) = group {
                 // Direct push onto this connection's own outgoing_tx
@@ -514,6 +522,10 @@ impl ConnectionContext {
                     metrics,
                     DEFAULT_ACK_TIMEOUT,
                     DEFAULT_MAX_REDELIVERY_ATTEMPTS,
+                    crate::dead_letter::DeadLetterConfig {
+                        node_id,
+                        topic: dead_letter_topic,
+                    },
                 ))
             } else {
                 Subscription::Forwarder(Forwarder {
@@ -1338,6 +1350,10 @@ fn spawn_durable_forwarder(
 /// directly) purely so tests can exercise real redelivery/give-up
 /// behavior against a timeout measured in milliseconds instead of the
 /// production default; `handle_subscribe` always passes the defaults.
+///
+/// `dead_letter_config`, if it has a topic configured, is where a
+/// delivery that exhausts every redelivery attempt gets republished
+/// instead of just dropped (ADR-0047).
 fn spawn_ack_forwarder(
     broker: &Arc<Broker>,
     filter: TopicFilter,
@@ -1345,6 +1361,7 @@ fn spawn_ack_forwarder(
     metrics: Metrics,
     ack_timeout: std::time::Duration,
     max_redelivery_attempts: u32,
+    dead_letter_config: crate::dead_letter::DeadLetterConfig,
 ) -> Forwarder {
     let (ack_tx, mut ack_rx) = mpsc::channel::<MessageId>(ACK_CHANNEL_CAPACITY);
     let broker = Arc::clone(broker);
@@ -1393,6 +1410,15 @@ fn spawn_ack_forwarder(
                                 given_up_on.len()
                             );
                             metrics.record_delivery_ack_timeouts(given_up_on.len() as u64);
+                            let mut dead_lettered = 0u64;
+                            for envelope in &given_up_on {
+                                if crate::dead_letter::dead_letter(&broker, &dead_letter_config, envelope).await {
+                                    dead_lettered += 1;
+                                }
+                            }
+                            if dead_lettered > 0 {
+                                metrics.record_dead_lettered_messages(dead_lettered);
+                            }
                         }
                         if !to_resend.is_empty() {
                             metrics.record_redelivered_messages(to_resend.len() as u64);
@@ -1595,6 +1621,10 @@ mod tests {
             Metrics::new(),
             Duration::from_millis(30),
             5,
+            crate::dead_letter::DeadLetterConfig {
+                node_id: PeerId::new(),
+                topic: None,
+            },
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
 
@@ -1651,6 +1681,10 @@ mod tests {
             Metrics::new(),
             Duration::from_millis(20),
             MAX_ATTEMPTS,
+            crate::dead_letter::DeadLetterConfig {
+                node_id: PeerId::new(),
+                topic: None,
+            },
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
 
@@ -1683,6 +1717,73 @@ mod tests {
         );
     }
 
+    /// ADR-0047: a delivery given up on after exhausting every
+    /// redelivery attempt is republished to the configured dead-letter
+    /// topic - not just dropped, unlike the previous test's `None`.
+    #[tokio::test]
+    async fn ack_forwarder_dead_letters_a_delivery_it_gives_up_on() {
+        let broker = Arc::new(Broker::new());
+        let topic = Topic::from_str("weather.updates").unwrap();
+        let filter: TopicFilter = topic.clone().into();
+        let (outgoing_tx, mut outgoing_rx) = mpsc::channel(16);
+        let node_id = PeerId::new();
+        let dead_letter_topic = Topic::from_str("dead-letter").unwrap();
+        let (_backlog, mut dl_rx) = broker
+            .subscribe(
+                Topic::from_str("dead-letter.weather.updates")
+                    .unwrap()
+                    .into(),
+            )
+            .await;
+        const MAX_ATTEMPTS: u32 = 1;
+        let _forwarder = spawn_ack_forwarder(
+            &broker,
+            filter,
+            outgoing_tx,
+            Metrics::new(),
+            Duration::from_millis(20),
+            MAX_ATTEMPTS,
+            crate::dead_letter::DeadLetterConfig {
+                node_id,
+                topic: Some(dead_letter_topic),
+            },
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let envelope = Envelope::new(
+            PeerId::new(),
+            MessageKind::Publish {
+                topic: topic.clone(),
+                payload: b"sunny".to_vec(),
+                retain: false,
+                content_type: None,
+            },
+        );
+        broker.publish(&topic, Arc::new(envelope.clone())).await;
+
+        // Drain the original delivery plus every resend - never acked.
+        for _ in 0..=MAX_ATTEMPTS {
+            tokio::time::timeout(Duration::from_millis(500), outgoing_rx.recv())
+                .await
+                .expect("timed out waiting for a delivery")
+                .unwrap();
+        }
+
+        let dead_lettered = tokio::time::timeout(Duration::from_millis(500), dl_rx.recv())
+            .await
+            .expect("timed out waiting for the dead-lettered republish")
+            .unwrap();
+        assert_eq!(dead_lettered.sender, node_id);
+        assert_ne!(
+            dead_lettered.id, envelope.id,
+            "the republish gets a fresh id, not the original's"
+        );
+        match &dead_lettered.kind {
+            MessageKind::Publish { payload, .. } => assert_eq!(payload, b"sunny"),
+            other => panic!("expected a Publish, got {other:?}"),
+        }
+    }
+
     /// A delivery recovered from the replay buffer after a broadcast
     /// lag (ADR-0024) is tracked for redelivery exactly like a live
     /// one - lag recovery and ack tracking compose, rather than a
@@ -1704,6 +1805,10 @@ mod tests {
             Metrics::new(),
             Duration::from_millis(50),
             5,
+            crate::dead_letter::DeadLetterConfig {
+                node_id: PeerId::new(),
+                topic: None,
+            },
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
 

@@ -286,6 +286,32 @@ impl MessageStore for SqliteStore {
         .map(|_| ())
         .map_err(to_io)
     }
+
+    // ADR-0047
+    fn expire_before(&self, cutoff_ts: i64) -> std::io::Result<Vec<Arc<Envelope>>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(to_io)?;
+        let expired: Vec<Arc<Envelope>> = {
+            let mut stmt = tx
+                .prepare("SELECT envelope FROM messages WHERE ts < ?1")
+                .map_err(to_io)?;
+            let rows = stmt
+                .query_map([cutoff_ts], |row| row.get::<_, Vec<u8>>(0))
+                .map_err(to_io)?;
+            let mut out = Vec::new();
+            for row in rows {
+                let bytes = row.map_err(to_io)?;
+                out.push(Arc::new(
+                    Envelope::from_bytes(&bytes).map_err(std::io::Error::other)?,
+                ));
+            }
+            out
+        };
+        tx.execute("DELETE FROM messages WHERE ts < ?1", [cutoff_ts])
+            .map_err(to_io)?;
+        tx.commit().map_err(to_io)?;
+        Ok(expired)
+    }
 }
 
 /// Adds `messages.msg_id` if it's missing (ADR-0046): the one piece of
@@ -596,5 +622,87 @@ mod tests {
         // column already present and does nothing further.
         let reopened = SqliteStore::open(dir.path()).unwrap();
         assert_eq!(reopened.load_recent(10).unwrap()[0].1.len(), 1);
+    }
+
+    // ADR-0047
+
+    /// Inserts `envelope` directly at `ts`, bypassing `append`'s own
+    /// `SystemTime::now()` - the point of every `expire_before` test
+    /// below is controlling exactly how old a row is.
+    fn insert_at(store: &SqliteStore, envelope: &Envelope, ts: i64) {
+        let MessageKind::Publish { topic, .. } = &envelope.kind else {
+            panic!("insert_at given a non-Publish envelope");
+        };
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO messages (topic, ts, envelope, msg_id) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    topic.as_str(),
+                    ts,
+                    envelope.to_bytes().unwrap(),
+                    envelope.id.as_bytes().to_vec()
+                ],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn expire_before_deletes_and_returns_only_the_older_rows() {
+        let (_dir, store) = temp_store();
+        let old = publish("weather.updates", b"old", false);
+        let recent = publish("weather.updates", b"recent", false);
+        insert_at(&store, &old, 1_000);
+        insert_at(&store, &recent, 2_000);
+
+        let expired = store.expire_before(1_500).unwrap();
+        assert_eq!(
+            expired.iter().map(|e| e.id).collect::<Vec<_>>(),
+            vec![old.id]
+        );
+
+        let remaining = store.load_recent(10).unwrap();
+        assert_eq!(
+            remaining[0].1.iter().map(|e| e.id).collect::<Vec<_>>(),
+            vec![recent.id]
+        );
+    }
+
+    #[test]
+    fn expire_before_is_a_no_op_when_nothing_is_old_enough() {
+        let (_dir, store) = temp_store();
+        let recent = publish("weather.updates", b"recent", false);
+        insert_at(&store, &recent, 2_000);
+
+        assert!(store.expire_before(1_000).unwrap().is_empty());
+        assert_eq!(store.load_recent(10).unwrap()[0].1[0].id, recent.id);
+    }
+
+    /// `retained` has no `ts` column at all - a retained value can
+    /// never be touched by `expire_before`, regardless of how old the
+    /// `messages` row that originally set it gets.
+    #[test]
+    fn expire_before_never_touches_a_retained_value() {
+        let (_dir, store) = temp_store();
+        let retained = publish("sensor.temp", b"21C", true);
+        insert_at(&store, &retained, 1_000);
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO retained (topic, envelope) VALUES (?1, ?2)",
+                rusqlite::params!["sensor.temp", retained.to_bytes().unwrap()],
+            )
+            .unwrap();
+
+        let expired = store.expire_before(2_000).unwrap();
+        assert_eq!(
+            expired.iter().map(|e| e.id).collect::<Vec<_>>(),
+            vec![retained.id]
+        );
+        assert_eq!(store.load_retained().unwrap()[0].1.id, retained.id);
     }
 }
