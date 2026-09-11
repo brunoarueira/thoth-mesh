@@ -36,7 +36,12 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 
 CREATE INDEX IF NOT EXISTS messages_topic_seq ON messages (topic, seq);
-CREATE INDEX IF NOT EXISTS messages_topic_msgid ON messages (topic, msg_id);
+-- Partial: a row from before ADR-0046 has msg_id = NULL and is never
+-- matched by messages_since's `msg_id IS NOT NULL AND msg_id > ?`
+-- query - indexing it too would just be dead weight, permanently, on
+-- a long-lived database with a lot of pre-ADR-0046 history.
+CREATE INDEX IF NOT EXISTS messages_topic_msgid ON messages (topic, msg_id)
+    WHERE msg_id IS NOT NULL;
 
 -- The current retained (last-value) message per topic (ADR-0043).
 -- A separate table so retention pruning of `messages` never removes
