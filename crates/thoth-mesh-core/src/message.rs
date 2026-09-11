@@ -26,6 +26,21 @@ impl MessageId {
     pub fn timestamp(&self) -> Option<(u64, u32)> {
         self.0.get_timestamp().map(|ts| ts.to_unix())
     }
+
+    /// The ID's raw 16 bytes - lexicographically ordered the same as
+    /// creation time, since a `MessageId` is a UUIDv7 (see the type's
+    /// own doc comment). For a store that needs to key or range-query
+    /// on a `MessageId` without going through the wire format (e.g.
+    /// durable subscriber offsets, ADR-0046).
+    pub fn as_bytes(&self) -> [u8; 16] {
+        *self.0.as_bytes()
+    }
+
+    /// Reconstructs a `MessageId` from bytes previously returned by
+    /// [`as_bytes`](Self::as_bytes).
+    pub fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(Uuid::from_bytes(bytes))
+    }
 }
 
 impl Default for MessageId {
@@ -136,6 +151,18 @@ pub enum MessageKind {
         /// See ADR-0042.
         #[serde(default)]
         group: Option<String>,
+        /// Makes this subscription durable: the node remembers, per
+        /// authenticated sender identity and topic, the last message
+        /// delivered, so a later `durable: true` resubscribe from the
+        /// *same* identity resumes from there automatically instead
+        /// of only getting the in-memory replay buffer. Refused (see
+        /// `Error`) for a wildcard `filter` (one offset can't mean
+        /// several topics) or a connection with no TLS client
+        /// certificate (nothing stable to key the position on).
+        /// `#[serde(default)]`, same rolling-upgrade story as `ack`/
+        /// `group`. See ADR-0046.
+        #[serde(default)]
+        durable: bool,
     },
     /// Unsubscribe from a topic filter previously subscribed to.
     Unsubscribe { filter: TopicFilter },
@@ -199,6 +226,23 @@ mod tests {
     }
 
     #[test]
+    fn as_bytes_then_from_bytes_round_trips() {
+        let id = MessageId::new();
+        assert_eq!(MessageId::from_bytes(id.as_bytes()), id);
+    }
+
+    #[test]
+    fn as_bytes_preserves_creation_order() {
+        // A MessageId is a UUIDv7 - lexicographic byte order must
+        // match creation order, since ADR-0046 relies on this for an
+        // indexed "everything after this position" range query.
+        let a = MessageId::new();
+        let b = MessageId::new();
+        assert!(a <= b);
+        assert!(a.as_bytes() <= b.as_bytes());
+    }
+
+    #[test]
     fn message_kind_round_trips_through_cbor() {
         let topic = Topic::from_str("weather.updates").unwrap();
         let kinds = vec![
@@ -218,16 +262,25 @@ mod tests {
                 filter: topic.clone().into(),
                 ack: false,
                 group: None,
+                durable: false,
             },
             MessageKind::Subscribe {
                 filter: topic.clone().into(),
                 ack: true,
                 group: None,
+                durable: false,
             },
             MessageKind::Subscribe {
                 filter: topic.clone().into(),
                 ack: false,
                 group: Some("workers".to_owned()),
+                durable: false,
+            },
+            MessageKind::Subscribe {
+                filter: topic.clone().into(),
+                ack: false,
+                group: None,
+                durable: true,
             },
             MessageKind::Unsubscribe {
                 filter: topic.into(),
@@ -308,6 +361,7 @@ mod tests {
                 filter,
                 ack: false,
                 group: None,
+                durable: false,
             }
         );
     }
@@ -343,6 +397,46 @@ mod tests {
                 filter,
                 ack: true,
                 group: None,
+                durable: false,
+            }
+        );
+    }
+
+    /// A `Subscribe` encoded with `ack`/`group` but no `durable` field -
+    /// a sender from between ADR-0042 and ADR-0046 - still decodes,
+    /// defaulting `durable` to `false` (unchanged behavior).
+    #[test]
+    fn subscribe_without_a_durable_field_decodes_as_not_durable() {
+        let topic = Topic::from_str("weather.updates").unwrap();
+        let filter: TopicFilter = topic.into();
+
+        #[derive(Serialize)]
+        enum PreAdr0046 {
+            Subscribe {
+                filter: TopicFilter,
+                ack: bool,
+                group: Option<String>,
+            },
+        }
+
+        let mut bytes = Vec::new();
+        ciborium::into_writer(
+            &PreAdr0046::Subscribe {
+                filter: filter.clone(),
+                ack: false,
+                group: None,
+            },
+            &mut bytes,
+        )
+        .unwrap();
+        let decoded: MessageKind = ciborium::from_reader(&bytes[..]).unwrap();
+        assert_eq!(
+            decoded,
+            MessageKind::Subscribe {
+                filter,
+                ack: false,
+                group: None,
+                durable: false,
             }
         );
     }

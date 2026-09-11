@@ -663,6 +663,50 @@ would have before.
   received. A node that gains interest in a topic *after* a publish
   landed elsewhere does not get that earlier message back-filled.
 
+## Durable subscriptions
+
+`--data-dir` (above) also unlocks *durable* subscriptions
+([ADR-0046](adr/0046-durable-subscriptions.md)): a subscriber that
+resumes with a matching TLS client certificate picks up from exactly
+where it left off, even past a disconnect long enough to fall out of
+the in-memory replay buffer's window entirely — not just "recent
+history", an exact position.
+
+```sh
+thoth-mesh --tls-ca ca.pem --tls-cert client.pem --tls-key client.key \
+    subscribe weather.updates --durable
+```
+
+Four things all have to hold, or the node refuses the subscribe with
+an `Error` instead of registering anything:
+
+- **The node was started with `--data-dir`.** Durable subscriptions
+  need the on-disk log both to record a position in and to catch up
+  from — there's nowhere to persist either without it.
+- **The client presents a TLS certificate** (`--tls-cert`/`--tls-key`,
+  see [TLS](#tls) below). The position is keyed on the identity the
+  certificate derives ([ADR-0038](adr/0038-peerid-from-tls-fingerprint.md)),
+  so the same certificate is what makes a later reconnect recognized
+  as "the same subscriber" — there's no other stable identity to key
+  on. The CLI doesn't check this itself before asking; the node's
+  refusal is the only source of truth.
+- **The filter is a literal topic, not a wildcard.** One recorded
+  position can't stand in for several topics.
+- **Neither `--ack` nor `--group` is also set.** Durable delivery is
+  its own mode.
+
+The very first durable subscribe for a given (certificate, topic) pair
+— nothing recorded yet — behaves exactly like an ordinary subscribe:
+whatever the in-memory replay buffer currently holds, nothing more. A
+returning subscriber's catch-up is unbounded (not capped at the replay
+buffer's 1024, or even at the on-disk retention cap in practice —
+bounded only by `DEFAULT_PERSISTED_MESSAGES_PER_TOPIC`, 100,000), and
+after every delivery — catch-up or live — the node records that
+message as the new position, best-effort, the same "log and move on,
+never fatal" posture as the persist path itself. A position is never
+rewound or replayed on demand — there's no seek/rewind command in this
+protocol version.
+
 ## Lagged-forwarder recovery
 
 A subscriber that's already receiving live deliveries can still fall

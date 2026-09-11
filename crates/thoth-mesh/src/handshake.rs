@@ -182,6 +182,7 @@ mod tests {
                     filter: "weather.updates".parse().unwrap(),
                     ack: false,
                     group: None,
+                    durable: false,
                 },
             );
             let mut preloaded = Vec::new();

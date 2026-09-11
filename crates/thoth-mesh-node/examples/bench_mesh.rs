@@ -140,6 +140,7 @@ async fn run_once(hops: usize) -> BenchResult {
             filter: topic.clone().into(),
             ack: false,
             group: None,
+            durable: false,
         },
     );
     send(&mut subscriber, &sub).await;
