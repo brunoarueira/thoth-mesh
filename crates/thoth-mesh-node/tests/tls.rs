@@ -189,6 +189,7 @@ async fn two_tls_nodes_federate_and_a_tls_client_publishes_and_subscribes() {
             filter: topic("weather.updates").into(),
             ack: false,
             group: None,
+            durable: false,
         },
     );
     send(&mut subscriber, &sub).await;
@@ -420,6 +421,7 @@ async fn topic_acl_distinguishes_principals_by_certificate_fingerprint() {
             filter: topic("sensors.data").into(),
             ack: false,
             group: None,
+            durable: false,
         },
     );
     send(&mut subscriber, &sub).await;
@@ -584,6 +586,7 @@ async fn a_publish_with_a_mismatched_sender_is_corrected_to_the_authenticated_id
             filter: topic("weather.updates").into(),
             ack: false,
             group: None,
+            durable: false,
         },
     );
     send(&mut subscriber, &sub).await;
@@ -741,5 +744,227 @@ async fn an_impersonation_attempt_never_collides_with_the_real_peers_membership_
             MessageKind::StatusReply { in_reply_to, .. } => assert_eq!(in_reply_to, request.id),
             other => panic!("expected a StatusReply, got {other:?}"),
         }
+    }
+}
+
+/// ADR-0046: a durable subscriber that disconnects and later
+/// reconnects with the *same* TLS client certificate resumes exactly
+/// where it left off - nothing already delivered before it
+/// disconnected comes back, but everything published while it was gone
+/// does, even though it's long past evicted from the in-memory replay
+/// buffer's window by the time it's fetched from disk here (a two-item
+/// buffer easily holds it in this test, but the position tracking that
+/// makes this work doesn't care either way).
+#[tokio::test]
+async fn a_durable_subscriber_resumes_from_its_last_position_after_reconnecting() {
+    let ca = TestCa::new();
+    let data_dir = tempfile::tempdir().unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let _node = thoth_mesh_node::spawn_with_tls(
+        listener,
+        Vec::new(),
+        NodeOptions {
+            tls: Some(ca.issue()),
+            data_dir: Some(data_dir.path().to_path_buf()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let client_identity = ca.issue();
+    let publish = |payload: &'static [u8]| {
+        Envelope::new(
+            thoth_mesh_core::PeerId::new(),
+            MessageKind::Publish {
+                topic: topic("weather.updates"),
+                payload: payload.to_vec(),
+                retain: false,
+                content_type: None,
+            },
+        )
+    };
+    let payload_of = |envelope: &Envelope| match &envelope.kind {
+        MessageKind::Publish { payload, .. } => payload.clone(),
+        other => panic!("expected a Publish, got {other:?}"),
+    };
+
+    // --- first connection: subscribe durably, receive two messages ---
+    let mut client = connect_tls_as(addr, &client_identity, Some(&client_identity)).await;
+    let sub = Envelope::new(
+        thoth_mesh_core::PeerId::new(),
+        MessageKind::Subscribe {
+            filter: topic("weather.updates").into(),
+            ack: false,
+            group: None,
+            durable: true,
+        },
+    );
+    send(&mut client, &sub).await;
+    assert_eq!(
+        recv(&mut client).await.kind,
+        MessageKind::Ack {
+            in_reply_to: sub.id
+        }
+    );
+
+    let mut publisher = connect_tls(addr, &client_identity).await;
+    send(&mut publisher, &publish(b"sunny")).await;
+    assert_eq!(payload_of(&recv(&mut client).await), b"sunny");
+    send(&mut publisher, &publish(b"cloudy")).await;
+    assert_eq!(payload_of(&recv(&mut client).await), b"cloudy");
+
+    // Disconnect, then publish once more while nobody is listening.
+    drop(client);
+    send(&mut publisher, &publish(b"stormy")).await;
+    // Give the node's broker a moment to actually persist the publish
+    // above before the reconnect below races it.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // --- reconnect with the same identity, subscribe durably again ---
+    let mut client = connect_tls_as(addr, &client_identity, Some(&client_identity)).await;
+    let sub2 = Envelope::new(
+        thoth_mesh_core::PeerId::new(),
+        MessageKind::Subscribe {
+            filter: topic("weather.updates").into(),
+            ack: false,
+            group: None,
+            durable: true,
+        },
+    );
+    send(&mut client, &sub2).await;
+    assert_eq!(
+        recv(&mut client).await.kind,
+        MessageKind::Ack {
+            in_reply_to: sub2.id
+        }
+    );
+    assert_eq!(
+        payload_of(&recv(&mut client).await),
+        b"stormy",
+        "only the message published after this subscriber's last recorded position comes back"
+    );
+    // Nothing else follows - "sunny"/"cloudy" are not redelivered even
+    // though they're still sitting in the in-memory replay buffer.
+    assert!(
+        timeout(Duration::from_millis(200), recv(&mut client))
+            .await
+            .is_err(),
+        "no further message should have arrived"
+    );
+}
+
+/// ADR-0046: `durable: true` with no TLS client certificate presented
+/// is refused outright - there's no identity for the node to track a
+/// position against.
+#[tokio::test]
+async fn durable_subscribe_without_a_tls_client_certificate_is_rejected() {
+    let ca = TestCa::new();
+    let data_dir = tempfile::tempdir().unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let _node = thoth_mesh_node::spawn_with_tls(
+        listener,
+        Vec::new(),
+        NodeOptions {
+            tls: Some(ca.issue()),
+            data_dir: Some(data_dir.path().to_path_buf()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    // No client identity - an anonymous TLS connection.
+    let mut client = connect_tls(addr, &ca.issue()).await;
+    let sub = Envelope::new(
+        thoth_mesh_core::PeerId::new(),
+        MessageKind::Subscribe {
+            filter: topic("weather.updates").into(),
+            ack: false,
+            group: None,
+            durable: true,
+        },
+    );
+    send(&mut client, &sub).await;
+    match recv(&mut client).await.kind {
+        MessageKind::Error { in_reply_to, .. } => assert_eq!(in_reply_to, Some(sub.id)),
+        other => panic!("expected an Error, got {other:?}"),
+    }
+}
+
+/// ADR-0046: `durable: true` combined with a wildcard filter is
+/// refused - one recorded position can't stand in for several topics.
+#[tokio::test]
+async fn durable_subscribe_with_a_wildcard_filter_is_rejected() {
+    let ca = TestCa::new();
+    let data_dir = tempfile::tempdir().unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let _node = thoth_mesh_node::spawn_with_tls(
+        listener,
+        Vec::new(),
+        NodeOptions {
+            tls: Some(ca.issue()),
+            data_dir: Some(data_dir.path().to_path_buf()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let client_identity = ca.issue();
+    let mut client = connect_tls_as(addr, &client_identity, Some(&client_identity)).await;
+    let sub = Envelope::new(
+        thoth_mesh_core::PeerId::new(),
+        MessageKind::Subscribe {
+            filter: "weather.+".parse().unwrap(),
+            ack: false,
+            group: None,
+            durable: true,
+        },
+    );
+    send(&mut client, &sub).await;
+    match recv(&mut client).await.kind {
+        MessageKind::Error { in_reply_to, .. } => assert_eq!(in_reply_to, Some(sub.id)),
+        other => panic!("expected an Error, got {other:?}"),
+    }
+}
+
+/// ADR-0046: `durable: true` on a node started without `--data-dir`
+/// (no [`thoth_mesh_broker::MessageStore`] configured) is refused -
+/// there's nowhere to record a position.
+#[tokio::test]
+async fn durable_subscribe_with_no_data_dir_configured_is_rejected() {
+    let ca = TestCa::new();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let _node = thoth_mesh_node::spawn_with_tls(
+        listener,
+        Vec::new(),
+        NodeOptions {
+            tls: Some(ca.issue()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let client_identity = ca.issue();
+    let mut client = connect_tls_as(addr, &client_identity, Some(&client_identity)).await;
+    let sub = Envelope::new(
+        thoth_mesh_core::PeerId::new(),
+        MessageKind::Subscribe {
+            filter: topic("weather.updates").into(),
+            ack: false,
+            group: None,
+            durable: true,
+        },
+    );
+    send(&mut client, &sub).await;
+    match recv(&mut client).await.kind {
+        MessageKind::Error { in_reply_to, .. } => assert_eq!(in_reply_to, Some(sub.id)),
+        other => panic!("expected an Error, got {other:?}"),
     }
 }

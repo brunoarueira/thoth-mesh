@@ -317,6 +317,7 @@ mod tests {
                 filter: filter.clone(),
                 ack: false,
                 group: None,
+                durable: false,
             },
         );
         async_framing::write_frame(&mut conn, &sub.to_bytes().unwrap())
@@ -347,6 +348,7 @@ mod tests {
                 filter: filter.clone(),
                 ack: false,
                 group: None,
+                durable: false,
             }
         );
 
@@ -476,6 +478,7 @@ mod tests {
                 filter,
                 ack: false,
                 group: None,
+                durable: false,
             }
         );
     }

@@ -36,6 +36,19 @@ impl PeerId {
         bytes.copy_from_slice(&fingerprint[..16]);
         Self(uuid::Builder::from_custom_bytes(bytes).into_uuid())
     }
+
+    /// The identity's raw 16 bytes - for a store that needs to key on
+    /// a `PeerId` without going through the wire format (e.g. durable
+    /// subscriber offsets, ADR-0046).
+    pub fn as_bytes(&self) -> [u8; 16] {
+        *self.0.as_bytes()
+    }
+
+    /// Reconstructs a `PeerId` from bytes previously returned by
+    /// [`as_bytes`](Self::as_bytes).
+    pub fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(Uuid::from_bytes(bytes))
+    }
 }
 
 impl Default for PeerId {
@@ -78,6 +91,12 @@ mod tests {
         // can never produce the same PeerId, structurally, no matter
         // what bytes a fingerprint happens to contain.
         assert_ne!(PeerId::new(), PeerId::from_fingerprint([0u8; 32]));
+    }
+
+    #[test]
+    fn as_bytes_then_from_bytes_round_trips() {
+        let id = PeerId::new();
+        assert_eq!(PeerId::from_bytes(id.as_bytes()), id);
     }
 
     #[test]

@@ -27,8 +27,10 @@ filters), [ADR-0041](docs/adr/0041-at-least-once-delivery-with-ack-based-redeliv
 [ADR-0043](docs/adr/0043-retained-messages.md) (retained/last-value
 messages), and
 [ADR-0044](docs/adr/0044-content-type-hint-on-publish.md) (content-type
-hint on `Publish`). For diagrams of several of these flows, see
-[docs/FLOWS.md](docs/FLOWS.md).
+hint on `Publish`), and
+[ADR-0046](docs/adr/0046-durable-subscriptions.md) (durable
+subscriptions via per-subscriber offset tracking). For diagrams of
+several of these flows, see [docs/FLOWS.md](docs/FLOWS.md).
 
 **Status:** version 1, and explicitly unstable — see ADR-0014. Nothing
 here should be assumed to hold across a breaking change; check
@@ -236,22 +238,24 @@ reply. See [Delivery semantics](#delivery-semantics) for what
 ### `Subscribe`
 
 ```
-{"Subscribe": {"filter": <TopicFilter>, "ack": <bool>, "group": <string | null>}}
+{"Subscribe": {"filter": <TopicFilter>, "ack": <bool>, "group": <string | null>, "durable": <bool>}}
 ```
 
 Registers interest in `filter` on this connection - a literal topic
 name or a wildcard pattern alike (ADR-0022). The node replies with an
 `Ack` once registered, or an `Error` instead if a `--topic-acl` (or,
-for a peer link, a `--peer-topic-acl`) refuses it, or if `ack` and
-`group` are both set (see `group` below). A wildcard `filter`
-is refused outright wherever either ACL is configured for this
-connection's role, regardless of what it would actually expand to -
-neither ACL is pattern-aware, and this codebase doesn't attempt to
-make one covering-pattern imply anything about another. Sending
-`Subscribe` for a filter this connection is already subscribed to is a
-no-op (still gets an `Ack`) - including for `ack`/`group`: both are
-only read the first time a filter is subscribed to, the same as
-everything else a no-op re-`Subscribe` doesn't retroactively change.
+for a peer link, a `--peer-topic-acl`) refuses it, if `ack` and
+`group` are both set (see `group` below), or if `durable` is set and
+any of its own requirements aren't met (see `durable` below). A
+wildcard `filter` is refused outright wherever either ACL is
+configured for this connection's role, regardless of what it would
+actually expand to - neither ACL is pattern-aware, and this codebase
+doesn't attempt to make one covering-pattern imply anything about
+another. Sending `Subscribe` for a filter this connection is already
+subscribed to is a no-op (still gets an `Ack`) - including for
+`ack`/`group`/`durable`: all three are only read the first time a
+filter is subscribed to, the same as everything else a no-op
+re-`Subscribe` doesn't retroactively change.
 
 `ack` opts this subscription into at-least-once delivery
 ([ADR-0041](docs/adr/0041-at-least-once-delivery-with-ack-based-redelivery.md)):
@@ -302,6 +306,40 @@ is refused with an `Error` - what acknowledgement means for a group
 isn't defined by this protocol version. `#[serde(default)]` on the
 implementation side, same rolling-upgrade story as `ack`: a sender
 that omits `group` entirely gets `None`, unchanged fan-out behavior.
+
+`durable: true` makes this a durable subscription
+([ADR-0046](docs/adr/0046-durable-subscriptions.md)): the node
+remembers, per authenticated identity and topic, the `id` of the last
+`Publish` delivered, so a later `durable: true` resubscribe from the
+*same* identity resumes automatically from exactly that position -
+catching up on everything published while it was gone, not just
+whatever the in-memory replay buffer still happens to hold, and never
+redelivering anything already delivered before it disconnected. The
+very first `durable: true` subscribe for a given (identity, topic)
+pair - nothing recorded yet - behaves exactly like an ordinary
+subscribe: replay-buffer backlog only, no unconditional full history.
+Four things must all hold, or the node refuses with an `Error`
+instead of registering anything:
+
+- This connection has a TLS client certificate (ADR-0038) - the
+  authenticated identity it derives is what the position is keyed on.
+  A plaintext connection, or TLS with no client certificate presented,
+  has no such identity.
+- `filter` is a literal topic, not a wildcard pattern - one recorded
+  position can't stand in for several topics.
+- `ack` and `group` are both unset - durable delivery is its own mode,
+  not composable with either.
+- The node was started with `--data-dir`
+  ([ADR-0045](docs/adr/0045-on-disk-message-persistence-via-sqlite.md)) - durable
+  subscriptions need the on-disk log both to record a position in and
+  to catch up from.
+
+`#[serde(default)]` on the implementation side, same rolling-upgrade
+story as `ack`/`group`: a sender that omits `durable` entirely gets
+`false`, unchanged behavior. The CLI's `subscribe --durable` requires
+`--tls-cert`/`--tls-key` to be set, but does not pre-validate any of
+the four requirements above client-side - the node's `Error` reply is
+the single source of truth, exactly as `ack`/`group` already work.
 
 ### `Unsubscribe`
 
@@ -488,8 +526,8 @@ accepting side.
 Worth being explicit about what thoth-mesh does **not** currently
 guarantee:
 
-- **Best-effort, in-memory only - bounded replay, not durability.**
-  There is no persistence across a node restart. Live delivery still
+- **Best-effort, in-memory only by default - bounded replay, not
+  durability, unless `--data-dir` is configured.** Live delivery still
   reaches whoever is subscribed *at that moment*, on that node or
   reachable through the mesh; a subscriber connecting afterward is
   additionally replayed each topic's recent backlog (a bounded
@@ -497,7 +535,13 @@ guarantee:
   currently 1024, per topic) - see
   [ADR-0021](docs/adr/0021-message-replay-ring-buffer.md). A subscriber
   connecting after a topic's backlog has rolled past that capacity
-  still misses whatever fell off the oldest end.
+  still misses whatever fell off the oldest end - unless the node was
+  started with `--data-dir`
+  ([ADR-0045](docs/adr/0045-on-disk-message-persistence-via-sqlite.md)), in which
+  case every publish also survives on disk across a restart, and a
+  `durable: true` subscribe (see [`Subscribe`](#subscribe),
+  [ADR-0046](docs/adr/0046-durable-subscriptions.md)) can catch up from
+  disk past what the in-memory buffer alone would still hold.
 - **A slow subscriber can miss messages - but recovers what it can.**
   Delivery to each subscriber goes through a bounded channel; a
   subscriber that falls too far behind has the gap recovered from the

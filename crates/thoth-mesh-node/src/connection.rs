@@ -206,11 +206,18 @@ async fn run_connection(socket: MaybeTlsStream, shared: Shared, initial_peer: Op
         envelope.sender = ctx.authenticated_sender(envelope.sender);
 
         let keep_going = match &envelope.kind {
-            MessageKind::Subscribe { filter, ack, group } => {
+            MessageKind::Subscribe {
+                filter,
+                ack,
+                group,
+                durable,
+            } => {
                 let filter = filter.clone();
                 let ack = *ack;
                 let group = group.clone();
-                ctx.handle_subscribe(&envelope, filter, ack, group).await
+                let durable = *durable;
+                ctx.handle_subscribe(&envelope, filter, ack, group, durable)
+                    .await
             }
             MessageKind::Unsubscribe { filter } => {
                 let filter = filter.clone();
@@ -382,26 +389,30 @@ impl ConnectionContext {
         true
     }
 
-    /// Handles a `Subscribe { filter, ack, group }` request: refuses
-    /// `ack: true` combined with a `group` outright (see the `Error`
-    /// case below), authorizes it against whichever ACL applies
-    /// (ADR-0018/ADR-0020) - refusing a wildcard filter outright
-    /// wherever one does, regardless of what it would expand to
-    /// (ADR-0022) - registers a genuinely new filter (ADR-0021, or
-    /// ADR-0042 for a group), acks, and, only on this connection's
-    /// first subscriber for `filter`, propagates the interest
-    /// transition to every peer link (ADR-0011). `ack`/`group` are
-    /// only read the first time `filter` is subscribed to on this
-    /// connection - same as the rest of a no-op re-`Subscribe`, it
-    /// doesn't retroactively change an already-registered
-    /// subscription's mode. Returns `false` if the outgoing queue has
-    /// closed and the read loop should stop.
+    /// Handles a `Subscribe { filter, ack, group, durable }` request:
+    /// refuses `ack: true` combined with a `group` outright (see the
+    /// `Error` case below), refuses `durable: true` combined with
+    /// `ack`, `group`, a wildcard `filter`, no TLS client certificate,
+    /// or no configured `MessageStore` (ADR-0046), authorizes what's
+    /// left against whichever ACL applies (ADR-0018/ADR-0020) -
+    /// refusing a wildcard filter outright wherever one does,
+    /// regardless of what it would expand to (ADR-0022) - registers a
+    /// genuinely new filter (ADR-0021, or ADR-0042 for a group, or
+    /// ADR-0046 for a durable subscription), acks, and, only on this
+    /// connection's first subscriber for `filter`, propagates the
+    /// interest transition to every peer link (ADR-0011).
+    /// `ack`/`group`/`durable` are only read the first time `filter` is
+    /// subscribed to on this connection - same as the rest of a no-op
+    /// re-`Subscribe`, it doesn't retroactively change an
+    /// already-registered subscription's mode. Returns `false` if the
+    /// outgoing queue has closed and the read loop should stop.
     async fn handle_subscribe(
         &mut self,
         envelope: &Envelope,
         filter: TopicFilter,
         ack: bool,
         group: Option<String>,
+        durable: bool,
     ) -> bool {
         if ack && group.is_some() {
             tracing::warn!(sender = ?envelope.sender, %filter, "rejected: ack and group are not supported together (ADR-0042)");
@@ -413,6 +424,32 @@ impl ConnectionContext {
                 },
             );
             return self.send(error).await;
+        }
+        if durable {
+            let rejection = if ack {
+                Some("durable and ack are not supported together")
+            } else if group.is_some() {
+                Some("durable and group are not supported together")
+            } else if self.peer_fingerprint.is_none() {
+                Some("durable subscriptions require a TLS client certificate")
+            } else if filter.as_topic().is_none() {
+                Some("durable subscriptions require a literal topic, not a wildcard filter")
+            } else if !self.broker.has_store() {
+                Some("durable subscriptions require --data-dir to be configured on this node")
+            } else {
+                None
+            };
+            if let Some(message) = rejection {
+                tracing::warn!(sender = ?envelope.sender, %filter, "rejected: {message} (ADR-0046)");
+                let error = Envelope::new(
+                    self.node_id,
+                    MessageKind::Error {
+                        in_reply_to: Some(envelope.id),
+                        message: message.to_owned(),
+                    },
+                );
+                return self.send(error).await;
+            }
         }
         let is_peer = self.is_peer();
         if !filter_acl_permits(
@@ -438,11 +475,12 @@ impl ConnectionContext {
             );
             return self.send(error).await;
         }
-        tracing::info!(sender = ?envelope.sender, %filter, ack, ?group, "subscribed");
+        tracing::info!(sender = ?envelope.sender, %filter, ack, ?group, durable, "subscribed");
         let is_new_forwarder = !self.forwarders.contains_key(&filter);
         let broker = Arc::clone(&self.broker);
         let outgoing_tx = self.outgoing_tx.clone();
         let metrics = self.metrics.clone();
+        let subscriber = envelope.sender;
         self.forwarders.entry(filter.clone()).or_insert_with(|| {
             if let Some(group) = group {
                 // Direct push onto this connection's own outgoing_tx
@@ -450,6 +488,24 @@ impl ConnectionContext {
                 // below.
                 broker.join_group(filter.clone(), group.clone(), outgoing_tx);
                 Subscription::Group(group)
+            } else if durable {
+                // A literal topic is guaranteed by the rejection checks
+                // above - a durable subscribe never reaches here with a
+                // wildcard filter.
+                let topic = filter
+                    .as_topic()
+                    .expect("durable subscribe requires a literal topic, checked above");
+                Subscription::Forwarder(Forwarder {
+                    handle: spawn_durable_forwarder(
+                        &broker,
+                        filter.clone(),
+                        topic,
+                        subscriber,
+                        outgoing_tx,
+                        metrics,
+                    ),
+                    ack_tx: None,
+                })
             } else if ack {
                 Subscription::Forwarder(spawn_ack_forwarder(
                     &broker,
@@ -770,6 +826,7 @@ fn register_peer_link(
                 filter: filter.clone(),
                 ack: false,
                 group: None,
+                durable: false,
             },
         ));
         if outgoing_tx.try_send(envelope).is_err() {
@@ -890,6 +947,7 @@ fn propagate_interest(
             filter,
             ack: false,
             group: None,
+            durable: false,
         }
     } else {
         MessageKind::Unsubscribe { filter }
@@ -1150,6 +1208,110 @@ fn spawn_forwarder(
                             if outgoing_tx.send(envelope).await.is_err() {
                                 return;
                             }
+                            last_delivered = Some(id);
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }
+        .in_current_span(),
+    )
+}
+
+/// Like [`spawn_forwarder`], for a `filter` subscribed to with
+/// `durable: true` (ADR-0046): the initial subscribe goes through
+/// [`Broker::subscribe_durable`] instead of [`Broker::subscribe`], so
+/// the backlog includes disk catch-up since `subscriber`'s last
+/// recorded position for this topic (or nothing, the first time), and
+/// every delivery - backlog, live, or lag-recovered alike - is
+/// followed by recording that envelope's own `id` as the new position
+/// (best-effort, like the persist path itself). `handle_subscribe`
+/// already refuses a wildcard filter, a missing TLS identity, and a
+/// missing store synchronously before ever spawning this, so an `Err`
+/// here can only mean a genuine store I/O failure - logged, and the
+/// task simply ends without registering a live receiver, the same as
+/// if the subscribe had never happened.
+///
+/// Lag recovery re-subscribes with the ordinary [`Broker::subscribe`],
+/// not another `subscribe_durable` call: by this point the recorded
+/// position is already caught up to whatever was last delivered, and
+/// this loop's own gap-skipping logic (identical to
+/// [`spawn_forwarder`]'s) is what actually closes the gap - a second
+/// disk catch-up here would just redo that work.
+fn spawn_durable_forwarder(
+    broker: &Arc<Broker>,
+    filter: TopicFilter,
+    topic: Topic,
+    subscriber: PeerId,
+    outgoing_tx: mpsc::Sender<Arc<Envelope>>,
+    metrics: Metrics,
+) -> JoinHandle<()> {
+    let broker = Arc::clone(broker);
+    tokio::spawn(
+        async move {
+            let (backlog, mut rx) =
+                match broker.subscribe_durable(filter.clone(), subscriber).await {
+                    Ok(result) => result,
+                    Err(err) => {
+                        tracing::error!(%err, ?subscriber, %topic, "durable subscribe failed");
+                        return;
+                    }
+                };
+            if !backlog.is_empty() {
+                metrics.record_replayed_messages(backlog.len() as u64);
+            }
+            let mut last_delivered: Option<MessageId> = None;
+            for envelope in backlog {
+                let id = envelope.id;
+                if outgoing_tx.send(envelope).await.is_err() {
+                    return;
+                }
+                broker.record_delivered(subscriber, topic.clone(), id).await;
+                last_delivered = Some(id);
+            }
+            loop {
+                match rx.recv().await {
+                    Ok(envelope) => {
+                        let id = envelope.id;
+                        if outgoing_tx.send(envelope).await.is_err() {
+                            break;
+                        }
+                        broker.record_delivered(subscriber, topic.clone(), id).await;
+                        last_delivered = Some(id);
+                    }
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(skipped, "durable forwarder lagged, attempting recovery from replay buffer");
+                        metrics.record_forwarder_lag(skipped);
+
+                        let (fresh_backlog, fresh_rx) = broker.subscribe(filter.clone()).await;
+                        rx = fresh_rx;
+
+                        let recovered: Vec<Arc<Envelope>> = match last_delivered {
+                            None => fresh_backlog,
+                            Some(last_id) => {
+                                match fresh_backlog.iter().position(|e| e.id == last_id) {
+                                    Some(idx) => {
+                                        fresh_backlog.into_iter().skip(idx + 1).collect()
+                                    }
+                                    None => {
+                                        tracing::warn!(
+                                            "lag recovery gap exceeded the replay buffer, some messages are unrecoverably lost"
+                                        );
+                                        Vec::new()
+                                    }
+                                }
+                            }
+                        };
+                        if !recovered.is_empty() {
+                            metrics.record_lag_recovered(recovered.len() as u64);
+                        }
+                        for envelope in recovered {
+                            let id = envelope.id;
+                            if outgoing_tx.send(envelope).await.is_err() {
+                                return;
+                            }
+                            broker.record_delivered(subscriber, topic.clone(), id).await;
                             last_delivered = Some(id);
                         }
                     }

@@ -125,6 +125,15 @@ pub enum Command {
         /// defined yet. See ADR-0042.
         #[arg(long)]
         group: Option<String>,
+        /// Make every filter given a durable subscription: the node
+        /// remembers where this identity left off on each topic, so a
+        /// later `--durable` resubscribe resumes automatically instead
+        /// of only getting recent history. Requires --tls-cert/
+        /// --tls-key (a stable identity to key the position on) and a
+        /// literal filter (one offset can't mean several topics for a
+        /// wildcard) - refused by the node otherwise. See ADR-0046.
+        #[arg(long)]
+        durable: bool,
     },
     /// Print a tab-completion script for `shell` to stdout, then exit.
     /// See ADR-0036 for how to install the result.
@@ -217,12 +226,13 @@ pub async fn run(cli: Cli) -> std::io::Result<()> {
             output,
             ack,
             group,
+            durable,
         } => {
             let filters = filters
                 .iter()
                 .map(|filter| parse_filter(filter))
                 .collect::<std::io::Result<Vec<_>>>()?;
-            subscribe_and_print(&mut conn, sender, filters, output, ack, group).await
+            subscribe_and_print(&mut conn, sender, filters, output, ack, group, durable).await
         }
         Command::Status => status_and_print(&mut conn, sender).await,
         Command::Completions { .. } => unreachable!("returned above"),
@@ -269,6 +279,10 @@ async fn read_payload(
 /// (ADR-0042); combined with `ack`, the node refuses the request
 /// (surfaced as an `Err` here, same as any other `Subscribe`
 /// rejection) rather than this CLI guessing at what's supported.
+/// `durable` makes every filter a durable subscription (ADR-0046) -
+/// refused by the node without a TLS client certificate, or for a
+/// wildcard filter, the same "let the node's Error be the one source
+/// of truth" pattern `group` already follows.
 async fn subscribe_and_print(
     conn: &mut Compat<MaybeTlsStream>,
     sender: PeerId,
@@ -276,8 +290,9 @@ async fn subscribe_and_print(
     output: OutputMode,
     ack: bool,
     group: Option<String>,
+    durable: bool,
 ) -> std::io::Result<()> {
-    let backlog = subscribe_all(conn, sender, &filters, ack, group).await?;
+    let backlog = subscribe_all(conn, sender, &filters, ack, group, durable).await?;
     let list = filters
         .iter()
         .map(TopicFilter::to_string)
@@ -387,6 +402,7 @@ async fn subscribe(
             filter,
             ack: false,
             group: None,
+            durable: false,
         },
     );
     send(conn, &envelope).await?;
@@ -432,6 +448,7 @@ async fn subscribe_all(
     filters: &[TopicFilter],
     ack: bool,
     group: Option<String>,
+    durable: bool,
 ) -> std::io::Result<Vec<Envelope>> {
     let mut pending: HashSet<MessageId> = HashSet::new();
     for filter in filters {
@@ -441,6 +458,7 @@ async fn subscribe_all(
                 filter: filter.clone(),
                 ack,
                 group: group.clone(),
+                durable,
             },
         );
         send(conn, &envelope).await?;
@@ -1048,6 +1066,7 @@ mod tests {
                 output: OutputMode::Text,
                 ack: false,
                 group: None,
+                durable: false,
             },
         };
         let err = timeout(TEST_TIMEOUT, run(cli))
@@ -1156,6 +1175,7 @@ mod tests {
                 &[weather.clone(), traffic.clone()],
                 false,
                 None,
+                false,
             ),
         )
         .await
@@ -1276,6 +1296,7 @@ mod tests {
                 &[weather.clone(), traffic],
                 false,
                 None,
+                false,
             ),
         )
         .await
@@ -1323,7 +1344,14 @@ mod tests {
         let secret: TopicFilter = "secret.topic".parse().unwrap();
         let err = timeout(
             TEST_TIMEOUT,
-            subscribe_all(&mut client, PeerId::new(), &[weather, secret], false, None),
+            subscribe_all(
+                &mut client,
+                PeerId::new(),
+                &[weather, secret],
+                false,
+                None,
+                false,
+            ),
         )
         .await
         .expect("timed out waiting for the rejection")

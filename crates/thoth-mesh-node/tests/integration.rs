@@ -125,6 +125,7 @@ async fn subscribe_receives_ack() {
             filter: topic("weather.updates").into(),
             ack: false,
             group: None,
+            durable: false,
         },
     );
     send(&mut client, &sub).await;
@@ -149,6 +150,7 @@ async fn unsubscribe_receives_ack() {
             filter: topic("weather.updates").into(),
             ack: false,
             group: None,
+            durable: false,
         },
     );
     send(&mut client, &sub).await;
@@ -183,6 +185,7 @@ async fn publish_delivers_to_subscriber() {
             filter: topic("weather.updates").into(),
             ack: false,
             group: None,
+            durable: false,
         },
     );
     send(&mut subscriber, &sub).await;
@@ -222,6 +225,7 @@ async fn a_content_type_hint_reaches_the_subscriber_unchanged() {
             filter: topic("weather.updates").into(),
             ack: false,
             group: None,
+            durable: false,
         },
     );
     send(&mut subscriber, &sub).await;
@@ -265,6 +269,7 @@ async fn an_acked_subscription_delivers_and_accepts_the_clients_ack() {
             filter: topic("weather.updates").into(),
             ack: true,
             group: None,
+            durable: false,
         },
     );
     send(&mut subscriber, &sub).await;
@@ -323,6 +328,7 @@ async fn ack_and_group_together_is_rejected() {
             filter: topic("weather.updates").into(),
             ack: true,
             group: Some("workers".to_owned()),
+            durable: false,
         },
     );
     send(&mut client, &sub).await;
@@ -344,6 +350,7 @@ async fn ack_and_group_together_is_rejected() {
             filter: topic("weather.updates").into(),
             ack: false,
             group: None,
+            durable: false,
         },
     );
     send(&mut client, &ordinary).await;
@@ -374,6 +381,7 @@ async fn consumer_group_round_robins_across_two_members() {
                 filter: topic("weather.updates").into(),
                 ack: false,
                 group: Some("workers".to_owned()),
+                durable: false,
             },
         );
         send(member, &sub).await;
@@ -429,6 +437,7 @@ async fn a_group_member_that_unsubscribes_is_dropped_from_the_rotation() {
                 filter: topic("weather.updates").into(),
                 ack: false,
                 group: Some("workers".to_owned()),
+                durable: false,
             },
         );
         send(member, &sub).await;
@@ -484,6 +493,7 @@ async fn unsubscribing_from_a_group_leaves_it() {
             filter: topic("weather.updates").into(),
             ack: false,
             group: Some("workers".to_owned()),
+            durable: false,
         },
     );
     send(&mut member, &sub).await;
@@ -526,6 +536,7 @@ async fn multiple_subscribers_all_receive() {
                 filter: topic("weather.updates").into(),
                 ack: false,
                 group: None,
+                durable: false,
             },
         );
         send(client, &sub).await;
@@ -570,6 +581,7 @@ async fn a_late_subscriber_is_replayed_a_publish_that_happened_before_it_subscri
             filter: topic("weather.updates").into(),
             ack: false,
             group: None,
+            durable: false,
         },
     );
     send(&mut subscriber, &sub).await;
@@ -610,6 +622,7 @@ async fn a_retained_publish_reaches_a_wildcard_subscriber_that_connects_afterwar
             filter: filter("sensor.+"),
             ack: false,
             group: None,
+            durable: false,
         },
     );
     send(&mut subscriber, &sub).await;
@@ -648,6 +661,7 @@ async fn an_empty_retained_publish_clears_the_retained_message() {
             filter: filter("sensor.+"),
             ack: false,
             group: None,
+            durable: false,
         },
     );
     send(&mut subscriber, &sub).await;
@@ -668,6 +682,7 @@ async fn resubscribing_to_an_already_subscribed_topic_does_not_replay_again() {
             filter: topic("weather.updates").into(),
             ack: false,
             group: None,
+            durable: false,
         },
     );
     send(&mut subscriber, &sub).await;
@@ -696,6 +711,7 @@ async fn resubscribing_to_an_already_subscribed_topic_does_not_replay_again() {
             filter: topic("weather.updates").into(),
             ack: false,
             group: None,
+            durable: false,
         },
     );
     send(&mut subscriber, &resub).await;
@@ -721,6 +737,7 @@ async fn unsubscribed_client_does_not_receive_publish() {
             filter: topic("weather.updates").into(),
             ack: false,
             group: None,
+            durable: false,
         },
     );
     send(&mut client, &sub).await;
@@ -761,6 +778,7 @@ async fn distinct_topics_do_not_cross_deliver() {
             filter: topic("weather.updates").into(),
             ack: false,
             group: None,
+            durable: false,
         },
     );
     send(&mut subscriber, &sub).await;
@@ -794,6 +812,7 @@ async fn a_wildcard_subscriber_receives_a_matching_publish() {
             filter: filter("weather.+"),
             ack: false,
             group: None,
+            durable: false,
         },
     );
     send(&mut subscriber, &sub).await;
@@ -826,6 +845,7 @@ async fn a_wildcard_subscriber_does_not_receive_a_non_matching_publish() {
             filter: filter("weather.+"),
             ack: false,
             group: None,
+            durable: false,
         },
     );
     send(&mut subscriber, &sub).await;
@@ -860,6 +880,7 @@ async fn an_exact_and_a_matching_wildcard_subscriber_on_the_same_connection_both
                 filter: sub_filter,
                 ack: false,
                 group: None,
+                durable: false,
             },
         );
         send(&mut subscriber, &sub).await;
@@ -1001,6 +1022,7 @@ async fn dial_side_peer_link_forwards_local_publishes_once_subscribed() {
             filter: topic("weather.updates").into(),
             ack: false,
             group: None,
+            durable: false,
         },
     );
     send(&mut peer, &sub).await;
@@ -1023,6 +1045,7 @@ async fn dial_side_peer_link_forwards_local_publishes_once_subscribed() {
             filter: topic("weather.updates").into(),
             ack: false,
             group: None,
+            durable: false,
         }
     );
 
@@ -1076,6 +1099,7 @@ async fn a_peer_links_wildcard_interest_propagates_and_receives_a_matching_publi
             filter: filter("weather.+"),
             ack: false,
             group: None,
+            durable: false,
         },
     );
     send(&mut peer, &sub).await;
@@ -1127,6 +1151,7 @@ async fn multi_hop_interest_propagates_across_a_chain_of_peers() {
             filter: topic("weather.updates").into(),
             ack: false,
             group: None,
+            durable: false,
         },
     );
     send(&mut subscriber, &sub).await;
@@ -1175,6 +1200,7 @@ async fn loop_prevention_stops_a_publish_from_bouncing_forever() {
                 filter: topic("weather.updates").into(),
                 ack: false,
                 group: None,
+                durable: false,
             },
         );
         send(client, &sub).await;
@@ -1482,6 +1508,7 @@ async fn a_restarted_node_rehydrates_replay_history_and_retained_values_from_dis
             filter: topic("weather.updates").into(),
             ack: false,
             group: None,
+            durable: false,
         },
     );
     send(&mut subscriber, &sub).await;
@@ -1500,6 +1527,7 @@ async fn a_restarted_node_rehydrates_replay_history_and_retained_values_from_dis
             filter: filter("sensor.+"),
             ack: false,
             group: None,
+            durable: false,
         },
     );
     send(&mut subscriber, &wild).await;

@@ -17,7 +17,7 @@ use std::hash::Hash;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use thoth_mesh_core::{Envelope, MessageId, MessageKind, Topic, TopicFilter};
+use thoth_mesh_core::{Envelope, MessageId, MessageKind, PeerId, Topic, TopicFilter};
 use tokio::sync::{RwLock, broadcast, mpsc};
 
 /// Default channel capacity for a topic's broadcast channel.
@@ -78,7 +78,64 @@ pub trait MessageStore: std::fmt::Debug + Send + Sync + 'static {
     /// Every topic's current retained message (ADR-0043), for
     /// refilling retained slots on startup.
     fn load_retained(&self) -> std::io::Result<Vec<(Topic, Arc<Envelope>)>>;
+
+    /// Every message persisted for `topic` after `after` (exclusive),
+    /// oldest first - the disk catch-up a durable subscription resumes
+    /// from (ADR-0046). A message persisted before `msg_id` tracking
+    /// existed is never returned, regardless of `after`.
+    fn messages_since(
+        &self,
+        topic: &Topic,
+        after: MessageId,
+    ) -> std::io::Result<Vec<Arc<Envelope>>>;
+
+    /// `subscriber`'s last recorded position for `topic`, if it has
+    /// one - `None` means this `(subscriber, topic)` pair has never
+    /// been durably tracked before (ADR-0046).
+    fn load_offset(&self, subscriber: PeerId, topic: &Topic) -> std::io::Result<Option<MessageId>>;
+
+    /// Records `message_id` as `subscriber`'s new position for
+    /// `topic` (ADR-0046) - called after every durable delivery.
+    fn record_offset(
+        &self,
+        subscriber: PeerId,
+        topic: &Topic,
+        message_id: MessageId,
+    ) -> std::io::Result<()>;
 }
+
+/// Why [`Broker::subscribe_durable`] refused a request, before ever
+/// touching the store (ADR-0046).
+#[derive(Debug)]
+pub enum DurableSubscribeError {
+    /// No [`MessageStore`] is configured for this broker - durable
+    /// subscriptions need somewhere to record a position.
+    NoStore,
+    /// `filter` is a wildcard pattern (ADR-0022), not a literal topic -
+    /// one offset can't mean several topics.
+    WildcardFilter,
+    /// The store itself failed while reading the existing position or
+    /// the catch-up history.
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for DurableSubscribeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoStore => write!(
+                f,
+                "no message store is configured for durable subscriptions"
+            ),
+            Self::WildcardFilter => write!(
+                f,
+                "durable subscriptions require a literal topic, not a wildcard filter"
+            ),
+            Self::Io(err) => write!(f, "durable subscribe store error: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for DurableSubscribeError {}
 
 /// An in-process pub/sub broker: routes published envelopes to the
 /// subscribers registered for their topic.
@@ -250,6 +307,99 @@ impl Broker {
                 backlog.sort_by_key(|e| e.id);
                 (backlog, receiver)
             }
+        }
+    }
+
+    /// Whether a [`MessageStore`] is configured - durable subscriptions
+    /// (ADR-0046) need one; nothing else does.
+    pub fn has_store(&self) -> bool {
+        self.store.is_some()
+    }
+
+    /// Subscribes `subscriber` to `filter` *durably* (ADR-0046):
+    /// `filter` must be a literal topic (a wildcard is refused - one
+    /// offset can't mean several topics), and a [`MessageStore`] must
+    /// be configured (refused otherwise, rather than silently
+    /// downgrading to an ordinary subscribe).
+    ///
+    /// The returned backlog is `subscriber`'s disk catch-up since its
+    /// last recorded position for this topic (everything, unbounded -
+    /// or nothing, if this is the first time this `(subscriber, topic)`
+    /// pair has ever been seen, in which case this behaves exactly
+    /// like [`subscribe`](Self::subscribe)) merged with whatever part
+    /// of the ordinary in-memory backlog (which already folds in the
+    /// topic's retained message, ADR-0043) is newer than that recorded
+    /// position, deduplicated by `MessageId` and sorted by it - a
+    /// still-buffered copy of a message already delivered before this
+    /// subscriber reconnected is not redelivered. The disk read happens
+    /// *before* the in-memory snapshot and
+    /// receiver registration, not under the same lock - see ADR-0046
+    /// for why the resulting narrow race can only ever double-deliver,
+    /// never lose, a message at the seam.
+    ///
+    /// Recording each delivery as `subscriber`'s new position is the
+    /// caller's job (see `record_delivered`) - this call only reads.
+    pub async fn subscribe_durable(
+        &self,
+        filter: TopicFilter,
+        subscriber: PeerId,
+    ) -> Result<(Vec<Arc<Envelope>>, broadcast::Receiver<Arc<Envelope>>), DurableSubscribeError>
+    {
+        let topic = filter
+            .as_topic()
+            .ok_or(DurableSubscribeError::WildcardFilter)?;
+        let store = self.store.clone().ok_or(DurableSubscribeError::NoStore)?;
+
+        let (last_id, catchup) = {
+            let store = Arc::clone(&store);
+            let topic = topic.clone();
+            tokio::task::spawn_blocking(move || match store.load_offset(subscriber, &topic)? {
+                Some(last_id) => Ok((Some(last_id), store.messages_since(&topic, last_id)?)),
+                None => Ok((None, Vec::new())),
+            })
+            .await
+            .map_err(|err| DurableSubscribeError::Io(std::io::Error::other(err)))?
+            .map_err(DurableSubscribeError::Io)?
+        };
+
+        let (buffered, receiver) = self.subscribe(filter).await;
+        let mut backlog = catchup;
+        for envelope in buffered {
+            // Already delivered and recorded before this subscriber
+            // reconnected - the disk catch-up above is the source of
+            // truth for "since my last position", so a still-buffered
+            // copy of the same old message must not come back too.
+            if last_id.is_some_and(|last| envelope.id <= last) {
+                continue;
+            }
+            if !backlog.iter().any(|e| e.id == envelope.id) {
+                backlog.push(envelope);
+            }
+        }
+        backlog.sort_by_key(|e| e.id);
+        Ok((backlog, receiver))
+    }
+
+    /// Records `message_id` as `subscriber`'s new durably-tracked
+    /// position for `topic` (ADR-0046). Best-effort, like the persist
+    /// path itself (ADR-0045): a failure is logged, not surfaced - it
+    /// just means the next reconnect might replay a little more than
+    /// strictly necessary, never less. A no-op if no store is
+    /// configured (shouldn't happen in practice - `subscribe_durable`
+    /// already requires one - but this is never the caller's problem
+    /// to re-check).
+    pub async fn record_delivered(&self, subscriber: PeerId, topic: Topic, message_id: MessageId) {
+        let Some(store) = self.store.clone() else {
+            return;
+        };
+        let result = tokio::task::spawn_blocking(move || {
+            store.record_offset(subscriber, &topic, message_id)
+        })
+        .await;
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => tracing::error!(%err, "failed to record durable subscriber offset"),
+            Err(join_err) => tracing::error!(%join_err, "durable-offset task panicked"),
         }
     }
 
@@ -1509,6 +1659,8 @@ mod tests {
         recent: Vec<(Topic, Vec<Arc<Envelope>>)>,
         retained: Vec<(Topic, Arc<Envelope>)>,
         fail: bool,
+        // ADR-0046
+        offsets: Mutex<HashMap<(PeerId, Topic), MessageId>>,
     }
 
     impl MessageStore for FakeStore {
@@ -1530,6 +1682,51 @@ mod tests {
         }
         fn load_retained(&self) -> std::io::Result<Vec<(Topic, Arc<Envelope>)>> {
             Ok(self.retained.clone())
+        }
+        // ADR-0046: `appended` (already a growing log across every
+        // topic) doubles as the fake's "on-disk" history to scan.
+        fn messages_since(
+            &self,
+            topic: &Topic,
+            after: MessageId,
+        ) -> std::io::Result<Vec<Arc<Envelope>>> {
+            let mut matches: Vec<Arc<Envelope>> = self
+                .appended
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| {
+                    matches!(&e.kind, MessageKind::Publish { topic: t, .. } if t == topic)
+                        && e.id > after
+                })
+                .cloned()
+                .collect();
+            matches.sort_by_key(|e| e.id);
+            Ok(matches)
+        }
+        fn load_offset(
+            &self,
+            subscriber: PeerId,
+            topic: &Topic,
+        ) -> std::io::Result<Option<MessageId>> {
+            Ok(self
+                .offsets
+                .lock()
+                .unwrap()
+                .get(&(subscriber, topic.clone()))
+                .copied())
+        }
+        fn record_offset(
+            &self,
+            subscriber: PeerId,
+            topic: &Topic,
+            message_id: MessageId,
+        ) -> std::io::Result<()> {
+            self.offsets
+                .lock()
+                .unwrap()
+                .insert((subscriber, topic.clone()), message_id);
+            Ok(())
         }
     }
 
@@ -1606,6 +1803,109 @@ mod tests {
         assert!(
             store.appended.lock().unwrap().is_empty(),
             "rehydrate must not re-persist"
+        );
+    }
+
+    #[test]
+    fn has_store_reflects_whether_one_is_configured() {
+        assert!(!Broker::new().has_store());
+        assert!(Broker::with_store(Arc::new(FakeStore::default())).has_store());
+    }
+
+    #[tokio::test]
+    async fn subscribe_durable_rejects_a_wildcard_filter() {
+        let broker = Broker::with_store(Arc::new(FakeStore::default()));
+        let err = broker
+            .subscribe_durable(filter("weather.+"), PeerId::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DurableSubscribeError::WildcardFilter));
+    }
+
+    #[tokio::test]
+    async fn subscribe_durable_rejects_when_no_store_is_configured() {
+        let broker = Broker::new();
+        let topic = Topic::from_str("weather.updates").unwrap();
+        let err = broker
+            .subscribe_durable(topic.into(), PeerId::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DurableSubscribeError::NoStore));
+    }
+
+    #[tokio::test]
+    async fn a_first_time_durable_subscriber_gets_no_disk_catch_up() {
+        // No recorded offset for this (subscriber, topic) - behaves
+        // exactly like an ordinary subscribe, even though the store
+        // has history for the topic (from some *other* subscriber, or
+        // from before this one ever existed). See ADR-0046.
+        let topic = Topic::from_str("weather.updates").unwrap();
+        let store = Arc::new(FakeStore {
+            appended: Mutex::new(vec![publish_envelope(&topic, b"old news")]),
+            ..FakeStore::default()
+        });
+        let broker = Broker::with_store(store);
+
+        let (backlog, _rx) = broker
+            .subscribe_durable(topic.into(), PeerId::new())
+            .await
+            .unwrap();
+        assert!(backlog.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_returning_durable_subscriber_gets_everything_since_its_recorded_position() {
+        let topic = Topic::from_str("weather.updates").unwrap();
+        let subscriber = PeerId::new();
+        let before = publish_envelope(&topic, b"before");
+        let after_1 = publish_envelope(&topic, b"after 1");
+        let after_2 = publish_envelope(&topic, b"after 2");
+        let store = Arc::new(FakeStore {
+            appended: Mutex::new(vec![before.clone(), after_1.clone(), after_2.clone()]),
+            offsets: Mutex::new(HashMap::from([((subscriber, topic.clone()), before.id)])),
+            ..FakeStore::default()
+        });
+        let broker = Broker::with_store(store);
+
+        let (backlog, _rx) = broker
+            .subscribe_durable(topic.into(), subscriber)
+            .await
+            .unwrap();
+        let ids: Vec<_> = backlog.iter().map(|e| e.id).collect();
+        assert_eq!(ids, vec![after_1.id, after_2.id]);
+    }
+
+    #[tokio::test]
+    async fn record_delivered_then_resubscribing_durably_resumes_from_there() {
+        // The full round trip: publish, durably subscribe, record what
+        // was delivered, reconnect (a fresh subscribe_durable call) -
+        // only what's genuinely new comes back.
+        let store = Arc::new(FakeStore::default());
+        let broker = Broker::with_store(store);
+        let topic = Topic::from_str("weather.updates").unwrap();
+        let subscriber = PeerId::new();
+
+        let first = publish_envelope(&topic, b"sunny");
+        broker.publish(&topic, first.clone()).await;
+        let (backlog, _rx) = broker
+            .subscribe_durable(topic.clone().into(), subscriber)
+            .await
+            .unwrap();
+        assert_eq!(backlog, vec![first.clone()]);
+        broker
+            .record_delivered(subscriber, topic.clone(), first.id)
+            .await;
+
+        let second = publish_envelope(&topic, b"cloudy");
+        broker.publish(&topic, second.clone()).await;
+        let (backlog, _rx) = broker
+            .subscribe_durable(topic.into(), subscriber)
+            .await
+            .unwrap();
+        assert_eq!(
+            backlog,
+            vec![second],
+            "only the message published after the recorded position comes back"
         );
     }
 
