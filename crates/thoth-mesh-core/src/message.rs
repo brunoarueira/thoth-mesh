@@ -103,7 +103,7 @@ pub struct MetricsSummary {
     /// survive a restart. Always 0 with no `--data-dir` configured.
     pub persist_failures_total: u64,
     /// Messages deleted from the on-disk store for having aged past
-    /// `--message-ttl-secs` (ADR-0047). Always 0 with no TTL
+    /// `--persisted-message-ttl-secs` (ADR-0047). Always 0 with no TTL
     /// configured.
     pub expired_messages_total: u64,
     /// Messages republished to a configured `--dead-letter-topic`

@@ -603,7 +603,7 @@ guarantee:
   (ADR-0025) - a retained topic with no live subscriber, on a node
   churning through more than 4096 distinct topics.
 - **An unconsumed message is dropped by default - dead-lettering is
-  opt-in.** A message aged past `--message-ttl-secs` (only meaningful
+  opt-in.** A message aged past `--persisted-message-ttl-secs` (only meaningful
   alongside `--data-dir`), or an `ack: true` delivery that exhausts
   every redelivery attempt (ADR-0041), is simply gone unless the node
   is run with `--dead-letter-topic` - in which case it's republished,

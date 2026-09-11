@@ -47,11 +47,12 @@ pub struct Metrics {
     /// after exhausting every redelivery attempt without ever
     /// receiving an ack (ADR-0041).
     delivery_ack_timeouts: Arc<AtomicU64>,
-    /// Messages deleted from the on-disk store by the `--message-ttl-secs`
-    /// sweep for having aged past it (ADR-0047). Zero unless a TTL is
-    /// configured. Counted regardless of whether a dead-letter topic
-    /// is also configured - see `dead_lettered_messages` for how many
-    /// of these were actually republished somewhere inspectable.
+    /// Messages deleted from the on-disk store by the
+    /// `--persisted-message-ttl-secs` sweep for having aged past it
+    /// (ADR-0047). Zero unless a TTL is configured. Counted regardless
+    /// of whether a dead-letter topic is also configured - see
+    /// `dead_lettered_messages` for how many of these were actually
+    /// republished somewhere inspectable.
     expired_messages: Arc<AtomicU64>,
     /// Messages republished to a configured `--dead-letter-topic`
     /// (ADR-0047) - from either TTL expiry above or an `ack: true`
@@ -121,8 +122,8 @@ impl Metrics {
     }
 
     /// Records that `count` messages were deleted from the on-disk
-    /// store by the TTL sweep for having aged past `--message-ttl-secs`
-    /// (ADR-0047).
+    /// store by the TTL sweep for having aged past
+    /// `--persisted-message-ttl-secs` (ADR-0047).
     pub fn record_expired_messages(&self, count: u64) {
         self.expired_messages.fetch_add(count, Ordering::Relaxed);
     }

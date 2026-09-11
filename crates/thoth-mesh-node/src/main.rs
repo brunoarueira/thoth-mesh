@@ -92,24 +92,27 @@ struct Cli {
     #[arg(long = "metrics-token-file", requires = "metrics_addr")]
     metrics_token_file: Option<PathBuf>,
 
-    /// How long (in seconds) a persisted message survives before the
-    /// background sweep deletes it. Requires --data-dir - there's no
-    /// disk log to expire anything from otherwise. With none given, no
+    /// How long (in seconds) a message survives in the on-disk store
+    /// (--data-dir) before the background sweep deletes it - not a
+    /// dead-letter setting by itself, and not related to live/in-
+    /// flight delivery at all; see --dead-letter-topic if that's what
+    /// you're looking for. Requires --data-dir - there's no disk log
+    /// to expire anything from otherwise. With none given, no
     /// age-based expiry runs; the on-disk log is only ever pruned by
     /// count, unchanged from before this flag existed. See ADR-0047
     /// and docs/OPERATIONS.md.
-    #[arg(long = "message-ttl-secs", requires = "data_dir")]
-    message_ttl_secs: Option<u64>,
+    #[arg(long = "persisted-message-ttl-secs", requires = "data_dir")]
+    persisted_message_ttl_secs: Option<u64>,
 
     /// A literal topic (not a wildcard) to republish an otherwise-
     /// unconsumed message to, as `<this>.<original topic>`, instead of
-    /// just dropping it - a message aged past --message-ttl-secs, or
-    /// an `ack: true` delivery that exhausts every redelivery attempt
-    /// (ADR-0041). Standalone - works with no --data-dir/
-    /// --message-ttl-secs at all for the latter source. With none
-    /// given, both sources behave exactly as before this flag existed:
-    /// silently dropped, only counted. See ADR-0047 and
-    /// docs/OPERATIONS.md.
+    /// just dropping it - a message aged past
+    /// --persisted-message-ttl-secs, or an `ack: true` delivery that
+    /// exhausts every redelivery attempt (ADR-0041). Standalone -
+    /// works with no --data-dir/--persisted-message-ttl-secs at all
+    /// for the latter source. With none given, both sources behave
+    /// exactly as before this flag existed: silently dropped, only
+    /// counted. See ADR-0047 and docs/OPERATIONS.md.
     #[arg(long = "dead-letter-topic")]
     dead_letter_topic: Option<String>,
 }
@@ -191,7 +194,9 @@ async fn main() -> std::io::Result<()> {
         topic_acl,
         peer_topic_acl,
         data_dir: cli.data_dir,
-        message_ttl: cli.message_ttl_secs.map(std::time::Duration::from_secs),
+        persisted_message_ttl: cli
+            .persisted_message_ttl_secs
+            .map(std::time::Duration::from_secs),
         dead_letter_topic,
     };
 

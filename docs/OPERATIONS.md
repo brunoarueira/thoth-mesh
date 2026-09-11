@@ -387,7 +387,7 @@ ADR-0047):
 | `thothmesh_redelivered_messages_total` | counter | Deliveries resent because an `ack: true` subscription's acknowledgement didn't arrive within the redelivery timeout (see [ADR-0041](adr/0041-at-least-once-delivery-with-ack-based-redelivery.md)). Zero on a node with no `ack: true` subscribers, or whose subscribers ack promptly. |
 | `thothmesh_delivery_ack_timeouts_total` | counter | Deliveries an `ack: true` subscription's forwarder gave up on after exhausting every redelivery attempt with no ack - counted, and republished to [`--dead-letter-topic`](#message-ttl-and-dead-lettering) if one is configured, otherwise just dropped. Nonzero here means a subscriber is missing messages it asked to be guaranteed. |
 | `thothmesh_persist_failures_total` | counter | Publishes the on-disk store failed to durably record (see [Persistence](#persistence)). Delivery still happened, but those messages won't survive a restart. Always 0 without `--data-dir`. Nonzero means the disk is full or failing. |
-| `thothmesh_expired_messages_total` | counter | Messages deleted from the on-disk store for having aged past [`--message-ttl-secs`](#message-ttl-and-dead-lettering). Always 0 without a TTL configured. |
+| `thothmesh_expired_messages_total` | counter | Messages deleted from the on-disk store for having aged past [`--persisted-message-ttl-secs`](#message-ttl-and-dead-lettering). Always 0 without a TTL configured. |
 | `thothmesh_dead_lettered_messages_total` | counter | Messages republished to [`--dead-letter-topic`](#message-ttl-and-dead-lettering) - from TTL expiry above or an exhausted `ack: true` redelivery alike. Always 0 without a dead-letter topic configured. |
 
 Point a Prometheus `scrape_configs` target at `--metrics-addr` the
@@ -657,7 +657,7 @@ would have before.
   and are never pruned. The total on disk is that cap times the
   number of distinct topics the node has ever seen — a node cycling
   through unboundedly many topics still grows unboundedly by this cap
-  alone; add [`--message-ttl-secs`](#message-ttl-and-dead-lettering)
+  alone; add [`--persisted-message-ttl-secs`](#message-ttl-and-dead-lettering)
   for age-based expiry on top of it.
 - **Failure is not fatal.** If a write to the store fails (disk full,
   I/O error), the node logs it, bumps
@@ -721,7 +721,7 @@ protocol version.
 Two independent, optional flags, both introduced by
 [ADR-0047](adr/0047-message-ttl-and-dead-lettering.md):
 
-- **`--message-ttl-secs <N>`** — how long (in seconds) a persisted
+- **`--persisted-message-ttl-secs <N>`** — how long (in seconds) a persisted
   message survives before a background sweep deletes it. Requires
   `--data-dir` — there's no on-disk log to expire anything from
   otherwise. With none given, the log is only ever pruned by count
@@ -732,16 +732,16 @@ Two independent, optional flags, both introduced by
   TTL is still checked every minute, not proportionally less often).
 
   ```sh
-  thoth-mesh-node --data-dir /var/lib/thoth-mesh --message-ttl-secs 604800  # 7 days
+  thoth-mesh-node --data-dir /var/lib/thoth-mesh --persisted-message-ttl-secs 604800  # 7 days
   ```
 
 - **`--dead-letter-topic <topic>`** — a literal topic (not a
   wildcard) to republish an otherwise-unconsumed message to, instead
   of just dropping it. Feeds from two independent sources: a message
-  aged past `--message-ttl-secs` above, and an `ack: true` delivery
+  aged past `--persisted-message-ttl-secs` above, and an `ack: true` delivery
   that exhausts every redelivery attempt (ADR-0041,
   `thothmesh_delivery_ack_timeouts_total`) — the latter works
-  standalone, with no `--data-dir`/`--message-ttl-secs` at all. With
+  standalone, with no `--data-dir`/`--persisted-message-ttl-secs` at all. With
   none given, both sources behave exactly as before this flag
   existed: silently dropped, only counted. A dead-lettered message is
   republished as a fresh `Publish` (its own new `id`, this node's own
@@ -755,12 +755,12 @@ Two independent, optional flags, both introduced by
   (ADR-0011) if that `id` was ever seen before.
 
   ```sh
-  thoth-mesh-node --data-dir /var/lib/thoth-mesh --message-ttl-secs 604800 \
+  thoth-mesh-node --data-dir /var/lib/thoth-mesh --persisted-message-ttl-secs 604800 \
       --dead-letter-topic dead-letter
   ```
 
 `thothmesh_expired_messages_total` counts messages deleted by the TTL
-sweep (zero without `--message-ttl-secs`); `thothmesh_dead_lettered_messages_total`
+sweep (zero without `--persisted-message-ttl-secs`); `thothmesh_dead_lettered_messages_total`
 counts messages actually republished, from either source (zero
 without `--dead-letter-topic`). Comparing the two shows how much of
 what expired was actually captured somewhere inspectable versus lost

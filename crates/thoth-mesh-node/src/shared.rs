@@ -76,8 +76,9 @@ pub struct Shared {
     /// forwarder that exhausts its redelivery attempts (ADR-0041)
     /// republishes the original message to
     /// `<dead_letter_topic>.<original topic>` instead of just dropping
-    /// it. Independent of `--message-ttl-secs`/`--data-dir` - useful
-    /// for ack-giveup dead-lettering on a fully in-memory node too.
+    /// it. Independent of `--persisted-message-ttl-secs`/`--data-dir` -
+    /// useful for ack-giveup dead-lettering on a fully in-memory node
+    /// too.
     /// `None` (the default) means unchanged behavior: a giveup is
     /// simply dropped and counted, as before this ADR.
     pub dead_letter_topic: Option<Topic>,

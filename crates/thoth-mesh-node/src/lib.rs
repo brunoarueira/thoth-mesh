@@ -81,20 +81,21 @@ pub struct NodeOptions {
     /// exactly as before that ADR: nothing is written, nothing
     /// survives a restart.
     pub data_dir: Option<PathBuf>,
-    /// How long a persisted message survives before the background
-    /// sweep deletes it, `--message-ttl-secs` - see ADR-0047. `None`
-    /// (the default) means no age-based expiry: the on-disk log is
-    /// only ever pruned by count (ADR-0045), unchanged from before
-    /// this ADR. Only meaningful alongside `data_dir` - there's
-    /// nothing to expire without one.
-    pub message_ttl: Option<Duration>,
+    /// How long a message survives in the on-disk store before the
+    /// background sweep deletes it, `--persisted-message-ttl-secs` -
+    /// see ADR-0047. `None` (the default) means no age-based expiry:
+    /// the on-disk log is only ever pruned by count (ADR-0045),
+    /// unchanged from before this ADR. Only meaningful alongside
+    /// `data_dir` - there's nothing to expire without one.
+    pub persisted_message_ttl: Option<Duration>,
     /// Where an otherwise-unconsumed message is republished instead of
     /// just dropped, `--dead-letter-topic` - see ADR-0047. Feeds from
-    /// two independent sources: a message aged past `message_ttl`, and
-    /// an `ack: true` delivery that exhausts every redelivery attempt
-    /// (ADR-0041) - the latter works with no `data_dir`/`message_ttl`
-    /// at all. `None` (the default) means both sources behave exactly
-    /// as before this ADR: silently dropped, only counted.
+    /// two independent sources: a message aged past
+    /// `persisted_message_ttl`, and an `ack: true` delivery that
+    /// exhausts every redelivery attempt (ADR-0041) - the latter works
+    /// with no `data_dir`/`persisted_message_ttl` at all. `None` (the
+    /// default) means both sources behave exactly as before this ADR:
+    /// silently dropped, only counted.
     pub dead_letter_topic: Option<Topic>,
 }
 
@@ -151,21 +152,22 @@ async fn rehydrate_from_store(
 }
 
 /// Spawns the TTL sweep background task (ADR-0047) if both `store`
-/// (`--data-dir`) and `message_ttl` (`--message-ttl-secs`) are
-/// configured - silently does nothing otherwise, the same "TTL is
-/// meaningless without a disk log to expire from" posture
-/// `--message-ttl-secs` requiring `--data-dir` already enforces at the
-/// CLI level (`thoth-mesh-node::main`), just re-checked here since a
-/// direct `NodeOptions` caller (a test, or an embedder) isn't bound by
+/// (`--data-dir`) and `persisted_message_ttl`
+/// (`--persisted-message-ttl-secs`) are configured - silently does
+/// nothing otherwise, the same "TTL is meaningless without a disk log
+/// to expire from" posture `--persisted-message-ttl-secs` requiring
+/// `--data-dir` already enforces at the CLI level
+/// (`thoth-mesh-node::main`), just re-checked here since a direct
+/// `NodeOptions` caller (a test, or an embedder) isn't bound by
 /// `clap`'s `requires`.
 fn maybe_spawn_ttl_sweeper(
     store: Option<Arc<dyn MessageStore>>,
     broker: &Arc<Broker>,
     metrics: crate::metrics::Metrics,
-    message_ttl: Option<Duration>,
+    persisted_message_ttl: Option<Duration>,
     dead_letter: dead_letter::DeadLetterConfig,
 ) {
-    let (Some(store), Some(ttl)) = (store, message_ttl) else {
+    let (Some(store), Some(ttl)) = (store, persisted_message_ttl) else {
         return;
     };
     ttl::spawn(store, Arc::clone(broker), ttl, dead_letter, metrics);
@@ -231,7 +233,7 @@ pub async fn run_with_tls(
         store,
         &shared.broker,
         shared.metrics.clone(),
-        options.message_ttl,
+        options.persisted_message_ttl,
         dead_letter::DeadLetterConfig {
             node_id: shared.node_id,
             topic: options.dead_letter_topic,
@@ -314,7 +316,7 @@ pub async fn serve_with_tls(
         store,
         &shared.broker,
         shared.metrics.clone(),
-        options.message_ttl,
+        options.persisted_message_ttl,
         dead_letter::DeadLetterConfig {
             node_id: shared.node_id,
             topic: options.dead_letter_topic,
@@ -403,7 +405,7 @@ pub fn spawn_with_tls(
         store,
         &shared.broker,
         shared.metrics.clone(),
-        options.message_ttl,
+        options.persisted_message_ttl,
         dead_letter::DeadLetterConfig {
             node_id: shared.node_id,
             topic: options.dead_letter_topic,

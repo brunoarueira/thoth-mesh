@@ -1,5 +1,5 @@
 //! The periodic background sweep that expires on-disk messages older
-//! than `--message-ttl-secs` (ADR-0047), dead-lettering each one if
+//! than `--persisted-message-ttl-secs` (ADR-0047), dead-lettering each one if
 //! `--dead-letter-topic` is also configured.
 
 use std::sync::Arc;

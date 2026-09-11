@@ -63,7 +63,7 @@ sources produced a given increment; `thothmesh_expired_messages_total`
 already existed) separately show *why* the underlying message was
 given up on, whether or not it was also dead-lettered.
 
-### TTL: a single global `--message-ttl-secs`, not per-topic or per-publish
+### TTL: a single global `--persisted-message-ttl-secs`, not per-topic or per-publish
 
 The issue's two named options were per-topic and per-publish; a third,
 simpler one - one node-wide value - is what this ADR picks instead.
@@ -74,7 +74,7 @@ change every publisher has to know to set, and per-message bookkeeping
 the on-disk sweep query doesn't otherwise need. Neither is justified
 by evidence of actual need yet - the issue itself only asks for *a*
 way to expire content, not a granular one. A single
-`--message-ttl-secs <N>` (seconds; unset by default, meaning no
+`--persisted-message-ttl-secs <N>` (seconds; unset by default, meaning no
 age-based expiry - only the existing count cap applies, unchanged from
 before this ADR) is enough to solve the stated problem ("growing
 forever") with no new wire surface at all. Requires `--data-dir`
@@ -97,7 +97,7 @@ on an append), age has nothing to do with appends; a row can go stale
 with zero further publishes on its topic. So the TTL sweep is instead
 a periodic background task (`ttl.rs`, a fixed 60s interval, not
 currently configurable), started only when both `--data-dir` and
-`--message-ttl-secs` are set. `retained` rows are untouched by
+`--persisted-message-ttl-secs` are set. `retained` rows are untouched by
 `expire_before` - a retained value's entire point is staying current
 indefinitely (ADR-0043), not expiring by age; TTL only ever prunes
 `messages`.
@@ -114,7 +114,7 @@ entry already holds the `Arc<Envelope>` right up until it's dropped);
 
 ## Consequences
 
-- New CLI flags: `--message-ttl-secs <N>` (requires `--data-dir`) and
+- New CLI flags: `--persisted-message-ttl-secs <N>` (requires `--data-dir`) and
   `--dead-letter-topic <topic>` (standalone - useful for ack-giveup
   dead-lettering even with no `--data-dir`/TTL at all).
 - `MessageStore` gains `expire_before`. `SqliteStore` implements it as
