@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use thoth_mesh::{Interest, Membership, PeerDirectory};
 use thoth_mesh_broker::Broker;
-use thoth_mesh_core::PeerId;
+use thoth_mesh_core::{PeerId, Topic};
 use thoth_mesh_tls::{TlsAcceptor, TlsConnector};
 use tokio::sync::{Semaphore, mpsc};
 
@@ -72,6 +72,16 @@ pub struct Shared {
     /// independent of `topic_acl`, which never applies to one. See
     /// ADR-0020.
     pub peer_topic_acl: Option<Arc<TopicAcl>>,
+    /// `--dead-letter-topic` (ADR-0047): if set, an `ack: true`
+    /// forwarder that exhausts its redelivery attempts (ADR-0041)
+    /// republishes the original message to
+    /// `<dead_letter_topic>.<original topic>` instead of just dropping
+    /// it. Independent of `--persisted-message-ttl-secs`/`--data-dir` -
+    /// useful for ack-giveup dead-lettering on a fully in-memory node
+    /// too.
+    /// `None` (the default) means unchanged behavior: a giveup is
+    /// simply dropped and counted, as before this ADR.
+    pub dead_letter_topic: Option<Topic>,
 }
 
 // Hand-rolled rather than derived: `TlsAcceptor`/`TlsConnector` don't
@@ -96,6 +106,7 @@ impl std::fmt::Debug for Shared {
             )
             .field("topic_acl", &self.topic_acl.is_some())
             .field("peer_topic_acl", &self.peer_topic_acl.is_some())
+            .field("dead_letter_topic", &self.dead_letter_topic)
             .finish_non_exhaustive()
     }
 }
@@ -139,6 +150,7 @@ impl Shared {
             allowed_peers: None,
             topic_acl: None,
             peer_topic_acl: None,
+            dead_letter_topic: None,
         };
         (shared, discovered_rx)
     }

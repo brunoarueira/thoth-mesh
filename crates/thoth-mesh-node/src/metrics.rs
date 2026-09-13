@@ -47,6 +47,18 @@ pub struct Metrics {
     /// after exhausting every redelivery attempt without ever
     /// receiving an ack (ADR-0041).
     delivery_ack_timeouts: Arc<AtomicU64>,
+    /// Messages deleted from the on-disk store by the
+    /// `--persisted-message-ttl-secs` sweep for having aged past it
+    /// (ADR-0047). Zero unless a TTL is configured. Counted regardless
+    /// of whether a dead-letter topic is also configured - see
+    /// `dead_lettered_messages` for how many of these were actually
+    /// republished somewhere inspectable.
+    expired_messages: Arc<AtomicU64>,
+    /// Messages republished to a configured `--dead-letter-topic`
+    /// (ADR-0047) - from either TTL expiry above or an `ack: true`
+    /// forwarder exhausting its redelivery attempts (ADR-0041). Zero
+    /// unless `--dead-letter-topic` is configured.
+    dead_lettered_messages: Arc<AtomicU64>,
 }
 
 impl Metrics {
@@ -109,6 +121,20 @@ impl Metrics {
             .fetch_add(count, Ordering::Relaxed);
     }
 
+    /// Records that `count` messages were deleted from the on-disk
+    /// store by the TTL sweep for having aged past
+    /// `--persisted-message-ttl-secs` (ADR-0047).
+    pub fn record_expired_messages(&self, count: u64) {
+        self.expired_messages.fetch_add(count, Ordering::Relaxed);
+    }
+
+    /// Records that `count` messages were republished to a configured
+    /// `--dead-letter-topic` (ADR-0047).
+    pub fn record_dead_lettered_messages(&self, count: u64) {
+        self.dead_lettered_messages
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
     fn forwarder_lag_total(&self) -> u64 {
         self.forwarder_lag.load(Ordering::Relaxed)
     }
@@ -140,6 +166,14 @@ impl Metrics {
     fn delivery_ack_timeouts_total(&self) -> u64 {
         self.delivery_ack_timeouts.load(Ordering::Relaxed)
     }
+
+    fn expired_messages_total(&self) -> u64 {
+        self.expired_messages.load(Ordering::Relaxed)
+    }
+
+    fn dead_lettered_messages_total(&self) -> u64 {
+        self.dead_lettered_messages.load(Ordering::Relaxed)
+    }
 }
 
 /// A snapshot of every metric this node tracks, as typed fields - the
@@ -170,6 +204,8 @@ pub fn summary(
         redelivered_messages_total: metrics.redelivered_messages_total(),
         delivery_ack_timeouts_total: metrics.delivery_ack_timeouts_total(),
         persist_failures_total: broker.persist_failures(),
+        expired_messages_total: metrics.expired_messages_total(),
+        dead_lettered_messages_total: metrics.dead_lettered_messages_total(),
     }
 }
 
@@ -212,7 +248,11 @@ pub fn render_prometheus(
          # TYPE thothmesh_delivery_ack_timeouts_total counter\n\
          thothmesh_delivery_ack_timeouts_total {}\n\
          # TYPE thothmesh_persist_failures_total counter\n\
-         thothmesh_persist_failures_total {}\n",
+         thothmesh_persist_failures_total {}\n\
+         # TYPE thothmesh_expired_messages_total counter\n\
+         thothmesh_expired_messages_total {}\n\
+         # TYPE thothmesh_dead_lettered_messages_total counter\n\
+         thothmesh_dead_lettered_messages_total {}\n",
         s.peers_connected,
         s.messages_published,
         s.forwarder_lag_total,
@@ -228,6 +268,8 @@ pub fn render_prometheus(
         s.redelivered_messages_total,
         s.delivery_ack_timeouts_total,
         s.persist_failures_total,
+        s.expired_messages_total,
+        s.dead_lettered_messages_total,
     )
 }
 
@@ -303,6 +345,22 @@ mod tests {
     }
 
     #[test]
+    fn record_expired_messages_accumulates() {
+        let metrics = Metrics::new();
+        metrics.record_expired_messages(4);
+        metrics.record_expired_messages(6);
+        assert_eq!(metrics.expired_messages_total(), 10);
+    }
+
+    #[test]
+    fn record_dead_lettered_messages_accumulates() {
+        let metrics = Metrics::new();
+        metrics.record_dead_lettered_messages(1);
+        metrics.record_dead_lettered_messages(2);
+        assert_eq!(metrics.dead_lettered_messages_total(), 3);
+    }
+
+    #[test]
     fn record_delivery_ack_timeouts_accumulates() {
         let metrics = Metrics::new();
         metrics.record_delivery_ack_timeouts(1);
@@ -311,7 +369,7 @@ mod tests {
     }
 
     #[test]
-    fn render_prometheus_includes_all_fifteen_metrics() {
+    fn render_prometheus_includes_all_seventeen_metrics() {
         let membership = Membership::new();
         membership.mark_connected(thoth_mesh_core::PeerId::new(), None);
         let broker = Broker::new();
@@ -325,6 +383,8 @@ mod tests {
         metrics.record_lag_recovered(5);
         metrics.record_redelivered_messages(3);
         metrics.record_delivery_ack_timeouts(1);
+        metrics.record_expired_messages(9);
+        metrics.record_dead_lettered_messages(4);
 
         let rendered = render_prometheus(&membership, &broker, &discover, &metrics);
 
@@ -349,6 +409,8 @@ mod tests {
         assert!(rendered.contains("thothmesh_delivery_ack_timeouts_total 1"));
         // A broker with no configured store never fails to persist.
         assert!(rendered.contains("thothmesh_persist_failures_total 0"));
+        assert!(rendered.contains("thothmesh_expired_messages_total 9"));
+        assert!(rendered.contains("thothmesh_dead_lettered_messages_total 4"));
     }
 
     #[test]
@@ -380,6 +442,8 @@ mod tests {
         assert_eq!(s.redelivered_messages_total, 0);
         assert_eq!(s.delivery_ack_timeouts_total, 0);
         assert_eq!(s.persist_failures_total, 0);
+        assert_eq!(s.expired_messages_total, 0);
+        assert_eq!(s.dead_lettered_messages_total, 0);
 
         let rendered = render_prometheus(&membership, &broker, &discover, &metrics);
         assert!(rendered.contains("thothmesh_peers_connected 1"));

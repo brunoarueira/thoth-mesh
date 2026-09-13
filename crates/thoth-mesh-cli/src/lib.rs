@@ -582,6 +582,11 @@ fn print_status(reply: &StatusReply) {
         ("redelivered_messages_total", m.redelivered_messages_total),
         ("delivery_ack_timeouts_total", m.delivery_ack_timeouts_total),
         ("persist_failures_total", m.persist_failures_total),
+        ("expired_messages_total", m.expired_messages_total),
+        (
+            "dead_lettered_messages_total",
+            m.dead_lettered_messages_total,
+        ),
     ] {
         println!("  {name:<32} {value}");
     }

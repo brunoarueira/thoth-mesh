@@ -102,6 +102,15 @@ pub trait MessageStore: std::fmt::Debug + Send + Sync + 'static {
         topic: &Topic,
         message_id: MessageId,
     ) -> std::io::Result<()>;
+
+    /// Deletes every persisted message older than `cutoff_ts` (a Unix
+    /// timestamp in milliseconds, the same unit `append` records
+    /// alongside each row) and returns what was removed, across every
+    /// topic - the caller's one chance to dead-letter them before
+    /// they're gone for good (ADR-0047). `retained` rows are never
+    /// touched: a retained value's whole point is staying current
+    /// indefinitely (ADR-0043), not expiring by age.
+    fn expire_before(&self, cutoff_ts: i64) -> std::io::Result<Vec<Arc<Envelope>>>;
 }
 
 /// Why [`Broker::subscribe_durable`] refused a request, before ever
@@ -1661,6 +1670,10 @@ mod tests {
         fail: bool,
         // ADR-0046
         offsets: Mutex<HashMap<(PeerId, Topic), MessageId>>,
+        // ADR-0047: `append` doesn't otherwise track a persisted-at
+        // time, so `expire_before` has nothing to compare against
+        // without this.
+        timestamps: Mutex<HashMap<MessageId, i64>>,
     }
 
     impl MessageStore for FakeStore {
@@ -1668,10 +1681,15 @@ mod tests {
             if self.fail {
                 return Err(std::io::Error::other("boom"));
             }
-            self.appended
+            let mut appended = self.appended.lock().unwrap();
+            // Insertion order stands in for a persisted-at timestamp -
+            // monotonically increasing, same as real wall-clock time
+            // would be for a sequence of appends.
+            self.timestamps
                 .lock()
                 .unwrap()
-                .push(Arc::new(envelope.clone()));
+                .insert(envelope.id, appended.len() as i64);
+            appended.push(Arc::new(envelope.clone()));
             Ok(())
         }
         fn load_recent(
@@ -1727,6 +1745,15 @@ mod tests {
                 .unwrap()
                 .insert((subscriber, topic.clone()), message_id);
             Ok(())
+        }
+        fn expire_before(&self, cutoff_ts: i64) -> std::io::Result<Vec<Arc<Envelope>>> {
+            let timestamps = self.timestamps.lock().unwrap();
+            let mut appended = self.appended.lock().unwrap();
+            let (expired, kept): (Vec<_>, Vec<_>) = appended
+                .drain(..)
+                .partition(|e| timestamps.get(&e.id).is_some_and(|ts| *ts < cutoff_ts));
+            *appended = kept;
+            Ok(expired)
         }
     }
 

@@ -29,8 +29,10 @@ messages), and
 [ADR-0044](docs/adr/0044-content-type-hint-on-publish.md) (content-type
 hint on `Publish`), and
 [ADR-0046](docs/adr/0046-durable-subscriptions.md) (durable
-subscriptions via per-subscriber offset tracking). For diagrams of
-several of these flows, see [docs/FLOWS.md](docs/FLOWS.md).
+subscriptions via per-subscriber offset tracking), and
+[ADR-0047](docs/adr/0047-message-ttl-and-dead-lettering.md) (message
+TTL and dead-lettering). For diagrams of several of these flows, see
+[docs/FLOWS.md](docs/FLOWS.md).
 
 **Status:** version 1, and explicitly unstable — see ADR-0014. Nothing
 here should be assumed to hold across a breaking change; check
@@ -271,11 +273,12 @@ watching several filters over one connection (ADR-0033) can request it
 for only some of them - and applies only to the direct connection
 between a node and its subscriber: a `Subscribe` a peer link sends to
 propagate interest onward (ADR-0011) always carries `ack: false`,
-regardless of what any client subscription behind it asked for. There
-is no dead-letter destination once redelivery attempts are exhausted -
-the message is simply dropped, and counted (see
-`thothmesh_delivery_ack_timeouts_total` in
-[OPERATIONS.md](docs/OPERATIONS.md)).
+regardless of what any client subscription behind it asked for. Once
+redelivery attempts are exhausted, the message is dropped and counted
+(`thothmesh_delivery_ack_timeouts_total`) - and, if the node is run
+with `--dead-letter-topic`, also republished there instead of just
+vanishing (see [ADR-0047](docs/adr/0047-message-ttl-and-dead-lettering.md)
+and [OPERATIONS.md](docs/OPERATIONS.md)).
 
 Immediately after the `Ack`, this node also delivers - as ordinary
 `Publish` messages - whatever it currently holds in a matching replay
@@ -599,3 +602,13 @@ guarantee:
   to the same topic-map eviction the replay buffer is subject to
   (ADR-0025) - a retained topic with no live subscriber, on a node
   churning through more than 4096 distinct topics.
+- **An unconsumed message is dropped by default - dead-lettering is
+  opt-in.** A message aged past `--persisted-message-ttl-secs` (only meaningful
+  alongside `--data-dir`), or an `ack: true` delivery that exhausts
+  every redelivery attempt (ADR-0041), is simply gone unless the node
+  is run with `--dead-letter-topic` - in which case it's republished,
+  as an ordinary `Publish` with a fresh `id`, to
+  `<dead-letter-topic>.<original topic>` (see
+  [ADR-0047](docs/adr/0047-message-ttl-and-dead-lettering.md)). No
+  wire-protocol change either way - a dead-lettered message is
+  indistinguishable from any other `Publish`.
