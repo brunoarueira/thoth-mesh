@@ -186,13 +186,25 @@ and [`PROTOCOL.md`](../PROTOCOL.md#delivery-semantics).
 ordinary fan-out: run several instances with the same `--group` name
 against the same topic, and each published message goes to exactly
 one of them, round-robin - a quick way to load-balance work across a
-pool of CLI-driven workers without writing one. Combining `--group`
-with `--ack` is refused by the node - the two aren't supported
-together yet (see [ADR-0042](adr/0042-consumer-groups.md)). A group
-member gets no catch-up on messages published before it joined, and
-no lag recovery if it falls behind - a materially weaker guarantee
-than ordinary fan-out subscribing, worth knowing before relying on it
-for anything that can't tolerate a missed message.
+pool of CLI-driven workers without writing one. A group member gets no
+catch-up on messages published before it joined, and no lag recovery
+if it falls behind - a materially weaker guarantee than ordinary
+fan-out subscribing, worth knowing before relying on it for anything
+that can't tolerate a missed message (see
+[ADR-0042](adr/0042-consumer-groups.md)).
+
+Adding `--ack` turns that into real work-queue semantics instead
+([ADR-0048](adr/0048-work-queue-redelivery-for-consumer-groups.md);
+refused outright before this ADR): a delivery is provisional until
+*some* live member of the group acks it - not necessarily the one it
+was originally sent to - and reclaimed by the group's ordinary
+round-robin if that doesn't happen within the redelivery timeout, up
+to `DEFAULT_MAX_REDELIVERY_ATTEMPTS` times before it's given up on
+(counted, and dead-lettered if [`--dead-letter-topic`](#message-ttl-and-dead-lettering)
+is configured, exactly like an ordinary `ack: true` giveup). This is
+what actually makes a dying-mid-message worker's work resumable by a
+different one - plain `--group` alone never does, it just skips
+whatever the dead worker had.
 
 `publish --retain` also stores the payload as the topic's
 last-value message: any subscriber that connects afterward is handed
@@ -384,8 +396,8 @@ ADR-0047):
 | `thothmesh_pattern_evictions_total` | counter | Same as `topic_evictions_total`, for wildcard pattern subscriptions - tracked separately since they're two independent caps. |
 | `thothmesh_membership_evictions_total` | counter | Disconnected peers this node stopped remembering an address for, once over the cap (see [Bounded memory footprint](#bounded-memory-footprint)). A currently-*connected* peer is never counted here. |
 | `thothmesh_peer_directory_evictions_total` | counter | Peers this node stops remembering as dialable, once over the cap - distinct from `membership_evictions_total`: this is every peer ever learned about (gossip or handshake), not just ones this node itself connected to. |
-| `thothmesh_redelivered_messages_total` | counter | Deliveries resent because an `ack: true` subscription's acknowledgement didn't arrive within the redelivery timeout (see [ADR-0041](adr/0041-at-least-once-delivery-with-ack-based-redelivery.md)). Zero on a node with no `ack: true` subscribers, or whose subscribers ack promptly. |
-| `thothmesh_delivery_ack_timeouts_total` | counter | Deliveries an `ack: true` subscription's forwarder gave up on after exhausting every redelivery attempt with no ack - counted, and republished to [`--dead-letter-topic`](#message-ttl-and-dead-lettering) if one is configured, otherwise just dropped. Nonzero here means a subscriber is missing messages it asked to be guaranteed. |
+| `thothmesh_redelivered_messages_total` | counter | Deliveries resent because an `ack: true` subscription's acknowledgement didn't arrive within the redelivery timeout (see [ADR-0041](adr/0041-at-least-once-delivery-with-ack-based-redelivery.md)) - including a work-queue `--group --ack` delivery reclaimed by another member ([ADR-0048](adr/0048-work-queue-redelivery-for-consumer-groups.md)). Zero on a node with no `ack: true` subscribers, or whose subscribers ack promptly. |
+| `thothmesh_delivery_ack_timeouts_total` | counter | Deliveries given up on after exhausting every redelivery attempt with no ack - an ordinary `ack: true` subscription's or a work-queue group's alike (ADR-0048) - counted, and republished to [`--dead-letter-topic`](#message-ttl-and-dead-lettering) if one is configured, otherwise just dropped. Nonzero here means a subscriber (or every current group member) is missing messages it asked to be guaranteed. |
 | `thothmesh_persist_failures_total` | counter | Publishes the on-disk store failed to durably record (see [Persistence](#persistence)). Delivery still happened, but those messages won't survive a restart. Always 0 without `--data-dir`. Nonzero means the disk is full or failing. |
 | `thothmesh_expired_messages_total` | counter | Messages deleted from the on-disk store for having aged past [`--persisted-message-ttl-secs`](#message-ttl-and-dead-lettering). Always 0 without a TTL configured. |
 | `thothmesh_dead_lettered_messages_total` | counter | Messages republished to [`--dead-letter-topic`](#message-ttl-and-dead-lettering) - from TTL expiry above or an exhausted `ack: true` redelivery alike. Always 0 without a dead-letter topic configured. |
@@ -1006,6 +1018,10 @@ Worth knowing before running this anywhere that matters:
   [durable subscriptions](#durable-subscriptions) (ADR-0046) and
   [message TTL/dead-lettering](#message-ttl-and-dead-lettering)
   (ADR-0047) build on it; without `--data-dir`, none of that does.
+  Work-queue redelivery for consumer groups
+  ([ADR-0048](adr/0048-work-queue-redelivery-for-consumer-groups.md))
+  is the one Phase 14 exception - its leases are in-memory only,
+  independent of `--data-dir`, and don't survive a restart either.
   Mesh-wide retained-state sync is still to come — see
   [docs/ROADMAP.md](ROADMAP.md) Phase 14.
 None of these are hidden defaults — they're the honest current state

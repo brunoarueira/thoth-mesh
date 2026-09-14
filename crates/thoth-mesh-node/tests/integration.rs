@@ -313,14 +313,22 @@ async fn an_acked_subscription_delivers_and_accepts_the_clients_ack() {
     assert_eq!(second_delivered.id, second_publish.id);
 }
 
-/// `ack: true` and `group: Some(_)` together is refused outright
-/// (ADR-0042) - the node hasn't defined what acknowledgement means
-/// for a group. The connection stays open and usable afterward, same
-/// as any other `Subscribe` rejection (ADR-0018).
+/// `ack: true` combined with `group: Some(_)` is accepted, not refused
+/// (ADR-0048 lifts ADR-0042's original v1 refusal): the subscribe gets
+/// an ordinary `Ack`, a publish is delivered to the group exactly like
+/// a plain group subscribe, and sending the resulting `Ack` back is
+/// accepted without upsetting the connection - the real lease-timeout/
+/// reclaim-by-another-member behavior itself is covered at the
+/// `thoth-mesh-broker` and `work_queue` unit levels (against
+/// `Broker::sweep_group_leases` and `work_queue::sweep_once` directly)
+/// so this test isn't stuck waiting out `DEFAULT_ACK_TIMEOUT` for
+/// real - see `an_acked_subscription_delivers_and_accepts_the_clients_ack`
+/// above for the same reasoning applied to plain `ack: true`.
 #[tokio::test]
-async fn ack_and_group_together_is_rejected() {
+async fn ack_and_group_together_is_accepted_as_work_queue_delivery() {
     let addr = spawn_test_node().await;
-    let mut client = connect(addr).await;
+    let mut member = connect(addr).await;
+    let mut publisher = connect(addr).await;
 
     let sub = Envelope::new(
         PeerId::new(),
@@ -331,36 +339,49 @@ async fn ack_and_group_together_is_rejected() {
             durable: false,
         },
     );
-    send(&mut client, &sub).await;
-
-    let reply = recv(&mut client).await;
+    send(&mut member, &sub).await;
     assert_eq!(
-        reply.kind,
-        MessageKind::Error {
-            in_reply_to: Some(sub.id),
-            message: "ack and group are not supported together".to_owned(),
+        recv(&mut member).await.kind,
+        MessageKind::Ack {
+            in_reply_to: sub.id
         }
     );
 
-    // The connection is still usable - an ordinary (non-group,
-    // non-ack) subscribe on it still works.
-    let ordinary = Envelope::new(
+    let publish = Envelope::new(
         PeerId::new(),
-        MessageKind::Subscribe {
-            filter: topic("weather.updates").into(),
-            ack: false,
-            group: None,
-            durable: false,
+        MessageKind::Publish {
+            topic: topic("weather.updates"),
+            payload: b"sunny".to_vec(),
+            retain: false,
+            content_type: None,
         },
     );
-    send(&mut client, &ordinary).await;
-    let ack = recv(&mut client).await;
-    assert_eq!(
-        ack.kind,
+    send(&mut publisher, &publish).await;
+    let delivered = recv(&mut member).await;
+    assert_eq!(delivered.id, publish.id);
+
+    let ack = Envelope::new(
+        PeerId::new(),
         MessageKind::Ack {
-            in_reply_to: ordinary.id
-        }
+            in_reply_to: delivered.id,
+        },
     );
+    send(&mut member, &ack).await;
+
+    // The connection is still healthy after acking - a second publish
+    // still reaches it.
+    let second_publish = Envelope::new(
+        PeerId::new(),
+        MessageKind::Publish {
+            topic: topic("weather.updates"),
+            payload: b"cloudy".to_vec(),
+            retain: false,
+            content_type: None,
+        },
+    );
+    send(&mut publisher, &second_publish).await;
+    let second_delivered = recv(&mut member).await;
+    assert_eq!(second_delivered.id, second_publish.id);
 }
 
 /// Two connections joining the same named group for the same filter

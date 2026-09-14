@@ -120,9 +120,12 @@ pub enum Command {
         /// Join this named consumer group for every filter given,
         /// instead of ordinary fan-out: each matching message goes to
         /// exactly one currently-live group member, round-robin, not
-        /// every subscriber. Combining this with `--ack` is refused
-        /// by the node - what acknowledgement means for a group isn't
-        /// defined yet. See ADR-0042.
+        /// every subscriber. Combined with `--ack`, this becomes
+        /// work-queue delivery: a message is reclaimed by another live
+        /// member (not necessarily the one it was first sent to) if
+        /// nobody acks it in time, instead of the plain fire-and-
+        /// forget guarantee `--group` alone has. See ADR-0042 and
+        /// ADR-0048.
         #[arg(long)]
         group: Option<String>,
         /// Make every filter given a durable subscription: the node
@@ -276,9 +279,10 @@ async fn read_payload(
 /// after printing it - not after any other condition, since v1 has no
 /// notion of "processing" beyond printing. `group` joins every filter
 /// to that named consumer group instead of ordinary fan-out
-/// (ADR-0042); combined with `ack`, the node refuses the request
-/// (surfaced as an `Err` here, same as any other `Subscribe`
-/// rejection) rather than this CLI guessing at what's supported.
+/// (ADR-0042); combined with `ack`, this becomes work-queue delivery
+/// (ADR-0048) - this invocation's own auto-ack right after printing
+/// works exactly the same either way, the node is what decides
+/// whether an unacked delivery is reclaimed by another member.
 /// `durable` makes every filter a durable subscription (ADR-0046) -
 /// refused by the node without a TLS client certificate, or for a
 /// wildcard filter, the same "let the node's Error be the one source
