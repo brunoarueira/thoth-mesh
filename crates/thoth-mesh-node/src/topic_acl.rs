@@ -85,7 +85,8 @@ fn parse_entry(raw: &str) -> Result<Vec<(Principal, Topic, Action)>, TopicAclPar
         });
     };
 
-    let principal = parse_principal(principal.trim())?;
+    let principal =
+        parse_principal(principal.trim()).map_err(TopicAclParseError::InvalidPrincipal)?;
     let actions = parse_actions(action.trim())?;
     let topic: Topic = topic
         .trim()
@@ -98,11 +99,15 @@ fn parse_entry(raw: &str) -> Result<Vec<(Principal, Topic, Action)>, TopicAclPar
         .collect())
 }
 
-fn parse_principal(s: &str) -> Result<Principal, TopicAclParseError> {
+/// `pub(crate)`, not private: `peer_topic_filter` (ADR-0049) reuses
+/// this exact parsing for its own `<fingerprint>|<topic>` entries -
+/// same identity primitive, same tolerant-of-`openssl`-style-output
+/// behavior, no reason for a second copy of it.
+pub(crate) fn parse_principal(s: &str) -> Result<Principal, ParseFingerprintError> {
     if s.eq_ignore_ascii_case("anonymous") {
         return Ok(Principal::Anonymous);
     }
-    let fingerprint = parse_fingerprint(s).map_err(TopicAclParseError::InvalidPrincipal)?;
+    let fingerprint = parse_fingerprint(s)?;
     Ok(Principal::Fingerprint(fingerprint))
 }
 

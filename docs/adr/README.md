@@ -54,6 +54,7 @@ thoth-mesh, using the format described in
 | [0046](0046-durable-subscriptions.md) | Durable subscriptions via per-subscriber offset tracking |
 | [0047](0047-message-ttl-and-dead-lettering.md) | Message TTL and dead-lettering |
 | [0048](0048-work-queue-redelivery-for-consumer-groups.md) | Work-queue redelivery for consumer groups |
+| [0049](0049-selective-per-peer-link-topic-filtering.md) | Selective per-peer-link topic filtering |
 
 To add a new one, copy the format of an existing ADR, number it
 sequentially, and set its status to `Accepted` once the decision is

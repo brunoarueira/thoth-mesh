@@ -33,8 +33,10 @@ subscriptions via per-subscriber offset tracking), and
 [ADR-0047](docs/adr/0047-message-ttl-and-dead-lettering.md) (message
 TTL and dead-lettering), and
 [ADR-0048](docs/adr/0048-work-queue-redelivery-for-consumer-groups.md)
-(work-queue redelivery for consumer groups). For diagrams of several
-of these flows, see [docs/FLOWS.md](docs/FLOWS.md).
+(work-queue redelivery for consumer groups), and
+[ADR-0049](docs/adr/0049-selective-per-peer-link-topic-filtering.md)
+(selective per-peer-link topic filtering). For diagrams of several of
+these flows, see [docs/FLOWS.md](docs/FLOWS.md).
 
 **Status:** version 1, and explicitly unstable — see ADR-0014. Nothing
 here should be assumed to hold across a breaking change; check
@@ -64,8 +66,17 @@ independently, a peer link's own certificate can gate which topics
 *it* may carry, via `--peer-topic-acl` (see
 [ADR-0020](docs/adr/0020-peer-scoped-topic-restriction.md)); the two
 lists never cross-apply, a peer is never checked against `--topic-acl`
-and a client is never checked against `--peer-topic-acl`. None of
-these authenticate what a `sender` value itself claims to be, though —
+and a client is never checked against `--peer-topic-acl`. A third,
+independent knob, `--peer-topic-filter` (see
+[ADR-0049](docs/adr/0049-selective-per-peer-link-topic-filtering.md)),
+restricts which of this node's own aggregate interest a specific peer
+link is *proactively told about* - a different question from
+`--peer-topic-acl`'s "is this peer permitted to ask for this," and
+checked nowhere near the wire format itself: a `Subscribe`/
+`Unsubscribe` this node decides to send a peer link looks exactly like
+any other, it's only *whether* one gets sent to that particular link
+at all that changes. None of these authenticate what a `sender` value
+itself claims to be, though —
 nothing ties an envelope's `sender` field to the connection's TLS
 identity. The metrics endpoint (`--metrics-addr`) is unrelated to this
 port and this TLS layer entirely — it's a separate, plain-HTTP port

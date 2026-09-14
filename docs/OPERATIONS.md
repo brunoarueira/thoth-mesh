@@ -619,6 +619,47 @@ rejection bumps `thothmesh_peer_topic_acl_rejections_total` (see
 `thothmesh_topic_acl_rejections_total` so a misbehaving peer is
 distinguishable from a misbehaving client at a glance.
 
+### Selective per-peer-link topic filtering
+
+`--peer-topic-filter` (repeatable, shaped `<fingerprint>|<topic>` —
+literal topic only, no wildcard) answers a different question than
+`--peer-topic-acl` above: not "is this peer *permitted* to ask for
+this," but "does this node *proactively tell* this specific peer link
+about its own interest in this" (see
+[ADR-0049](adr/0049-selective-per-peer-link-topic-filtering.md)). A
+peer link this node hasn't told about a topic never gets that topic's
+traffic relayed to it - but a peer can still explicitly `Subscribe` to
+anything `--peer-topic-acl` permits and get it, even a topic this
+filter would never have volunteered unasked. The two flags are
+independent and can be combined.
+
+```sh
+# This node only ever proactively tells the peer at this fingerprint
+# about weather.updates - even though this node may have plenty of
+# other local interest, none of it crosses this link unless that peer
+# explicitly asks for it itself (still subject to --peer-topic-acl,
+# if one is also configured).
+cargo run -p thoth-mesh-node -- --addr 127.0.0.1:49500 \
+  --tls-cert node-a-cert.pem --tls-key node-a-key.pem --tls-ca ca-cert.pem \
+  --peer-topic-filter "3F:08:CA:D2:92:03:BB:AA:B8:DD:92:32:33:8B:BD:0E:F8:E6:D9:E4:70:27:87:4E:51:D3:24:6E:CC:1A:92:10|weather.updates"
+```
+
+- Off by default — with no `--peer-topic-filter` given, every peer
+  link is proactively told about everything, same as before this flag
+  existed.
+- Default-deny once configured at all, same as `--topic-acl`/
+  `--peer-topic-acl`: a peer link whose own fingerprint has no entries
+  listed gets nothing proactively announced, not silently exempted.
+- A wildcard filter this node is locally interested in is never
+  relayed to any peer link a `--peer-topic-filter` applies to at all —
+  no pattern-vs-pattern matching, the same conservative default
+  `--topic-acl`/`--peer-topic-acl` already take wherever a wildcard
+  meets an ACL. Watching several concrete topics through a filtered
+  link just means listing each one.
+- No new metric or rejection reply — there's nothing to reject. A
+  restricted topic simply never becomes something this node tells that
+  peer link it wants.
+
 ## Message replay
 
 Every topic keeps a bounded, in-memory ring buffer of its most
