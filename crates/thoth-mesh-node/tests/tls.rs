@@ -968,3 +968,255 @@ async fn durable_subscribe_with_no_data_dir_configured_is_rejected() {
         other => panic!("expected an Error, got {other:?}"),
     }
 }
+
+/// ADR-0049: `--peer-topic-filter` restricts what node A proactively
+/// tells peer B about via interest propagation - a topic listed for
+/// B's own fingerprint still crosses the link, but one that isn't
+/// never does, even though A has genuine local interest in both.
+#[tokio::test]
+async fn peer_topic_filter_restricts_what_is_proactively_relayed_to_a_specific_peer() {
+    let ca = TestCa::new();
+    let identity_a = ca.issue();
+    let identity_b = ca.issue();
+    let fingerprint_b = fingerprint_of(&identity_b)
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<String>();
+
+    let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_a = listener_a.local_addr().unwrap();
+    let node_a = thoth_mesh_node::spawn_with_tls(
+        listener_a,
+        Vec::new(),
+        NodeOptions {
+            tls: Some(identity_a),
+            peer_topic_filter: Some(
+                thoth_mesh_node::PeerTopicFilter::parse([format!(
+                    "{fingerprint_b}|weather.updates"
+                )
+                .as_str()])
+                .unwrap(),
+            ),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let listener_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_b = listener_b.local_addr().unwrap();
+    let node_b = thoth_mesh_node::spawn_with_tls(
+        listener_b,
+        vec![addr_a.to_string()],
+        NodeOptions {
+            tls: Some(identity_b),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    eventually(|| node_b.membership.is_reachable(node_a.id)).await;
+    eventually(|| node_a.membership.is_reachable(node_b.id)).await;
+
+    // A client subscribes on A to both topics - A genuinely has local
+    // interest in each.
+    let client_identity = ca.issue();
+    let mut subscriber = connect_tls(addr_a, &client_identity).await;
+    for filter in ["weather.updates", "traffic.updates"] {
+        let sub = Envelope::new(
+            thoth_mesh_core::PeerId::new(),
+            MessageKind::Subscribe {
+                filter: topic(filter).into(),
+                ack: false,
+                group: None,
+                durable: false,
+            },
+        );
+        send(&mut subscriber, &sub).await;
+        assert_eq!(
+            recv(&mut subscriber).await.kind,
+            MessageKind::Ack {
+                in_reply_to: sub.id
+            }
+        );
+    }
+
+    // A publisher on B publishes both - only the listed one can ever
+    // reach the subscriber, since A's filter is what decides whether A
+    // ever told B it wants either in the first place.
+    let mut publisher = connect_tls(addr_b, &client_identity).await;
+    let deadline = tokio::time::Instant::now() + TEST_TIMEOUT;
+    loop {
+        let publish = Envelope::new(
+            thoth_mesh_core::PeerId::new(),
+            MessageKind::Publish {
+                topic: topic("weather.updates"),
+                payload: b"sunny".to_vec(),
+                retain: false,
+                content_type: None,
+            },
+        );
+        send(&mut publisher, &publish).await;
+
+        match timeout(
+            Duration::from_millis(200),
+            async_framing::read_frame(&mut subscriber),
+        )
+        .await
+        {
+            Ok(Ok(bytes)) => {
+                let delivered = Envelope::from_bytes(&bytes).unwrap();
+                if let MessageKind::Publish { topic, payload, .. } = delivered.kind {
+                    assert_eq!(topic.as_str(), "weather.updates");
+                    assert_eq!(payload, b"sunny");
+                    break;
+                }
+            }
+            _ => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the listed topic never arrived at the subscriber"
+                );
+            }
+        }
+    }
+
+    // Now that the mesh has demonstrably settled (the listed topic
+    // just crossed it), the excluded one gets one honest attempt -
+    // A never told B it wants traffic.updates, so B has nothing
+    // registered to forward it back on.
+    let excluded = Envelope::new(
+        thoth_mesh_core::PeerId::new(),
+        MessageKind::Publish {
+            topic: topic("traffic.updates"),
+            payload: b"jam".to_vec(),
+            retain: false,
+            content_type: None,
+        },
+    );
+    send(&mut publisher, &excluded).await;
+    let never_arrives = timeout(
+        Duration::from_millis(500),
+        async_framing::read_frame(&mut subscriber),
+    )
+    .await;
+    assert!(
+        never_arrives.is_err(),
+        "traffic.updates should never have crossed the filtered peer link"
+    );
+}
+
+/// ADR-0049: `--peer-topic-filter` only gates what this node
+/// *proactively* announces - it does not additionally restrict an
+/// *explicit* `Subscribe` the peer sends this node itself. Node A's
+/// filter excludes `traffic.updates` from what it tells B, but a
+/// client subscribing directly on B still gets it via B's own
+/// (unrestricted) interest propagation to A.
+#[tokio::test]
+async fn peer_topic_filter_does_not_restrict_an_explicit_subscribe_from_that_peer() {
+    let ca = TestCa::new();
+    let identity_a = ca.issue();
+    let identity_b = ca.issue();
+    let fingerprint_b = fingerprint_of(&identity_b)
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<String>();
+
+    let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_a = listener_a.local_addr().unwrap();
+    let node_a = thoth_mesh_node::spawn_with_tls(
+        listener_a,
+        Vec::new(),
+        NodeOptions {
+            tls: Some(identity_a),
+            // Excludes traffic.updates from what A proactively tells
+            // B - irrelevant to this test's direction (B telling A),
+            // which is the whole point being demonstrated.
+            peer_topic_filter: Some(
+                thoth_mesh_node::PeerTopicFilter::parse([format!(
+                    "{fingerprint_b}|weather.updates"
+                )
+                .as_str()])
+                .unwrap(),
+            ),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let listener_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_b = listener_b.local_addr().unwrap();
+    let node_b = thoth_mesh_node::spawn_with_tls(
+        listener_b,
+        vec![addr_a.to_string()],
+        NodeOptions {
+            tls: Some(identity_b),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    eventually(|| node_b.membership.is_reachable(node_a.id)).await;
+    eventually(|| node_a.membership.is_reachable(node_b.id)).await;
+
+    // A client subscribes on B (not A) to the topic A's filter would
+    // have excluded - B has no filter of its own, so B tells A about
+    // it unrestricted, an explicit request A's own filter never sees.
+    let client_identity = ca.issue();
+    let mut subscriber = connect_tls(addr_b, &client_identity).await;
+    let sub = Envelope::new(
+        thoth_mesh_core::PeerId::new(),
+        MessageKind::Subscribe {
+            filter: topic("traffic.updates").into(),
+            ack: false,
+            group: None,
+            durable: false,
+        },
+    );
+    send(&mut subscriber, &sub).await;
+    assert_eq!(
+        recv(&mut subscriber).await.kind,
+        MessageKind::Ack {
+            in_reply_to: sub.id
+        }
+    );
+
+    // A publisher on A publishes it - delivery has to cross the peer
+    // link from A back to B, driven entirely by B's own explicit
+    // subscribe to A, not by anything A proactively volunteered.
+    let mut publisher = connect_tls(addr_a, &client_identity).await;
+    let deadline = tokio::time::Instant::now() + TEST_TIMEOUT;
+    loop {
+        let publish = Envelope::new(
+            thoth_mesh_core::PeerId::new(),
+            MessageKind::Publish {
+                topic: topic("traffic.updates"),
+                payload: b"jam".to_vec(),
+                retain: false,
+                content_type: None,
+            },
+        );
+        send(&mut publisher, &publish).await;
+
+        match timeout(
+            Duration::from_millis(200),
+            async_framing::read_frame(&mut subscriber),
+        )
+        .await
+        {
+            Ok(Ok(bytes)) => {
+                let delivered = Envelope::from_bytes(&bytes).unwrap();
+                if let MessageKind::Publish { payload, .. } = delivered.kind {
+                    assert_eq!(payload, b"jam");
+                    break;
+                }
+            }
+            _ => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the explicitly-subscribed topic never arrived, even though A's own \
+                     --peer-topic-filter should never gate an inbound request from B"
+                );
+            }
+        }
+    }
+}

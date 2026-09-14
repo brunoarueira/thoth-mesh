@@ -39,6 +39,7 @@ use tracing::Instrument;
 
 use crate::metrics::Metrics;
 use crate::peer_links::PeerLinks;
+use crate::peer_topic_filter::PeerTopicFilter;
 use crate::redelivery::{
     DEFAULT_ACK_TIMEOUT, DEFAULT_MAX_REDELIVERY_ATTEMPTS, PendingAcks, sweep_interval,
 };
@@ -114,6 +115,7 @@ async fn run_connection(socket: MaybeTlsStream, shared: Shared, initial_peer: Op
         allowed_peers,
         topic_acl,
         peer_topic_acl,
+        peer_topic_filter,
         dead_letter_topic,
     } = shared;
     let (reader, writer) = split(socket);
@@ -160,6 +162,7 @@ async fn run_connection(socket: MaybeTlsStream, shared: Shared, initial_peer: Op
         allowed_peers,
         topic_acl,
         peer_topic_acl,
+        peer_topic_filter,
         dead_letter_topic,
         outgoing_tx,
         forwarders: HashMap::new(),
@@ -287,6 +290,14 @@ struct ConnectionContext {
     allowed_peers: Option<Arc<HashSet<[u8; 32]>>>,
     topic_acl: Option<Arc<TopicAcl>>,
     peer_topic_acl: Option<Arc<TopicAcl>>,
+    /// `--peer-topic-filter` (ADR-0049): restricts which of this
+    /// node's own aggregate interest this connection - if it becomes a
+    /// peer link - is proactively told about via interest propagation
+    /// (ADR-0011). Distinct from `peer_topic_acl`: that gates an
+    /// explicit request from the peer, this gates what this node
+    /// volunteers unasked. `None` - the default - means unchanged
+    /// behavior: every peer link hears about everything.
+    peer_topic_filter: Option<Arc<PeerTopicFilter>>,
     /// `--dead-letter-topic` (ADR-0047): where an `ack: true`
     /// forwarder that exhausts its redelivery attempts republishes the
     /// original message, if configured at all.
@@ -389,8 +400,10 @@ impl ConnectionContext {
             &self.discover,
             self.node_id,
             peer_id,
+            self.principal,
             listen_addr,
             &self.outgoing_tx,
+            self.peer_topic_filter.as_deref(),
         );
         true
     }
@@ -544,7 +557,13 @@ impl ConnectionContext {
             return false;
         }
         if is_new_forwarder && self.interest.subscribe(filter.clone()) {
-            propagate_interest(&self.peer_links, self.node_id, filter, true);
+            propagate_interest(
+                &self.peer_links,
+                self.node_id,
+                filter,
+                true,
+                self.peer_topic_filter.as_deref(),
+            );
         }
         true
     }
@@ -577,7 +596,13 @@ impl ConnectionContext {
             return false;
         }
         if had_forwarder.is_some() && self.interest.unsubscribe(&filter) {
-            propagate_interest(&self.peer_links, self.node_id, filter, false);
+            propagate_interest(
+                &self.peer_links,
+                self.node_id,
+                filter,
+                false,
+                self.peer_topic_filter.as_deref(),
+            );
         }
         true
     }
@@ -690,8 +715,10 @@ impl ConnectionContext {
             &self.discover,
             self.node_id,
             envelope.sender,
+            self.principal,
             listen_addr,
             &self.outgoing_tx,
+            self.peer_topic_filter.as_deref(),
         );
         true
     }
@@ -798,7 +825,13 @@ impl ConnectionContext {
                 }
             }
             if self.interest.unsubscribe(&filter) {
-                propagate_interest(&self.peer_links, self.node_id, filter, false);
+                propagate_interest(
+                    &self.peer_links,
+                    self.node_id,
+                    filter,
+                    false,
+                    self.peer_topic_filter.as_deref(),
+                );
             }
         }
         if let Some(peer_id) = self.peer_identity {
@@ -818,6 +851,14 @@ impl ConnectionContext {
 /// doesn't fit in the outgoing queue right now is dropped rather than
 /// blocking the connection on it, on the assumption a channel this
 /// backed up already has bigger problems.
+///
+/// `principal` is this new link's own authenticated identity - if
+/// `peer_topic_filter` is configured (ADR-0049), a filter this node is
+/// interested in for some other reason is only included in the
+/// catch-up if `principal` is explicitly permitted to hear about it;
+/// a wildcard filter is never included once any `--peer-topic-filter`
+/// applies, the same conservative stance
+/// [`PeerLinks::broadcast_interest`] takes for every later transition.
 #[allow(clippy::too_many_arguments)]
 fn register_peer_link(
     peer_links: &PeerLinks,
@@ -825,11 +866,21 @@ fn register_peer_link(
     discover: &PeerDirectory,
     node_id: PeerId,
     peer_id: PeerId,
+    principal: Principal,
     peer_listen_addr: Option<String>,
     outgoing_tx: &mpsc::Sender<Arc<Envelope>>,
+    peer_topic_filter: Option<&PeerTopicFilter>,
 ) {
-    peer_links.register(peer_id, outgoing_tx.clone());
+    peer_links.register(peer_id, outgoing_tx.clone(), principal);
     for filter in interest.snapshot() {
+        if let Some(peer_topic_filter) = peer_topic_filter {
+            let permitted = filter
+                .as_topic()
+                .is_some_and(|topic| peer_topic_filter.permits(principal, &topic));
+            if !permitted {
+                continue;
+            }
+        }
         let envelope = Arc::new(Envelope::new(
             node_id,
             // Always ack: false, group: None - interest propagation
@@ -945,12 +996,16 @@ fn propagate_peer(peer_links: &PeerLinks, node_id: PeerId, peer_id: PeerId, list
 /// transition: `now_interested` selects `Subscribe` (a filter just
 /// gained its first interested connection) or `Unsubscribe` (it just
 /// lost its last). See ADR-0011; a propagated filter may itself be a
-/// wildcard pattern (ADR-0022), handled with no special-casing.
+/// wildcard pattern (ADR-0022), handled with no special-casing. A peer
+/// link a `--peer-topic-filter` doesn't permit `filter` for hears
+/// about neither transition - see
+/// [`PeerLinks::broadcast_interest`] (ADR-0049).
 fn propagate_interest(
     peer_links: &PeerLinks,
     node_id: PeerId,
     filter: TopicFilter,
     now_interested: bool,
+    peer_topic_filter: Option<&PeerTopicFilter>,
 ) {
     let kind = if now_interested {
         // Always ack: false, group: None - see register_peer_link's
@@ -958,15 +1013,21 @@ fn propagate_interest(
         // (a peer link forwards interest in a filter, not membership
         // in any particular local consumer group).
         MessageKind::Subscribe {
-            filter,
+            filter: filter.clone(),
             ack: false,
             group: None,
             durable: false,
         }
     } else {
-        MessageKind::Unsubscribe { filter }
+        MessageKind::Unsubscribe {
+            filter: filter.clone(),
+        }
     };
-    peer_links.broadcast(Arc::new(Envelope::new(node_id, kind)));
+    peer_links.broadcast_interest(
+        Arc::new(Envelope::new(node_id, kind)),
+        &filter,
+        peer_topic_filter,
+    );
 }
 
 /// Whether a peer link presenting `peer_fingerprint` is allowed to
@@ -1899,7 +1960,7 @@ mod tests {
         let discover = PeerDirectory::new();
         let (discovered_tx, mut discovered_rx) = mpsc::unbounded_channel();
         let (link_tx, mut link_rx) = mpsc::channel(8);
-        peer_links.register(PeerId::new(), link_tx);
+        peer_links.register(PeerId::new(), link_tx, Principal::Anonymous);
 
         let peers = vec![
             PeerAdvert {
@@ -1947,7 +2008,7 @@ mod tests {
         let discover = PeerDirectory::new();
         let (discovered_tx, _discovered_rx) = mpsc::unbounded_channel();
         let (link_tx, mut link_rx) = mpsc::channel(8);
-        peer_links.register(PeerId::new(), link_tx);
+        peer_links.register(PeerId::new(), link_tx, Principal::Anonymous);
 
         let already_known = PeerId::new();
         discover.record(already_known, "127.0.0.1:1".to_owned());
@@ -1984,8 +2045,10 @@ mod tests {
             &discover,
             node_id,
             new_peer,
+            Principal::Anonymous,
             Some("127.0.0.1:2".to_owned()),
             &outgoing_tx,
+            None,
         );
 
         let mut announced_peers = Vec::new();
@@ -2033,8 +2096,10 @@ mod tests {
             &discover,
             node_id,
             new_peer,
+            Principal::Anonymous,
             None,
             &outgoing_tx,
+            None,
         );
 
         // Nothing to catch up on, and nothing recorded about the new

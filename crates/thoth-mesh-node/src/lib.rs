@@ -31,6 +31,7 @@ mod dead_letter;
 pub mod metrics;
 mod metrics_server;
 mod peer_links;
+mod peer_topic_filter;
 mod peering;
 mod persistence;
 mod redelivery;
@@ -50,6 +51,7 @@ use thoth_mesh_tls::MaybeTlsStream;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
+pub use peer_topic_filter::{PeerTopicFilter, PeerTopicFilterParseError};
 pub use shared::Shared;
 pub use thoth_mesh::{Interest, Membership, PeerDirectory};
 pub use thoth_mesh_core::DEFAULT_ADDR;
@@ -77,6 +79,16 @@ pub struct NodeOptions {
     /// a peer link is never checked against `topic_acl`, and a client
     /// connection is never checked against this.
     pub peer_topic_acl: Option<TopicAcl>,
+    /// Restricts which of this node's own aggregate interest a peer
+    /// link is proactively told about via interest propagation
+    /// (ADR-0011), `--peer-topic-filter` - see ADR-0049. Distinct from
+    /// `peer_topic_acl`: that gates an explicit request from the peer,
+    /// this gates what this node volunteers unasked - a peer can still
+    /// explicitly ask for (and receive) anything `peer_topic_acl`
+    /// permits, even a topic this filter would never have proactively
+    /// announced. `None` (the default) means unchanged behavior: every
+    /// peer link hears about everything.
+    pub peer_topic_filter: Option<PeerTopicFilter>,
     /// Directory for the on-disk message store, `--data-dir` - see
     /// ADR-0045. `None` (the default) keeps the node fully in-memory,
     /// exactly as before that ADR: nothing is written, nothing
@@ -226,6 +238,7 @@ pub async fn run_with_tls(
     }
     shared.topic_acl = options.topic_acl.map(Arc::new);
     shared.peer_topic_acl = options.peer_topic_acl.map(Arc::new);
+    shared.peer_topic_filter = options.peer_topic_filter.map(Arc::new);
     shared.dead_letter_topic = options.dead_letter_topic.clone();
     if let Some(store) = store.clone() {
         rehydrate_from_store(&shared.broker, store).await?;
@@ -315,6 +328,7 @@ pub async fn serve_with_tls(
     }
     shared.topic_acl = options.topic_acl.map(Arc::new);
     shared.peer_topic_acl = options.peer_topic_acl.map(Arc::new);
+    shared.peer_topic_filter = options.peer_topic_filter.map(Arc::new);
     shared.dead_letter_topic = options.dead_letter_topic.clone();
     if let Some(store) = store.clone() {
         rehydrate_from_store(&shared.broker, store).await?;
@@ -401,6 +415,7 @@ pub fn spawn_with_tls(
     }
     shared.topic_acl = options.topic_acl.map(Arc::new);
     shared.peer_topic_acl = options.peer_topic_acl.map(Arc::new);
+    shared.peer_topic_filter = options.peer_topic_filter.map(Arc::new);
     shared.dead_letter_topic = options.dead_letter_topic.clone();
     if let Some(store) = store.clone() {
         // spawn_with_tls isn't async; rehydration runs in the

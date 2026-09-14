@@ -14,6 +14,7 @@ use tokio::sync::{Semaphore, mpsc};
 
 use crate::metrics::Metrics;
 use crate::peer_links::PeerLinks;
+use crate::peer_topic_filter::PeerTopicFilter;
 use crate::topic_acl::TopicAcl;
 
 /// How many outbound dial attempts (`peering::dial_peer`'s connect
@@ -72,6 +73,15 @@ pub struct Shared {
     /// independent of `topic_acl`, which never applies to one. See
     /// ADR-0020.
     pub peer_topic_acl: Option<Arc<TopicAcl>>,
+    /// `--peer-topic-filter` (repeatable). `None` - the default -
+    /// means unchanged behavior: every peer link is proactively told
+    /// about all of this node's aggregate interest. `Some` restricts
+    /// each peer link's own catch-up/ongoing interest propagation to
+    /// exactly what's listed for its own authenticated identity -
+    /// distinct from `peer_topic_acl`, which gates an explicit request
+    /// from the peer rather than what this node volunteers unasked.
+    /// See ADR-0049.
+    pub peer_topic_filter: Option<Arc<PeerTopicFilter>>,
     /// `--dead-letter-topic` (ADR-0047): if set, an `ack: true`
     /// forwarder that exhausts its redelivery attempts (ADR-0041)
     /// republishes the original message to
@@ -106,6 +116,7 @@ impl std::fmt::Debug for Shared {
             )
             .field("topic_acl", &self.topic_acl.is_some())
             .field("peer_topic_acl", &self.peer_topic_acl.is_some())
+            .field("peer_topic_filter", &self.peer_topic_filter.is_some())
             .field("dead_letter_topic", &self.dead_letter_topic)
             .finish_non_exhaustive()
     }
@@ -150,6 +161,7 @@ impl Shared {
             allowed_peers: None,
             topic_acl: None,
             peer_topic_acl: None,
+            peer_topic_filter: None,
             dead_letter_topic: None,
         };
         (shared, discovered_rx)

@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use thoth_mesh_core::Topic;
-use thoth_mesh_node::{NodeOptions, TlsConfig, TopicAcl};
+use thoth_mesh_node::{NodeOptions, PeerTopicFilter, TlsConfig, TopicAcl};
 use tracing_subscriber::EnvFilter;
 
 /// Daemon that runs a thoth-mesh node: wires the local pub/sub broker
@@ -82,6 +82,22 @@ struct Cli {
     /// before this flag existed. See ADR-0020 and docs/OPERATIONS.md.
     #[arg(long = "peer-topic-acl")]
     peer_topic_acl: Vec<String>,
+
+    /// Restricts which of this node's own aggregate topic interest a
+    /// specific peer link is proactively told about, shaped
+    /// `<fingerprint>|<topic>` (literal topic only, no wildcard).
+    /// Repeatable. Distinct from --peer-topic-acl: that governs
+    /// whether a peer is *permitted* to publish/subscribe to a topic
+    /// if it explicitly asks; this governs what this node *volunteers
+    /// unasked* via interest propagation - a peer can still explicitly
+    /// ask for (and receive) anything --peer-topic-acl permits, even a
+    /// topic this node would never have proactively announced. With
+    /// none given, every peer link hears about everything, unchanged
+    /// from before this flag existed; given at least once, a peer
+    /// link with no entries of its own is told about nothing
+    /// proactively. See ADR-0049 and docs/OPERATIONS.md.
+    #[arg(long = "peer-topic-filter")]
+    peer_topic_filter: Vec<String>,
 
     /// File containing a shared-secret bearer token a metrics scrape
     /// must present (as `Authorization: Bearer <token>`) to get the
@@ -161,6 +177,20 @@ async fn main() -> std::io::Result<()> {
 
     let topic_acl = parse_topic_acl("--topic-acl", &cli.topic_acl)?;
     let peer_topic_acl = parse_topic_acl("--peer-topic-acl", &cli.peer_topic_acl)?;
+    let peer_topic_filter = if cli.peer_topic_filter.is_empty() {
+        None
+    } else {
+        Some(
+            PeerTopicFilter::parse(cli.peer_topic_filter.iter().map(String::as_str)).map_err(
+                |err| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("--peer-topic-filter {err}"),
+                    )
+                },
+            )?,
+        )
+    };
 
     let metrics_token = match &cli.metrics_token_file {
         None => None,
@@ -193,6 +223,7 @@ async fn main() -> std::io::Result<()> {
         tls,
         topic_acl,
         peer_topic_acl,
+        peer_topic_filter,
         data_dir: cli.data_dir,
         persisted_message_ttl: cli
             .persisted_message_ttl_secs
