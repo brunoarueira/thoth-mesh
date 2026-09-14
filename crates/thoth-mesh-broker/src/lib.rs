@@ -16,6 +16,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::Hash;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use thoth_mesh_core::{Envelope, MessageId, MessageKind, PeerId, Topic, TopicFilter};
 use tokio::sync::{RwLock, broadcast, mpsc};
@@ -422,19 +423,44 @@ impl Broker {
     /// `broadcast::Receiver` - there is no backlog replay (ADR-0021)
     /// or lag recovery (ADR-0024) for a group; a member only ever
     /// sees what's published while it's a live, keeping-up member.
+    ///
+    /// `ack` requests work-queue delivery for this group (ADR-0048):
+    /// a delivery is provisional until *some* member acks it (see
+    /// [`ack_group_delivery`](Self::ack_group_delivery)), and
+    /// reclaimable by any live member - not necessarily the original
+    /// recipient - once its lease expires (see
+    /// [`sweep_group_leases`](Self::sweep_group_leases)). Whether a
+    /// `(filter, group)` pair is ack-tracked is decided once, by
+    /// whichever `join_group` call first creates it; a later join
+    /// with a different `ack` is logged and otherwise ignored, the
+    /// same "first subscribe decides" convention this project already
+    /// applies per-connection (ADR-0041/ADR-0042/ADR-0046) - here
+    /// across every member of the group instead, since membership is
+    /// already shared, central state.
     pub fn join_group(
         &self,
         filter: TopicFilter,
         group: String,
         sender: mpsc::Sender<Arc<Envelope>>,
+        ack: bool,
     ) {
-        self.groups
-            .lock()
-            .unwrap()
-            .entry((filter, group))
-            .or_default()
-            .members
-            .push(sender);
+        let mut groups = self.groups.lock().unwrap();
+        let members = groups
+            .entry((filter.clone(), group.clone()))
+            .or_insert_with(|| GroupMembers {
+                ack_tracked: ack,
+                ..GroupMembers::default()
+            });
+        if members.ack_tracked != ack {
+            tracing::warn!(
+                %filter,
+                group,
+                requested = ack,
+                established = members.ack_tracked,
+                "ack mode mismatch on an existing consumer group - keeping the mode its first subscriber established"
+            );
+        }
+        members.members.push(sender);
     }
 
     /// Removes `sender` from the named consumer `group` for `filter`,
@@ -444,7 +470,10 @@ impl Broker {
     /// teardown can't remove a different connection's still-live
     /// membership. A no-op if `sender` was never a member of this
     /// `(filter, group)` (or already removed) - safe to call
-    /// unconditionally on disconnect.
+    /// unconditionally on disconnect. Any lease this member happened
+    /// to be holding (ADR-0048) is left as-is - it's still reclaimable
+    /// by whichever other member is live when it expires, exactly as
+    /// if this member had simply gone quiet without disconnecting.
     pub fn leave_group(
         &self,
         filter: TopicFilter,
@@ -457,6 +486,84 @@ impl Broker {
                 .members
                 .retain(|member| !member.same_channel(sender));
         }
+    }
+
+    /// Acknowledges a work-queue delivery (ADR-0048): clears
+    /// `message_id`'s lease on `(filter, group)`, if one exists. A
+    /// no-op otherwise - never registered (an ordinary, non-ack
+    /// group), already acked, already given up on
+    /// ([`sweep_group_leases`](Self::sweep_group_leases)), or naming a
+    /// `(filter, group)` this node doesn't currently know about at
+    /// all. Never fails and never needs to: an ack for something
+    /// that's no longer pending simply has nothing to do.
+    pub fn ack_group_delivery(&self, filter: TopicFilter, group: String, message_id: MessageId) {
+        if let Some(members) = self.groups.lock().unwrap().get_mut(&(filter, group)) {
+            members.leases.remove(&message_id);
+        }
+    }
+
+    /// Sweeps every ack-tracked consumer group's outstanding leases
+    /// (ADR-0048): a lease past `timeout` with attempts left is
+    /// reclaimed - redelivered via the group's ordinary round-robin
+    /// [`GroupMembers::deliver`], possibly to a different member than
+    /// the one that first got it - with its attempt count bumped and
+    /// its clock reset. A lease past `timeout` with `max_attempts`
+    /// already spent is removed and its envelope returned for the
+    /// caller to dead-letter (ADR-0047) or simply drop. A lease no
+    /// live member can currently accept (every channel full or
+    /// closed) is left untouched either way - retried again next
+    /// sweep without burning an attempt, the same "zero live
+    /// receivers right now" non-error [`publish`](Self::publish)
+    /// itself already treats as normal. Called periodically by
+    /// `thoth-mesh-node`'s own background task - `Broker` has no
+    /// timer of its own (the same split ADR-0047's TTL sweep already
+    /// established).
+    pub fn sweep_group_leases(
+        &self,
+        now: Instant,
+        timeout: Duration,
+        max_attempts: u32,
+    ) -> Vec<Arc<Envelope>> {
+        let mut given_up_on = Vec::new();
+        let mut groups = self.groups.lock().unwrap();
+        for members in groups.values_mut() {
+            if members.leases.is_empty() {
+                continue;
+            }
+            let expired: Vec<MessageId> = members
+                .leases
+                .iter()
+                .filter(|(_, lease)| now.duration_since(lease.leased_at) >= timeout)
+                .map(|(id, _)| *id)
+                .collect();
+            for id in expired {
+                let attempts = members
+                    .leases
+                    .get(&id)
+                    .expect("id was just collected from leases above")
+                    .attempts;
+                if attempts >= max_attempts {
+                    if let Some(lease) = members.leases.remove(&id) {
+                        given_up_on.push(lease.envelope);
+                    }
+                    continue;
+                }
+                let envelope = Arc::clone(
+                    &members
+                        .leases
+                        .get(&id)
+                        .expect("id was just collected from leases above")
+                        .envelope,
+                );
+                if members.deliver(Arc::clone(&envelope))
+                    && let Some(lease) = members.leases.get_mut(&id)
+                {
+                    lease.attempts += 1;
+                    lease.leased_at = now;
+                }
+            }
+        }
+        given_up_on
     }
 
     /// Publishes `envelope` to every subscriber currently registered
@@ -550,6 +657,20 @@ impl Broker {
         for (key, members) in groups.iter_mut() {
             if key.0.matches(topic) && members.deliver(Arc::clone(&envelope)) {
                 delivered += 1;
+                // Work-queue delivery (ADR-0048): provisional until
+                // some member acks it, reclaimable by the periodic
+                // sweep otherwise. A no-op field write for an
+                // ordinary (non-ack) group.
+                if members.ack_tracked {
+                    members.leases.insert(
+                        envelope.id,
+                        GroupLease {
+                            envelope: Arc::clone(&envelope),
+                            leased_at: Instant::now(),
+                            attempts: 0,
+                        },
+                    );
+                }
             }
         }
         delivered
@@ -772,6 +893,25 @@ struct GroupMembers {
     /// always kept within bounds of whatever `members.len()` is at
     /// the time, even as membership changes.
     next: usize,
+    /// Whether this group was joined with `ack: true` (ADR-0048) -
+    /// decided once, by whichever `join_group` call first creates
+    /// this entry. `false` (an ordinary, fire-and-forget group,
+    /// ADR-0042) unless every field is explicitly set otherwise.
+    ack_tracked: bool,
+    /// Deliveries still awaiting an ack from *some* current member
+    /// (ADR-0048) - only ever populated when `ack_tracked`.
+    leases: HashMap<MessageId, GroupLease>,
+}
+
+/// One work-queue delivery still waiting on an ack from *some* member
+/// of the group it went to (ADR-0048) - lease-based, not tied to the
+/// specific member it was sent to, unlike ADR-0041's per-connection
+/// `PendingAcks`.
+#[derive(Debug)]
+struct GroupLease {
+    envelope: Arc<Envelope>,
+    leased_at: Instant,
+    attempts: u32,
 }
 
 impl GroupMembers {
@@ -1260,7 +1400,7 @@ mod tests {
         let mut receivers = Vec::with_capacity(count);
         for _ in 0..count {
             let (tx, rx) = mpsc::channel(8);
-            broker.join_group(filter.clone(), group.to_owned(), tx);
+            broker.join_group(filter.clone(), group.to_owned(), tx, false);
             receivers.push(rx);
         }
         receivers
@@ -1317,8 +1457,8 @@ mod tests {
         let filter: TopicFilter = topic.clone().into();
         let (tx_a, mut rx_a) = mpsc::channel(8);
         let (tx_b, mut rx_b) = mpsc::channel(8);
-        broker.join_group(filter.clone(), "workers".to_owned(), tx_a.clone());
-        broker.join_group(filter.clone(), "workers".to_owned(), tx_b);
+        broker.join_group(filter.clone(), "workers".to_owned(), tx_a.clone(), false);
+        broker.join_group(filter.clone(), "workers".to_owned(), tx_b, false);
         broker.leave_group(filter, "workers".to_owned(), &tx_a);
 
         // Two publishes - if `tx_a` were still a member, round-robin
@@ -1341,7 +1481,7 @@ mod tests {
         let topic = Topic::from_str("weather.updates").unwrap();
         let filter: TopicFilter = topic.clone().into();
         let (tx, mut rx) = mpsc::channel(8);
-        broker.join_group(filter.clone(), "workers".to_owned(), tx);
+        broker.join_group(filter.clone(), "workers".to_owned(), tx, false);
 
         let (never_joined, _never_joined_rx) = mpsc::channel(8);
         broker.leave_group(filter, "workers".to_owned(), &never_joined);
@@ -1363,8 +1503,8 @@ mod tests {
             .try_send(publish_envelope(&topic, b"already queued"))
             .unwrap();
         let (tx_open, mut rx_open) = mpsc::channel(8);
-        broker.join_group(filter, "workers".to_owned(), tx_full);
-        broker.join_group(topic.clone().into(), "workers".to_owned(), tx_open);
+        broker.join_group(filter, "workers".to_owned(), tx_full, false);
+        broker.join_group(topic.clone().into(), "workers".to_owned(), tx_open, false);
 
         let envelope = publish_envelope(&topic, b"sunny");
         let delivered = broker.publish(&topic, envelope.clone()).await;
@@ -1445,7 +1585,7 @@ mod tests {
         let topic = Topic::from_str("weather.updates").unwrap();
         let filter: TopicFilter = topic.clone().into();
         let (tx, _rx) = mpsc::channel(8);
-        broker.join_group(filter.clone(), "workers".to_owned(), tx.clone());
+        broker.join_group(filter.clone(), "workers".to_owned(), tx.clone(), false);
         broker.leave_group(filter, "workers".to_owned(), &tx);
 
         // The group entry still exists (now with zero members) -
@@ -1455,6 +1595,217 @@ mod tests {
             .publish(&topic, publish_envelope(&topic, b"anybody?"))
             .await;
         assert_eq!(delivered, 0);
+    }
+
+    // ADR-0048
+
+    #[tokio::test]
+    async fn an_ordinary_groups_delivery_is_never_leased() {
+        // A plain (non-ack) group never populates a lease at all - a
+        // sweep immediately after delivery, with a zero timeout, finds
+        // nothing to reclaim or give up on.
+        let broker = Broker::new();
+        let topic = Topic::from_str("weather.updates").unwrap();
+        let mut members = join_members(&broker, topic.clone().into(), "workers", 1).await;
+        broker
+            .publish(&topic, publish_envelope(&topic, b"sunny"))
+            .await;
+        members[0].try_recv().unwrap();
+
+        let given_up_on = broker.sweep_group_leases(Instant::now(), Duration::ZERO, 5);
+        assert!(given_up_on.is_empty());
+    }
+
+    #[tokio::test]
+    async fn acking_a_work_queue_delivery_clears_its_lease_so_it_is_not_reclaimed() {
+        let broker = Broker::new();
+        let topic = Topic::from_str("weather.updates").unwrap();
+        let filter: TopicFilter = topic.clone().into();
+        let (tx, mut rx) = mpsc::channel(8);
+        broker.join_group(filter.clone(), "workers".to_owned(), tx, true);
+
+        let envelope = publish_envelope(&topic, b"sunny");
+        broker.publish(&topic, envelope.clone()).await;
+        assert_eq!(rx.try_recv().unwrap().id, envelope.id);
+
+        broker.ack_group_delivery(filter, "workers".to_owned(), envelope.id);
+
+        // Immediately "expired" (zero timeout) - but there's nothing
+        // left to reclaim or give up on, since it was acked.
+        let given_up_on = broker.sweep_group_leases(Instant::now(), Duration::ZERO, 5);
+        assert!(given_up_on.is_empty());
+        assert!(rx.try_recv().is_err(), "no redelivery for an acked message");
+    }
+
+    #[tokio::test]
+    async fn acking_group_delivery_is_a_no_op_for_an_unknown_message_id() {
+        let broker = Broker::new();
+        let topic = Topic::from_str("weather.updates").unwrap();
+        let filter: TopicFilter = topic.clone().into();
+        let (tx, _rx) = mpsc::channel(8);
+        broker.join_group(filter.clone(), "workers".to_owned(), tx, true);
+
+        // Never published, and this (filter, group) isn't even known
+        // - neither case should panic or otherwise misbehave.
+        broker.ack_group_delivery(filter.clone(), "workers".to_owned(), MessageId::new());
+        broker.ack_group_delivery(filter, "nonexistent".to_owned(), MessageId::new());
+    }
+
+    #[tokio::test]
+    async fn an_unacked_work_queue_delivery_is_reclaimed_by_another_live_member() {
+        let broker = Broker::new();
+        let topic = Topic::from_str("weather.updates").unwrap();
+        let filter: TopicFilter = topic.clone().into();
+        let (tx_a, mut rx_a) = mpsc::channel(8);
+        let (tx_b, mut rx_b) = mpsc::channel(8);
+        broker.join_group(filter.clone(), "workers".to_owned(), tx_a, true);
+        broker.join_group(filter, "workers".to_owned(), tx_b, true);
+
+        let envelope = publish_envelope(&topic, b"sunny");
+        broker.publish(&topic, envelope.clone()).await;
+        // Round-robin: member a got the first (and only) delivery so
+        // far.
+        assert_eq!(rx_a.try_recv().unwrap().id, envelope.id);
+        assert!(rx_b.try_recv().is_err());
+
+        // "Expired" (zero timeout), attempts nowhere near exhausted -
+        // reclaimed via the same round-robin, which lands on member b
+        // next in rotation.
+        let given_up_on = broker.sweep_group_leases(Instant::now(), Duration::ZERO, 5);
+        assert!(given_up_on.is_empty());
+        assert_eq!(rx_b.try_recv().unwrap().id, envelope.id);
+    }
+
+    #[tokio::test]
+    async fn a_work_queue_delivery_is_given_up_on_after_exhausting_every_attempt() {
+        let broker = Broker::new();
+        let topic = Topic::from_str("weather.updates").unwrap();
+        let filter: TopicFilter = topic.clone().into();
+        let (tx, mut rx) = mpsc::channel(8);
+        broker.join_group(filter, "workers".to_owned(), tx, true);
+
+        let envelope = publish_envelope(&topic, b"sunny");
+        broker.publish(&topic, envelope.clone()).await;
+        rx.try_recv().unwrap();
+
+        const MAX_ATTEMPTS: u32 = 2;
+        // Two sweeps (MAX_ATTEMPTS) still redeliver...
+        for _ in 0..MAX_ATTEMPTS {
+            let given_up_on =
+                broker.sweep_group_leases(Instant::now(), Duration::ZERO, MAX_ATTEMPTS);
+            assert!(given_up_on.is_empty());
+            assert_eq!(rx.try_recv().unwrap().id, envelope.id);
+        }
+        // ...but the third sweep gives up instead of redelivering
+        // again.
+        let given_up_on = broker.sweep_group_leases(Instant::now(), Duration::ZERO, MAX_ATTEMPTS);
+        assert_eq!(given_up_on.len(), 1);
+        assert_eq!(given_up_on[0].id, envelope.id);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn a_lease_no_live_member_can_accept_is_retried_without_burning_an_attempt() {
+        let broker = Broker::new();
+        let topic = Topic::from_str("weather.updates").unwrap();
+        let filter: TopicFilter = topic.clone().into();
+        let (tx, rx) = mpsc::channel(1);
+        broker.join_group(filter, "workers".to_owned(), tx.clone(), true);
+
+        let envelope = publish_envelope(&topic, b"sunny");
+        broker.publish(&topic, envelope.clone()).await;
+        // The channel (capacity 1) is already full from that delivery
+        // - nobody has drained `rx` - so the sole member has no room
+        // for a reclaim attempt.
+
+        // Every sweep leaves the lease as-is (nothing to reclaim into,
+        // never given up on) no matter how many times it's swept -
+        // if a failed redelivery attempt were silently burning an
+        // attempt anyway, this would eventually exceed max_attempts
+        // and give up.
+        for _ in 0..10 {
+            let given_up_on = broker.sweep_group_leases(Instant::now(), Duration::ZERO, 5);
+            assert!(given_up_on.is_empty());
+        }
+        drop(rx);
+    }
+
+    #[tokio::test]
+    async fn a_lease_within_its_timeout_is_never_reclaimed() {
+        let broker = Broker::new();
+        let topic = Topic::from_str("weather.updates").unwrap();
+        let filter: TopicFilter = topic.clone().into();
+        let (tx, mut rx) = mpsc::channel(8);
+        broker.join_group(filter, "workers".to_owned(), tx, true);
+
+        let envelope = publish_envelope(&topic, b"sunny");
+        broker.publish(&topic, envelope.clone()).await;
+        rx.try_recv().unwrap();
+
+        let given_up_on = broker.sweep_group_leases(Instant::now(), Duration::from_secs(3600), 5);
+        assert!(given_up_on.is_empty());
+        assert!(
+            rx.try_recv().is_err(),
+            "nothing should have been redelivered - the lease hasn't expired yet"
+        );
+    }
+
+    #[tokio::test]
+    async fn join_group_first_call_decides_ack_tracking_a_later_mismatch_is_ignored() {
+        let broker = Broker::new();
+        let topic = Topic::from_str("weather.updates").unwrap();
+        let filter: TopicFilter = topic.clone().into();
+        let (tx_a, mut rx_a) = mpsc::channel(8);
+        let (tx_b, mut rx_b) = mpsc::channel(8);
+        // First join establishes ack-tracked...
+        broker.join_group(filter.clone(), "workers".to_owned(), tx_a, true);
+        // ...a later join asking for plain fire-and-forget is ignored,
+        // not honored or refused.
+        broker.join_group(filter.clone(), "workers".to_owned(), tx_b, false);
+
+        let envelope = publish_envelope(&topic, b"sunny");
+        broker.publish(&topic, envelope.clone()).await;
+        // Whichever member got it, sweeping with a zero timeout
+        // proves it was leased (ack-tracked mode won).
+        let delivered_to_a = rx_a.try_recv().is_ok();
+        let delivered_to_b = rx_b.try_recv().is_ok();
+        assert!(delivered_to_a ^ delivered_to_b, "exactly one member got it");
+
+        let given_up_on = broker.sweep_group_leases(Instant::now(), Duration::ZERO, 5);
+        assert!(given_up_on.is_empty());
+        assert!(
+            rx_a.try_recv().is_ok() || rx_b.try_recv().is_ok(),
+            "the delivery should have been reclaimed, proving it was leased"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_ack_tracked_groups_on_the_same_filter_have_independent_leases() {
+        let broker = Broker::new();
+        let topic = Topic::from_str("weather.updates").unwrap();
+        let (tx_a, mut rx_a) = mpsc::channel(8);
+        let (tx_b, mut rx_b) = mpsc::channel(8);
+        broker.join_group(topic.clone().into(), "a".to_owned(), tx_a, true);
+        broker.join_group(topic.clone().into(), "b".to_owned(), tx_b, true);
+
+        let envelope = publish_envelope(&topic, b"sunny");
+        broker.publish(&topic, envelope.clone()).await;
+        assert_eq!(rx_a.try_recv().unwrap().id, envelope.id);
+        assert_eq!(rx_b.try_recv().unwrap().id, envelope.id);
+
+        // Ack only group a's copy...
+        broker.ack_group_delivery(topic.clone().into(), "a".to_owned(), envelope.id);
+
+        // ...group b's independent lease for the very same MessageId
+        // is still outstanding and gets reclaimed.
+        let given_up_on = broker.sweep_group_leases(Instant::now(), Duration::ZERO, 5);
+        assert!(given_up_on.is_empty());
+        assert!(rx_a.try_recv().is_err(), "group a's copy was acked");
+        assert_eq!(
+            rx_b.try_recv().unwrap().id,
+            envelope.id,
+            "group b's copy was reclaimed"
+        );
     }
 
     fn retain_envelope(topic: &Topic, payload: &[u8]) -> Arc<Envelope> {

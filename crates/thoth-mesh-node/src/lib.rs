@@ -38,6 +38,7 @@ mod shared;
 mod tls_config;
 mod topic_acl;
 mod ttl;
+mod work_queue;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -229,15 +230,21 @@ pub async fn run_with_tls(
     if let Some(store) = store.clone() {
         rehydrate_from_store(&shared.broker, store).await?;
     }
+    let dead_letter_config = dead_letter::DeadLetterConfig {
+        node_id: shared.node_id,
+        topic: options.dead_letter_topic,
+    };
     maybe_spawn_ttl_sweeper(
         store,
         &shared.broker,
         shared.metrics.clone(),
         options.persisted_message_ttl,
-        dead_letter::DeadLetterConfig {
-            node_id: shared.node_id,
-            topic: options.dead_letter_topic,
-        },
+        dead_letter_config.clone(),
+    );
+    work_queue::spawn(
+        Arc::clone(&shared.broker),
+        dead_letter_config,
+        shared.metrics.clone(),
     );
     tokio::spawn(peering::spawn_discovery_dialer(
         discovered_rx,
@@ -312,15 +319,21 @@ pub async fn serve_with_tls(
     if let Some(store) = store.clone() {
         rehydrate_from_store(&shared.broker, store).await?;
     }
+    let dead_letter_config = dead_letter::DeadLetterConfig {
+        node_id: shared.node_id,
+        topic: options.dead_letter_topic,
+    };
     maybe_spawn_ttl_sweeper(
         store,
         &shared.broker,
         shared.metrics.clone(),
         options.persisted_message_ttl,
-        dead_letter::DeadLetterConfig {
-            node_id: shared.node_id,
-            topic: options.dead_letter_topic,
-        },
+        dead_letter_config.clone(),
+    );
+    work_queue::spawn(
+        Arc::clone(&shared.broker),
+        dead_letter_config,
+        shared.metrics.clone(),
     );
     tokio::spawn(peering::spawn_discovery_dialer(
         discovered_rx,
@@ -401,15 +414,21 @@ pub fn spawn_with_tls(
             }
         });
     }
+    let dead_letter_config = dead_letter::DeadLetterConfig {
+        node_id: shared.node_id,
+        topic: options.dead_letter_topic,
+    };
     maybe_spawn_ttl_sweeper(
         store,
         &shared.broker,
         shared.metrics.clone(),
         options.persisted_message_ttl,
-        dead_letter::DeadLetterConfig {
-            node_id: shared.node_id,
-            topic: options.dead_letter_topic,
-        },
+        dead_letter_config.clone(),
+    );
+    work_queue::spawn(
+        Arc::clone(&shared.broker),
+        dead_letter_config,
+        shared.metrics.clone(),
     );
     tokio::spawn(peering::spawn_discovery_dialer(
         discovered_rx,

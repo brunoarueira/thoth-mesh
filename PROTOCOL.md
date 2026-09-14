@@ -31,8 +31,10 @@ hint on `Publish`), and
 [ADR-0046](docs/adr/0046-durable-subscriptions.md) (durable
 subscriptions via per-subscriber offset tracking), and
 [ADR-0047](docs/adr/0047-message-ttl-and-dead-lettering.md) (message
-TTL and dead-lettering). For diagrams of several of these flows, see
-[docs/FLOWS.md](docs/FLOWS.md).
+TTL and dead-lettering), and
+[ADR-0048](docs/adr/0048-work-queue-redelivery-for-consumer-groups.md)
+(work-queue redelivery for consumer groups). For diagrams of several
+of these flows, see [docs/FLOWS.md](docs/FLOWS.md).
 
 **Status:** version 1, and explicitly unstable — see ADR-0014. Nothing
 here should be assumed to hold across a breaking change; check
@@ -246,9 +248,9 @@ reply. See [Delivery semantics](#delivery-semantics) for what
 Registers interest in `filter` on this connection - a literal topic
 name or a wildcard pattern alike (ADR-0022). The node replies with an
 `Ack` once registered, or an `Error` instead if a `--topic-acl` (or,
-for a peer link, a `--peer-topic-acl`) refuses it, if `ack` and
-`group` are both set (see `group` below), or if `durable` is set and
-any of its own requirements aren't met (see `durable` below). A
+for a peer link, a `--peer-topic-acl`) refuses it, or if `durable` is
+set and any of its own requirements aren't met (see `durable` below,
+which does still refuse combining it with either `ack` or `group`). A
 wildcard `filter` is refused outright wherever either ACL is
 configured for this connection's role, regardless of what it would
 actually expand to - neither ACL is pattern-aware, and this codebase
@@ -302,13 +304,26 @@ group, round-robin, rather than every subscriber. Two different
 getting its own copy; *within* one group, only one member gets each
 message. A group member gets no replay-buffer catch-up on join and no
 lag recovery if it falls behind (unlike ordinary fan-out, ADR-0021/
-ADR-0024) - live delivery only, exactly as strong a guarantee as
-ordinary fire-and-forget, just applied once across the group instead
-of fanned out to everyone. `group: Some(_)` combined with `ack: true`
-is refused with an `Error` - what acknowledgement means for a group
-isn't defined by this protocol version. `#[serde(default)]` on the
+ADR-0024) - live delivery only. `#[serde(default)]` on the
 implementation side, same rolling-upgrade story as `ack`: a sender
 that omits `group` entirely gets `None`, unchanged fan-out behavior.
+
+Combined with `ack: true`, `group: Some(_)` means **work-queue**
+delivery instead of plain fire-and-forget
+([ADR-0048](docs/adr/0048-work-queue-redelivery-for-consumer-groups.md);
+refused outright in earlier protocol versions, ADR-0042): a delivery
+is provisional until *some* current member of the group - not
+necessarily the one it was originally sent to - acks it, and
+reclaimed (redelivered, via the same round-robin as any other
+delivery) if that doesn't happen before the redelivery timeout,
+exactly `DEFAULT_MAX_REDELIVERY_ATTEMPTS` times before it's given up
+on. Whether a `(filter, group)` pair is work-queue or plain
+fire-and-forget is decided once, by whichever `Subscribe` first
+creates it - a later join with a different `ack` doesn't change it,
+the same no-op-re-`Subscribe` rule above. `group: Some(_)` with no
+`ack` remains exactly as strong a guarantee as ordinary
+fire-and-forget, just applied once across the group instead of fanned
+out to everyone.
 
 `durable: true` makes this a durable subscription
 ([ADR-0046](docs/adr/0046-durable-subscriptions.md)): the node
@@ -590,9 +605,15 @@ guarantee:
   *at that moment* - no backlog on joining (ADR-0021 doesn't apply to
   a group), and a member that falls behind just misses what it missed,
   rather than recovering it the way an ordinary fan-out forwarder does
-  (ADR-0024). A group's overall delivery guarantee is exactly
-  fire-and-forget, applied once across the group rather than fanned
-  out to everyone in it.
+  (ADR-0024). A plain `group: Some(_)` (no `ack`) is exactly as strong
+  a guarantee as ordinary fire-and-forget, applied once across the
+  group rather than fanned out to everyone in it - `group` combined
+  with `ack: true` is stronger (work-queue delivery, reclaimable by
+  any live member until acked, see [`Subscribe`](#subscribe) and
+  [ADR-0048](docs/adr/0048-work-queue-redelivery-for-consumer-groups.md)),
+  but still has no backlog/lag-recovery of its own: a lease can only
+  ever be reclaimed by a member that's live *right now*, the same as
+  the very first delivery attempt.
 - **A retained message is per node, not per mesh.** `retain: true`
   (ADR-0043) gives a topic a last-value message that a later
   subscriber gets immediately, but each node only retains what it

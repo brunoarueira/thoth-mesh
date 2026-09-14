@@ -396,22 +396,25 @@ impl ConnectionContext {
     }
 
     /// Handles a `Subscribe { filter, ack, group, durable }` request:
-    /// refuses `ack: true` combined with a `group` outright (see the
-    /// `Error` case below), refuses `durable: true` combined with
-    /// `ack`, `group`, a wildcard `filter`, no TLS client certificate,
-    /// or no configured `MessageStore` (ADR-0046), authorizes what's
-    /// left against whichever ACL applies (ADR-0018/ADR-0020) -
-    /// refusing a wildcard filter outright wherever one does,
-    /// regardless of what it would expand to (ADR-0022) - registers a
-    /// genuinely new filter (ADR-0021, or ADR-0042 for a group, or
-    /// ADR-0046 for a durable subscription), acks, and, only on this
-    /// connection's first subscriber for `filter`, propagates the
-    /// interest transition to every peer link (ADR-0011).
-    /// `ack`/`group`/`durable` are only read the first time `filter` is
-    /// subscribed to on this connection - same as the rest of a no-op
-    /// re-`Subscribe`, it doesn't retroactively change an
-    /// already-registered subscription's mode. Returns `false` if the
-    /// outgoing queue has closed and the read loop should stop.
+    /// refuses `durable: true` combined with `ack`, `group`, a
+    /// wildcard `filter`, no TLS client certificate, or no configured
+    /// `MessageStore` (ADR-0046), authorizes what's left against
+    /// whichever ACL applies (ADR-0018/ADR-0020) - refusing a wildcard
+    /// filter outright wherever one does, regardless of what it would
+    /// expand to (ADR-0022) - registers a genuinely new filter
+    /// (ADR-0021, or ADR-0042 for a group, or ADR-0046 for a durable
+    /// subscription), acks, and, only on this connection's first
+    /// subscriber for `filter`, propagates the interest transition to
+    /// every peer link (ADR-0011). `ack: true` combined with `group:
+    /// Some(_)` is no longer refused (unlike ADR-0042's original v1) -
+    /// it means work-queue delivery for the group (ADR-0048), handled
+    /// entirely inside `Broker::join_group`/`publish` rather than
+    /// anything special here. `ack`/`group`/`durable` are only read
+    /// the first time `filter` is subscribed to on this connection -
+    /// same as the rest of a no-op re-`Subscribe`, it doesn't
+    /// retroactively change an already-registered subscription's
+    /// mode. Returns `false` if the outgoing queue has closed and the
+    /// read loop should stop.
     async fn handle_subscribe(
         &mut self,
         envelope: &Envelope,
@@ -420,17 +423,6 @@ impl ConnectionContext {
         group: Option<String>,
         durable: bool,
     ) -> bool {
-        if ack && group.is_some() {
-            tracing::warn!(sender = ?envelope.sender, %filter, "rejected: ack and group are not supported together (ADR-0042)");
-            let error = Envelope::new(
-                self.node_id,
-                MessageKind::Error {
-                    in_reply_to: Some(envelope.id),
-                    message: "ack and group are not supported together".to_owned(),
-                },
-            );
-            return self.send(error).await;
-        }
         if durable {
             let rejection = if ack {
                 Some("durable and ack are not supported together")
@@ -493,8 +485,10 @@ impl ConnectionContext {
             if let Some(group) = group {
                 // Direct push onto this connection's own outgoing_tx
                 // (ADR-0042) - no forwarder task, unlike every branch
-                // below.
-                broker.join_group(filter.clone(), group.clone(), outgoing_tx);
+                // below. `ack` requests work-queue delivery for this
+                // group (ADR-0048) - decided once, by whichever join
+                // creates the group; see `Broker::join_group`.
+                broker.join_group(filter.clone(), group.clone(), outgoing_tx, ack);
                 Subscription::Group(group)
             } else if durable {
                 // A literal topic is guaranteed by the rejection checks
@@ -718,26 +712,34 @@ impl ConnectionContext {
     /// Handles an `Ack { in_reply_to }` received from a client:
     /// forwards it to every forwarder on this connection that's
     /// tracking pending acknowledgements (ADR-0041) - i.e. every
-    /// filter subscribed to with `ack: true`; a consumer-group
-    /// subscription (ADR-0042) never has one, since `ack: true` and
-    /// `group` are mutually exclusive. Best-effort
-    /// (`try_send`, not awaited): a forwarder whose ack channel is
-    /// momentarily full just resends on its next timeout instead of
-    /// retiring the entry a little early - at-least-once delivery
-    /// already tolerates a redundant resend, so this never causes
-    /// incorrect behavior, only an occasional extra one. Never fails
-    /// the connection - nothing here writes back to this link, and an
-    /// `in_reply_to` that matches none of this connection's own
-    /// forwarders (e.g. a stale or malicious ack) is simply ignored
-    /// everywhere it's tried.
+    /// filter subscribed to with `ack: true` - and, for every
+    /// consumer-group membership on this connection (ADR-0042), also
+    /// tries clearing that `(filter, group)`'s work-queue lease for
+    /// this id (ADR-0048; a no-op if that group isn't ack-tracked, or
+    /// if the id names something else entirely). Best-effort
+    /// (`try_send`, not awaited, for the per-forwarder case): a
+    /// forwarder whose ack channel is momentarily full just resends on
+    /// its next timeout instead of retiring the entry a little early -
+    /// at-least-once delivery already tolerates a redundant resend, so
+    /// this never causes incorrect behavior, only an occasional extra
+    /// one. Never fails the connection - nothing here writes back to
+    /// this link, and an `in_reply_to` that matches nothing this
+    /// connection is tracking anywhere (e.g. a stale or malicious ack)
+    /// is simply ignored everywhere it's tried.
     fn handle_ack(&self, in_reply_to: MessageId) {
-        for subscription in self.forwarders.values() {
-            if let Subscription::Forwarder(Forwarder {
-                ack_tx: Some(ack_tx),
-                ..
-            }) = subscription
-            {
-                let _ = ack_tx.try_send(in_reply_to);
+        for (filter, subscription) in &self.forwarders {
+            match subscription {
+                Subscription::Forwarder(Forwarder {
+                    ack_tx: Some(ack_tx),
+                    ..
+                }) => {
+                    let _ = ack_tx.try_send(in_reply_to);
+                }
+                Subscription::Group(group) => {
+                    self.broker
+                        .ack_group_delivery(filter.clone(), group.clone(), in_reply_to);
+                }
+                _ => {}
             }
         }
     }
