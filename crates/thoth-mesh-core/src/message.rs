@@ -137,6 +137,23 @@ pub enum MessageKind {
         /// this field decodes as `None`.
         #[serde(default)]
         content_type: Option<String>,
+        /// Marks this publish as a *request* expecting a reply on this
+        /// topic - a plain, ordinary `Topic`, never interpreted or
+        /// validated by the node, purely a convention two cooperating
+        /// clients follow. A responder republishes its answer here,
+        /// naming the request's own `id` in its own `in_reply_to`
+        /// below. `#[serde(default)]` so an older sender omitting this
+        /// field decodes as `None` - just an ordinary publish, exactly
+        /// as before this ADR. See ADR-0050.
+        #[serde(default)]
+        reply_to: Option<Topic>,
+        /// Marks this publish as a *reply* to the request whose own
+        /// `id` is named here - the same by-`id` correlation `Ack`
+        /// already uses (ADR-0041), reused rather than inventing a
+        /// second one. `#[serde(default)]` so an older sender omitting
+        /// this field decodes as `None`. See ADR-0050.
+        #[serde(default)]
+        in_reply_to: Option<MessageId>,
     },
     /// Subscribe to a topic filter - a plain topic name, or one
     /// containing MQTT-style wildcard segments (see ADR-0022).
@@ -221,6 +238,8 @@ mod tests {
     use super::*;
     use std::str::FromStr;
 
+    use crate::envelope::Envelope;
+
     #[test]
     fn new_ids_are_distinct_and_ordered() {
         let a = MessageId::new();
@@ -260,12 +279,24 @@ mod tests {
                 payload: vec![1, 2, 3],
                 retain: false,
                 content_type: None,
+                reply_to: None,
+                in_reply_to: None,
             },
             MessageKind::Publish {
                 topic: topic.clone(),
                 payload: vec![1, 2, 3],
                 retain: true,
                 content_type: Some("application/json".to_owned()),
+                reply_to: None,
+                in_reply_to: None,
+            },
+            MessageKind::Publish {
+                topic: topic.clone(),
+                payload: vec![4, 5, 6],
+                retain: false,
+                content_type: None,
+                reply_to: Some(Topic::from_str("replies.rpc").unwrap()),
+                in_reply_to: Some(MessageId::new()),
             },
             MessageKind::Subscribe {
                 filter: topic.clone().into(),
@@ -479,6 +510,8 @@ mod tests {
                 payload: vec![1, 2, 3],
                 retain: false,
                 content_type: None,
+                reply_to: None,
+                in_reply_to: None,
             }
         );
     }
@@ -517,7 +550,89 @@ mod tests {
                 payload: vec![1, 2, 3],
                 retain: true,
                 content_type: None,
+                reply_to: None,
+                in_reply_to: None,
             }
         );
+    }
+
+    /// A `Publish` encoded without `reply_to`/`in_reply_to` at all - a
+    /// sender from before ADR-0050 - still decodes, defaulting both to
+    /// `None`: an ordinary publish, not a request or a reply.
+    #[test]
+    fn publish_without_reply_to_or_in_reply_to_fields_decodes_as_none() {
+        let topic = Topic::from_str("weather.updates").unwrap();
+
+        #[derive(Serialize)]
+        enum PreAdr0050 {
+            Publish {
+                topic: Topic,
+                payload: Vec<u8>,
+                retain: bool,
+                content_type: Option<String>,
+            },
+        }
+
+        let mut bytes = Vec::new();
+        ciborium::into_writer(
+            &PreAdr0050::Publish {
+                topic: topic.clone(),
+                payload: vec![1, 2, 3],
+                retain: false,
+                content_type: Some("application/json".to_owned()),
+            },
+            &mut bytes,
+        )
+        .unwrap();
+        let decoded: MessageKind = ciborium::from_reader(&bytes[..]).unwrap();
+        assert_eq!(
+            decoded,
+            MessageKind::Publish {
+                topic,
+                payload: vec![1, 2, 3],
+                retain: false,
+                content_type: Some("application/json".to_owned()),
+                reply_to: None,
+                in_reply_to: None,
+            }
+        );
+    }
+
+    /// A request (`reply_to` set) and its reply (`in_reply_to` naming
+    /// the request's own `id`) both round-trip through CBOR intact -
+    /// the two new fields are ordinary data, not special-cased by
+    /// encoding/decoding in any way. See ADR-0050.
+    #[test]
+    fn reply_to_and_in_reply_to_round_trip_through_cbor() {
+        let topic = Topic::from_str("rpc.add").unwrap();
+        let reply_to = Topic::from_str("replies.rpc").unwrap();
+        let request = Envelope::new(
+            PeerId::new(),
+            MessageKind::Publish {
+                topic: topic.clone(),
+                payload: vec![1, 2],
+                retain: false,
+                content_type: None,
+                reply_to: Some(reply_to.clone()),
+                in_reply_to: None,
+            },
+        );
+        let reply = Envelope::new(
+            PeerId::new(),
+            MessageKind::Publish {
+                topic: reply_to,
+                payload: vec![3],
+                retain: false,
+                content_type: None,
+                reply_to: None,
+                in_reply_to: Some(request.id),
+            },
+        );
+
+        for envelope in [&request, &reply] {
+            let bytes = envelope.to_bytes().unwrap();
+            let decoded = Envelope::from_bytes(&bytes).unwrap();
+            assert_eq!(&decoded, envelope);
+        }
     }
 }

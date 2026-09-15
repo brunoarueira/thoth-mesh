@@ -168,6 +168,8 @@ async fn run_once(hops: usize) -> BenchResult {
                     payload: vec![0u8; PAYLOAD_SIZE],
                     retain: false,
                     content_type: None,
+                    reply_to: None,
+                    in_reply_to: None,
                 },
             );
             send(&mut publisher, &envelope).await;

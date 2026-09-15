@@ -227,6 +227,27 @@ isn't. A MIME type is only a convention: the node never checks or
 interprets the value, it just forwards it (see
 [ADR-0044](adr/0044-content-type-hint-on-publish.md)).
 
+`thoth-mesh request <topic> <payload> [--timeout-secs <secs>]` is
+RPC-style call/response built on top of ordinary pub/sub (see
+[ADR-0050](adr/0050-request-reply-over-pubsub.md)): it subscribes to a
+fresh, private reply topic, publishes `payload` to `topic` naming that
+reply topic in the request's `reply_to`, then waits (5s by default) for
+a `Publish` there whose `in_reply_to` names the request's own message
+id, and prints it exactly like `subscribe` does (`--output`/
+`--content-type` work the same way here too). Nothing replies?
+`request` exits non-zero with a message on stderr rather than hanging.
+There's no corresponding `thoth-mesh respond` command - a responder is
+conceptually just `subscribe`'s existing delivery loop plus a
+hand-written reply naming the request's `reply_to`/id, but `publish`
+has no flags for either field today, so writing one currently means
+speaking the wire protocol directly (see
+[`PROTOCOL.md`](../PROTOCOL.md#publish)) rather than the `publish`
+subcommand as-is. If a request topic has more than one ordinary
+subscriber, every one of them can see and reply to it - `request`
+returns whichever reply arrives first. Route the request through a
+consumer group (`--group` on the responder side's `subscribe`) instead
+if exactly one responder should ever see it.
+
 Every node and CLI invocation picks a fresh random `PeerId` on
 startup, with one exception: given `--tls-cert`/`--tls-key`, a node or
 CLI invocation derives its `PeerId` from that certificate's SHA-256
