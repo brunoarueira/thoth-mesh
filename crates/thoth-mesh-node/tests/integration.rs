@@ -77,6 +77,8 @@ async fn publish_until_delivered(
         payload: payload.to_vec(),
         retain: false,
         content_type: None,
+        reply_to: None,
+        in_reply_to: None,
     };
     let deadline = tokio::time::Instant::now() + TEST_TIMEOUT;
     loop {
@@ -198,6 +200,8 @@ async fn publish_delivers_to_subscriber() {
             payload: b"sunny".to_vec(),
             retain: false,
             content_type: None,
+            reply_to: None,
+            in_reply_to: None,
         },
     );
     send(&mut publisher, &publish).await;
@@ -238,6 +242,8 @@ async fn a_content_type_hint_reaches_the_subscriber_unchanged() {
             payload: br#"{"temp":21}"#.to_vec(),
             retain: false,
             content_type: Some("application/json".to_owned()),
+            reply_to: None,
+            in_reply_to: None,
         },
     );
     send(&mut publisher, &publish).await;
@@ -246,6 +252,95 @@ async fn a_content_type_hint_reaches_the_subscriber_unchanged() {
     match delivered.kind {
         MessageKind::Publish { content_type, .. } => {
             assert_eq!(content_type, Some("application/json".to_owned()));
+        }
+        other => panic!("expected a Publish, got {other:?}"),
+    }
+}
+
+/// `reply_to`/`in_reply_to` (ADR-0050) are carried through delivery
+/// verbatim, exactly like `content_type` above - the node has no
+/// notion of "this is a request/reply" and never touches either
+/// field. Covers a request publish (`reply_to` set) and, separately, a
+/// reply publish (`in_reply_to` set) reaching their own subscribers
+/// unchanged.
+#[tokio::test]
+async fn reply_to_and_in_reply_to_reach_the_subscriber_unchanged() {
+    let addr = spawn_test_node().await;
+    let mut subscriber = connect(addr).await;
+    let mut publisher = connect(addr).await;
+
+    let sub = Envelope::new(
+        PeerId::new(),
+        MessageKind::Subscribe {
+            filter: topic("rpc.add").into(),
+            ack: false,
+            group: None,
+            durable: false,
+        },
+    );
+    send(&mut subscriber, &sub).await;
+    recv(&mut subscriber).await; // subscribe ack
+
+    let request = Envelope::new(
+        PeerId::new(),
+        MessageKind::Publish {
+            topic: topic("rpc.add"),
+            payload: b"1+1".to_vec(),
+            retain: false,
+            content_type: None,
+            reply_to: Some(topic("rpc.add.replies")),
+            in_reply_to: None,
+        },
+    );
+    send(&mut publisher, &request).await;
+
+    let delivered = recv(&mut subscriber).await;
+    match delivered.kind {
+        MessageKind::Publish {
+            reply_to,
+            in_reply_to,
+            ..
+        } => {
+            assert_eq!(reply_to, Some(topic("rpc.add.replies")));
+            assert_eq!(in_reply_to, None);
+        }
+        other => panic!("expected a Publish, got {other:?}"),
+    }
+
+    let sub_replies = Envelope::new(
+        PeerId::new(),
+        MessageKind::Subscribe {
+            filter: topic("rpc.add.replies").into(),
+            ack: false,
+            group: None,
+            durable: false,
+        },
+    );
+    send(&mut subscriber, &sub_replies).await;
+    recv(&mut subscriber).await; // subscribe ack
+
+    let reply = Envelope::new(
+        PeerId::new(),
+        MessageKind::Publish {
+            topic: topic("rpc.add.replies"),
+            payload: b"2".to_vec(),
+            retain: false,
+            content_type: None,
+            reply_to: None,
+            in_reply_to: Some(delivered.id),
+        },
+    );
+    send(&mut publisher, &reply).await;
+
+    let delivered_reply = recv(&mut subscriber).await;
+    match delivered_reply.kind {
+        MessageKind::Publish {
+            reply_to,
+            in_reply_to,
+            ..
+        } => {
+            assert_eq!(reply_to, None);
+            assert_eq!(in_reply_to, Some(delivered.id));
         }
         other => panic!("expected a Publish, got {other:?}"),
     }
@@ -282,6 +377,8 @@ async fn an_acked_subscription_delivers_and_accepts_the_clients_ack() {
             payload: b"sunny".to_vec(),
             retain: false,
             content_type: None,
+            reply_to: None,
+            in_reply_to: None,
         },
     );
     send(&mut publisher, &publish).await;
@@ -306,6 +403,8 @@ async fn an_acked_subscription_delivers_and_accepts_the_clients_ack() {
             payload: b"cloudy".to_vec(),
             retain: false,
             content_type: None,
+            reply_to: None,
+            in_reply_to: None,
         },
     );
     send(&mut publisher, &second_publish).await;
@@ -354,6 +453,8 @@ async fn ack_and_group_together_is_accepted_as_work_queue_delivery() {
             payload: b"sunny".to_vec(),
             retain: false,
             content_type: None,
+            reply_to: None,
+            in_reply_to: None,
         },
     );
     send(&mut publisher, &publish).await;
@@ -377,6 +478,8 @@ async fn ack_and_group_together_is_accepted_as_work_queue_delivery() {
             payload: b"cloudy".to_vec(),
             retain: false,
             content_type: None,
+            reply_to: None,
+            in_reply_to: None,
         },
     );
     send(&mut publisher, &second_publish).await;
@@ -418,6 +521,8 @@ async fn consumer_group_round_robins_across_two_members() {
                 payload: format!("update {i}").into_bytes(),
                 retain: false,
                 content_type: None,
+                reply_to: None,
+                in_reply_to: None,
             },
         );
         send(&mut publisher, &publish).await;
@@ -483,6 +588,8 @@ async fn a_group_member_that_unsubscribes_is_dropped_from_the_rotation() {
                 payload: format!("update {i}").into_bytes(),
                 retain: false,
                 content_type: None,
+                reply_to: None,
+                in_reply_to: None,
             },
         );
         send(&mut publisher, &publish).await;
@@ -536,6 +643,8 @@ async fn unsubscribing_from_a_group_leaves_it() {
             payload: b"anybody?".to_vec(),
             retain: false,
             content_type: None,
+            reply_to: None,
+            in_reply_to: None,
         },
     );
     send(&mut publisher, &publish).await;
@@ -571,6 +680,8 @@ async fn multiple_subscribers_all_receive() {
             payload: b"sunny".to_vec(),
             retain: false,
             content_type: None,
+            reply_to: None,
+            in_reply_to: None,
         },
     );
     send(&mut publisher, &publish).await;
@@ -591,6 +702,8 @@ async fn a_late_subscriber_is_replayed_a_publish_that_happened_before_it_subscri
             payload: b"sunny".to_vec(),
             retain: false,
             content_type: None,
+            reply_to: None,
+            in_reply_to: None,
         },
     );
     send(&mut publisher, &publish).await;
@@ -632,6 +745,8 @@ async fn a_retained_publish_reaches_a_wildcard_subscriber_that_connects_afterwar
             payload: b"21C".to_vec(),
             retain: true,
             content_type: None,
+            reply_to: None,
+            in_reply_to: None,
         },
     );
     send(&mut publisher, &retained).await;
@@ -670,6 +785,8 @@ async fn an_empty_retained_publish_clears_the_retained_message() {
                 payload: payload.to_vec(),
                 retain: true,
                 content_type: None,
+                reply_to: None,
+                in_reply_to: None,
             },
         );
         send(&mut publisher, &publish).await;
@@ -716,6 +833,8 @@ async fn resubscribing_to_an_already_subscribed_topic_does_not_replay_again() {
             payload: b"sunny".to_vec(),
             retain: false,
             content_type: None,
+            reply_to: None,
+            in_reply_to: None,
         },
     );
     send(&mut publisher, &publish).await;
@@ -780,6 +899,8 @@ async fn unsubscribed_client_does_not_receive_publish() {
             payload: b"sunny".to_vec(),
             retain: false,
             content_type: None,
+            reply_to: None,
+            in_reply_to: None,
         },
     );
     send(&mut publisher, &publish).await;
@@ -812,6 +933,8 @@ async fn distinct_topics_do_not_cross_deliver() {
             payload: b"jam".to_vec(),
             retain: false,
             content_type: None,
+            reply_to: None,
+            in_reply_to: None,
         },
     );
     send(&mut publisher, &publish).await;
@@ -846,6 +969,8 @@ async fn a_wildcard_subscriber_receives_a_matching_publish() {
             payload: b"sunny".to_vec(),
             retain: false,
             content_type: None,
+            reply_to: None,
+            in_reply_to: None,
         },
     );
     send(&mut publisher, &publish).await;
@@ -879,6 +1004,8 @@ async fn a_wildcard_subscriber_does_not_receive_a_non_matching_publish() {
             payload: b"jam".to_vec(),
             retain: false,
             content_type: None,
+            reply_to: None,
+            in_reply_to: None,
         },
     );
     send(&mut publisher, &publish).await;
@@ -915,6 +1042,8 @@ async fn an_exact_and_a_matching_wildcard_subscriber_on_the_same_connection_both
             payload: b"sunny".to_vec(),
             retain: false,
             content_type: None,
+            reply_to: None,
+            in_reply_to: None,
         },
     );
     send(&mut publisher, &publish).await;
@@ -1079,6 +1208,8 @@ async fn dial_side_peer_link_forwards_local_publishes_once_subscribed() {
             payload: b"sunny".to_vec(),
             retain: false,
             content_type: None,
+            reply_to: None,
+            in_reply_to: None,
         },
     );
     send(&mut publisher, &publish).await;
@@ -1135,6 +1266,8 @@ async fn a_peer_links_wildcard_interest_propagates_and_receives_a_matching_publi
             payload: b"sunny".to_vec(),
             retain: false,
             content_type: None,
+            reply_to: None,
+            in_reply_to: None,
         },
     );
     send(&mut publisher, &publish).await;
@@ -1187,6 +1320,8 @@ async fn multi_hop_interest_propagates_across_a_chain_of_peers() {
             payload: b"sunny".to_vec(),
             retain: false,
             content_type: None,
+            reply_to: None,
+            in_reply_to: None,
         }
     );
 }
@@ -1255,6 +1390,8 @@ async fn loop_prevention_stops_a_publish_from_bouncing_forever() {
             payload: b"final".to_vec(),
             retain: false,
             content_type: None,
+            reply_to: None,
+            in_reply_to: None,
         },
     );
     send(&mut connect(addr_a).await, &publish).await;
@@ -1436,6 +1573,8 @@ async fn status_request_reports_a_metrics_summary_reflecting_activity() {
             payload: b"sunny".to_vec(),
             retain: false,
             content_type: None,
+            reply_to: None,
+            in_reply_to: None,
         },
     );
     send(&mut client, &publish).await;
@@ -1486,6 +1625,8 @@ async fn a_restarted_node_rehydrates_replay_history_and_retained_values_from_dis
             payload: b"21C".to_vec(),
             retain: true,
             content_type: Some("text/plain".to_owned()),
+            reply_to: None,
+            in_reply_to: None,
         },
     );
     let plain = Envelope::new(
@@ -1495,6 +1636,8 @@ async fn a_restarted_node_rehydrates_replay_history_and_retained_values_from_dis
             payload: b"sunny".to_vec(),
             retain: false,
             content_type: None,
+            reply_to: None,
+            in_reply_to: None,
         },
     );
     send(&mut publisher, &retained).await;

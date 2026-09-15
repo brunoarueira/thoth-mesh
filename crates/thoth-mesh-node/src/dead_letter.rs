@@ -87,6 +87,8 @@ pub async fn dead_letter(broker: &Broker, config: &DeadLetterConfig, original: &
             payload: payload.clone(),
             retain: false,
             content_type: content_type.clone(),
+            reply_to: None,
+            in_reply_to: None,
         },
     );
     broker.publish(&destination, Arc::new(envelope)).await;
@@ -106,6 +108,8 @@ mod tests {
                 payload: payload.to_vec(),
                 retain: false,
                 content_type: Some("text/plain".to_owned()),
+                reply_to: None,
+                in_reply_to: None,
             },
         )
     }
@@ -139,6 +143,7 @@ mod tests {
                 payload,
                 retain,
                 content_type,
+                ..
             } => {
                 assert_eq!(topic, &destination);
                 assert_eq!(payload, b"sunny");

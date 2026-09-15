@@ -620,6 +620,7 @@ impl ConnectionContext {
             payload,
             retain,
             content_type,
+            ..
         } = &envelope.kind
         else {
             unreachable!("handle_publish is only ever called for a Publish envelope");
@@ -1565,6 +1566,8 @@ mod tests {
                     payload: i.to_be_bytes().to_vec(),
                     retain: false,
                     content_type: None,
+                    reply_to: None,
+                    in_reply_to: None,
                 },
             );
             broker.publish(topic, Arc::new(envelope)).await;
@@ -1698,6 +1701,8 @@ mod tests {
                 payload: b"sunny".to_vec(),
                 retain: false,
                 content_type: None,
+                reply_to: None,
+                in_reply_to: None,
             },
         );
         broker.publish(&topic, Arc::new(envelope.clone())).await;
@@ -1758,6 +1763,8 @@ mod tests {
                 payload: b"sunny".to_vec(),
                 retain: false,
                 content_type: None,
+                reply_to: None,
+                in_reply_to: None,
             },
         );
         broker.publish(&topic, Arc::new(envelope.clone())).await;
@@ -1820,6 +1827,8 @@ mod tests {
                 payload: b"sunny".to_vec(),
                 retain: false,
                 content_type: None,
+                reply_to: None,
+                in_reply_to: None,
             },
         );
         broker.publish(&topic, Arc::new(envelope.clone())).await;

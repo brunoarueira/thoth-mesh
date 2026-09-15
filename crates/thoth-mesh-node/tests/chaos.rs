@@ -96,6 +96,8 @@ async fn a_restarted_peer_reconnects_as_a_new_identity_with_no_leftover_duplicat
             payload: b"before".to_vec(),
             retain: false,
             content_type: None,
+            reply_to: None,
+            in_reply_to: None,
         },
     );
     send(&mut connect(addr_b).await, &before).await;
@@ -151,6 +153,8 @@ async fn a_restarted_peer_reconnects_as_a_new_identity_with_no_leftover_duplicat
             payload: b"after".to_vec(),
             retain: false,
             content_type: None,
+            reply_to: None,
+            in_reply_to: None,
         },
     );
     send(&mut connect(addr_b).await, &after).await;

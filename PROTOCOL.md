@@ -35,8 +35,10 @@ TTL and dead-lettering), and
 [ADR-0048](docs/adr/0048-work-queue-redelivery-for-consumer-groups.md)
 (work-queue redelivery for consumer groups), and
 [ADR-0049](docs/adr/0049-selective-per-peer-link-topic-filtering.md)
-(selective per-peer-link topic filtering). For diagrams of several of
-these flows, see [docs/FLOWS.md](docs/FLOWS.md).
+(selective per-peer-link topic filtering), and
+[ADR-0050](docs/adr/0050-request-reply-over-pubsub.md) (request/reply
+over pub/sub). For diagrams of several of these flows, see
+[docs/FLOWS.md](docs/FLOWS.md).
 
 **Status:** version 1, and explicitly unstable — see ADR-0014. Nothing
 here should be assumed to hold across a breaking change; check
@@ -200,7 +202,7 @@ out: it's a bare string, not a one-entry map with a `null` value.
 ### `Publish`
 
 ```
-{"Publish": {"topic": <Topic>, "payload": <bytes>, "retain": <bool>, "content_type": <string | null>}}
+{"Publish": {"topic": <Topic>, "payload": <bytes>, "retain": <bool>, "content_type": <string | null>, "reply_to": <Topic | null>, "in_reply_to": <MessageId | null>}}
 ```
 
 Publishes `payload` to `topic`. `payload` is an arbitrary byte string
@@ -240,6 +242,27 @@ anything the replay window would also deliver. A retained value is
 along in a forwarded envelope so a peer that receives a `retain: true`
 publish retains it locally too (this is not a mesh-wide retained-state
 sync — see ADR-0043).
+
+`reply_to` and `in_reply_to` (both `#[serde(default)]` — an older
+sender that omits either means `null`) are the request/reply
+convention ([ADR-0050](docs/adr/0050-request-reply-over-pubsub.md)):
+purely opaque, purely conventional metadata that a node never
+validates or acts on, carried through delivery, persistence, replay,
+and cross-peer forwarding exactly like `content_type`. A **request**
+is an ordinary `Publish` with `reply_to` set to the `Topic` its answer
+should be published to; a **reply** is an ordinary `Publish` (to that
+topic) with `in_reply_to` set to the request envelope's own `id` — the
+same by-`id` correlation `Ack` already uses. Nothing about either field
+changes how this `Publish` is otherwise handled: it persists, replays,
+retains, gets dead-lettered, and routes through consumer groups exactly
+like any other `Publish`. A requester that wants at most one responder
+gets it by making the request topic a consumer group (`group`,
+[ADR-0042](docs/adr/0042-consumer-groups.md)) rather than an ordinary
+fan-out subscription — a fan-out request topic with more than one
+subscriber can produce more than one reply, all carrying the same
+`in_reply_to`. There is no server-side timeout or redelivery for an
+unanswered request; a requester that gives up waiting does so entirely
+on its own.
 
 No reply is sent for a `Publish` — it's fire-and-forget from the
 sender's point of view, unless a `--topic-acl`

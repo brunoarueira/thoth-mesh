@@ -361,6 +361,8 @@ mod tests {
                 payload: b"sunny".to_vec(),
                 retain: false,
                 content_type: None,
+                reply_to: None,
+                in_reply_to: None,
             },
         );
         broker

@@ -989,6 +989,8 @@ mod tests {
                 payload: payload.to_vec(),
                 retain: false,
                 content_type: None,
+                reply_to: None,
+                in_reply_to: None,
             },
         ))
     }
@@ -1816,6 +1818,8 @@ mod tests {
                 payload: payload.to_vec(),
                 retain: true,
                 content_type: None,
+                reply_to: None,
+                in_reply_to: None,
             },
         ))
     }

@@ -57,6 +57,8 @@ mod tests {
                 payload: vec![1, 2, 3],
                 retain: false,
                 content_type: None,
+                reply_to: None,
+                in_reply_to: None,
             },
             MessageKind::Subscribe {
                 filter: topic.clone().into(),

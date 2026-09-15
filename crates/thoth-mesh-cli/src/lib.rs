@@ -12,6 +12,7 @@ mod config;
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use thoth_mesh_core::{
@@ -92,6 +93,31 @@ pub enum Command {
         /// the node. See ADR-0044.
         #[arg(long)]
         content_type: Option<String>,
+    },
+    /// Send a request and wait for the reply, then print it and exit -
+    /// RPC-style call/response over pub/sub (ADR-0050). Subscribes to
+    /// a fresh, private topic first, publishes to `topic` with that as
+    /// `reply_to`, then waits for a `Publish` there naming this
+    /// request's own id in `in_reply_to`. A non-zero exit and a
+    /// message on stderr if nothing replies within `--timeout`.
+    Request {
+        /// Topic to send the request to.
+        topic: String,
+        /// Payload to send, as UTF-8 text - or `-` to read the
+        /// payload as raw bytes from stdin instead, same as
+        /// `publish`'s own payload argument (ADR-0035).
+        payload: String,
+        /// Optional hint at what the payload is, same convention as
+        /// `publish --content-type` (ADR-0044).
+        #[arg(long)]
+        content_type: Option<String>,
+        /// How to print the reply: `text` (default) or `raw`, same as
+        /// `subscribe --output` (ADR-0035).
+        #[arg(long, value_enum, default_value_t = OutputMode::Text)]
+        output: OutputMode,
+        /// How long to wait for a reply before giving up.
+        #[arg(long, default_value_t = 5)]
+        timeout_secs: u64,
     },
     /// Subscribe to one or more topic filters and print delivered
     /// messages until interrupted (Ctrl-C).
@@ -176,6 +202,9 @@ pub async fn run(cli: Cli) -> std::io::Result<()> {
         Command::Publish { topic, .. } => {
             parse_topic(topic)?;
         }
+        Command::Request { topic, .. } => {
+            parse_topic(topic)?;
+        }
         Command::Subscribe { filters, .. } => {
             for filter in filters {
                 parse_filter(filter)?;
@@ -220,9 +249,31 @@ pub async fn run(cli: Cli) -> std::io::Result<()> {
                     payload,
                     retain,
                     content_type,
+                    reply_to: None,
+                    in_reply_to: None,
                 },
             );
             send(&mut conn, &envelope).await
+        }
+        Command::Request {
+            topic,
+            payload,
+            content_type,
+            output,
+            timeout_secs,
+        } => {
+            let topic = parse_topic(&topic)?;
+            let payload = read_payload(&payload, tokio::io::stdin()).await?;
+            request_and_print(
+                &mut conn,
+                sender,
+                topic,
+                payload,
+                content_type,
+                output,
+                Duration::from_secs(timeout_secs),
+            )
+            .await
         }
         Command::Subscribe {
             filters,
@@ -487,6 +538,100 @@ async fn subscribe_all(
         }
     }
     Ok(backlog)
+}
+
+/// Sends a request `Publish` to `topic` (`reply_to` set to a fresh,
+/// per-call ephemeral topic named after a freshly generated
+/// `MessageId` - never derived from `sender`, which stays stable
+/// across invocations when a TLS identity is configured and would
+/// otherwise collide between two concurrent `request` calls using the
+/// same certificate) and waits, up to `timeout`, for a `Publish` on
+/// that topic naming this request's own `id` in `in_reply_to`. Returns
+/// a `TimedOut` error if nothing arrives in time. Subscribes to the
+/// reply topic *before* publishing the request, so a fast responder's
+/// reply can't possibly arrive before this is listening for it. See
+/// ADR-0050.
+///
+/// Kept separate from printing (see [`request_and_print`]) for the
+/// same reason [`request_status`]/[`subscribe_all`] are: testable
+/// without capturing stdout.
+async fn request(
+    conn: &mut Compat<MaybeTlsStream>,
+    sender: PeerId,
+    topic: Topic,
+    payload: Vec<u8>,
+    content_type: Option<String>,
+    timeout: Duration,
+) -> std::io::Result<Envelope> {
+    let reply_to: Topic = format!(
+        "reply.{}",
+        MessageId::new()
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    )
+    .parse()
+    .expect("a hex-suffixed reply topic is always a valid Topic");
+
+    subscribe_all(conn, sender, &[reply_to.clone().into()], false, None, false).await?;
+
+    let request = Envelope::new(
+        sender,
+        MessageKind::Publish {
+            topic,
+            payload,
+            retain: false,
+            content_type,
+            reply_to: Some(reply_to),
+            in_reply_to: None,
+        },
+    );
+    send(conn, &request).await?;
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    let timed_out = || {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("no reply within {timeout:?}"),
+        )
+    };
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(timed_out());
+        }
+        let envelope = tokio::time::timeout(remaining, recv(conn))
+            .await
+            .map_err(|_| timed_out())??;
+        if let MessageKind::Publish {
+            in_reply_to: Some(id),
+            ..
+        } = &envelope.kind
+            && *id == request.id
+        {
+            return Ok(envelope);
+        }
+        // Not our reply (another Ack/unrelated Publish on this
+        // connection) - keep waiting, still bound by the same
+        // deadline.
+    }
+}
+
+/// Sends a request via [`request`], then prints the reply exactly like
+/// `subscribe`'s own delivery printing (`--output text`/`raw`, ADR-0035).
+async fn request_and_print(
+    conn: &mut Compat<MaybeTlsStream>,
+    sender: PeerId,
+    topic: Topic,
+    payload: Vec<u8>,
+    content_type: Option<String>,
+    output: OutputMode,
+    timeout: Duration,
+) -> std::io::Result<()> {
+    let reply = request(conn, sender, topic, payload, content_type, timeout).await?;
+    print_if_publish(&reply, output)?;
+    Ok(())
 }
 
 /// A `StatusReply`'s payload, minus `in_reply_to` - already consumed
@@ -926,6 +1071,8 @@ mod tests {
                     payload: b"jam".to_vec(),
                     retain: false,
                     content_type: None,
+                    reply_to: None,
+                    in_reply_to: None,
                 },
             ),
         )
@@ -943,6 +1090,8 @@ mod tests {
                 payload: b"jam".to_vec(),
                 retain: false,
                 content_type: None,
+                reply_to: None,
+                in_reply_to: None,
             }
         );
     }
@@ -1121,6 +1270,8 @@ mod tests {
                     payload: b"sunny".to_vec(),
                     retain: false,
                     content_type: None,
+                    reply_to: None,
+                    in_reply_to: None,
                 },
             ),
         )
@@ -1138,6 +1289,8 @@ mod tests {
                 payload: b"sunny".to_vec(),
                 retain: false,
                 content_type: None,
+                reply_to: None,
+                in_reply_to: None,
             }
         );
     }
@@ -1209,6 +1362,8 @@ mod tests {
                         payload,
                         retain: false,
                         content_type: None,
+                        reply_to: None,
+                        in_reply_to: None,
                     },
                 ),
             )
@@ -1276,6 +1431,8 @@ mod tests {
                         payload: b"sunny".to_vec(),
                         retain: false,
                         content_type: None,
+                        reply_to: None,
+                        in_reply_to: None,
                     },
                 ),
             )
@@ -1330,6 +1487,8 @@ mod tests {
                 payload: b"sunny".to_vec(),
                 retain: false,
                 content_type: None,
+                reply_to: None,
+                in_reply_to: None,
             }
         );
     }
@@ -1539,6 +1698,8 @@ mod tests {
                 payload: b"sunny".to_vec(),
                 retain: false,
                 content_type: None,
+                reply_to: None,
+                in_reply_to: None,
             }
         );
 
@@ -1562,5 +1723,90 @@ mod tests {
             .unwrap();
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A responder receiving the request gets exactly the `reply_to`
+    /// topic and `id` `request` published with, and a reply it
+    /// publishes there - naming that `id` in its own `in_reply_to` -
+    /// is what `request` returns. See ADR-0050.
+    #[tokio::test]
+    async fn request_receives_and_returns_the_matching_reply() {
+        let addr = spawn_test_node().await;
+        let mut requester = connect(addr).await;
+        let mut responder = connect(addr).await;
+
+        let request_topic: TopicFilter = "rpc.add".parse().unwrap();
+        subscribe(&mut responder, PeerId::new(), request_topic)
+            .await
+            .unwrap();
+
+        let requester_task = tokio::spawn(async move {
+            request(
+                &mut requester,
+                PeerId::new(),
+                "rpc.add".parse().unwrap(),
+                b"1+1".to_vec(),
+                None,
+                TEST_TIMEOUT,
+            )
+            .await
+        });
+
+        let received = timeout(TEST_TIMEOUT, recv(&mut responder))
+            .await
+            .unwrap()
+            .unwrap();
+        let MessageKind::Publish {
+            payload,
+            reply_to: Some(reply_to),
+            ..
+        } = received.kind
+        else {
+            panic!("expected a Publish carrying reply_to");
+        };
+        assert_eq!(payload, b"1+1");
+
+        let reply = Envelope::new(
+            PeerId::new(),
+            MessageKind::Publish {
+                topic: reply_to,
+                payload: b"2".to_vec(),
+                retain: false,
+                content_type: None,
+                reply_to: None,
+                in_reply_to: Some(received.id),
+            },
+        );
+        send(&mut responder, &reply).await.unwrap();
+
+        let returned = timeout(TEST_TIMEOUT, requester_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        match returned.kind {
+            MessageKind::Publish { payload, .. } => assert_eq!(payload, b"2"),
+            other => panic!("expected a Publish, got {other:?}"),
+        }
+    }
+
+    /// No responder ever replies - `request` gives up once `timeout`
+    /// elapses rather than waiting forever.
+    #[tokio::test]
+    async fn request_times_out_with_no_reply() {
+        let addr = spawn_test_node().await;
+        let mut requester = connect(addr).await;
+
+        let err = request(
+            &mut requester,
+            PeerId::new(),
+            "rpc.add".parse().unwrap(),
+            b"1+1".to_vec(),
+            None,
+            Duration::from_millis(200),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
     }
 }

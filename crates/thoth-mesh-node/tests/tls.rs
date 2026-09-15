@@ -212,6 +212,8 @@ async fn two_tls_nodes_federate_and_a_tls_client_publishes_and_subscribes() {
                 payload: b"sunny".to_vec(),
                 retain: false,
                 content_type: None,
+                reply_to: None,
+                in_reply_to: None,
             },
         );
         send(&mut publisher, &publish).await;
@@ -441,6 +443,8 @@ async fn topic_acl_distinguishes_principals_by_certificate_fingerprint() {
             payload: b"42".to_vec(),
             retain: false,
             content_type: None,
+            reply_to: None,
+            in_reply_to: None,
         },
     );
     send(&mut allowed_conn, &publish).await;
@@ -456,6 +460,8 @@ async fn topic_acl_distinguishes_principals_by_certificate_fingerprint() {
             payload: b"should not arrive".to_vec(),
             retain: false,
             content_type: None,
+            reply_to: None,
+            in_reply_to: None,
         },
     );
     send(&mut other_conn, &rejected).await;
@@ -600,6 +606,8 @@ async fn a_publish_with_a_mismatched_sender_is_corrected_to_the_authenticated_id
             payload: b"sunny".to_vec(),
             retain: false,
             content_type: None,
+            reply_to: None,
+            in_reply_to: None,
         },
     );
     send(&mut publisher, &publish).await;
@@ -782,6 +790,8 @@ async fn a_durable_subscriber_resumes_from_its_last_position_after_reconnecting(
                 payload: payload.to_vec(),
                 retain: false,
                 content_type: None,
+                reply_to: None,
+                in_reply_to: None,
             },
         )
     };
@@ -1053,6 +1063,8 @@ async fn peer_topic_filter_restricts_what_is_proactively_relayed_to_a_specific_p
                 payload: b"sunny".to_vec(),
                 retain: false,
                 content_type: None,
+                reply_to: None,
+                in_reply_to: None,
             },
         );
         send(&mut publisher, &publish).await;
@@ -1091,6 +1103,8 @@ async fn peer_topic_filter_restricts_what_is_proactively_relayed_to_a_specific_p
             payload: b"jam".to_vec(),
             retain: false,
             content_type: None,
+            reply_to: None,
+            in_reply_to: None,
         },
     );
     send(&mut publisher, &excluded).await;
@@ -1193,6 +1207,8 @@ async fn peer_topic_filter_does_not_restrict_an_explicit_subscribe_from_that_pee
                 payload: b"jam".to_vec(),
                 retain: false,
                 content_type: None,
+                reply_to: None,
+                in_reply_to: None,
             },
         );
         send(&mut publisher, &publish).await;
