@@ -37,8 +37,10 @@ TTL and dead-lettering), and
 [ADR-0049](docs/adr/0049-selective-per-peer-link-topic-filtering.md)
 (selective per-peer-link topic filtering), and
 [ADR-0050](docs/adr/0050-request-reply-over-pubsub.md) (request/reply
-over pub/sub). For diagrams of several of these flows, see
-[docs/FLOWS.md](docs/FLOWS.md).
+over pub/sub), and
+[ADR-0051](docs/adr/0051-per-principal-publish-rate-limiting.md)
+(per-principal publish rate limiting). For diagrams of several of
+these flows, see [docs/FLOWS.md](docs/FLOWS.md).
 
 **Status:** version 1, and explicitly unstable — see ADR-0014. Nothing
 here should be assumed to hold across a breaking change; check
@@ -269,9 +271,12 @@ sender's point of view, unless a `--topic-acl`
 ([ADR-0018](docs/adr/0018-per-topic-client-authorization.md)) or, for
 a peer link, a `--peer-topic-acl`
 ([ADR-0020](docs/adr/0020-peer-scoped-topic-restriction.md)) refuses
-it, in which case an `Error` takes the place of the (otherwise absent)
-reply. See [Delivery semantics](#delivery-semantics) for what
-"published" actually guarantees.
+it, or a client (never a peer link) exceeds a configured
+`--publish-rate-limit-per-sec`
+([ADR-0051](docs/adr/0051-per-principal-publish-rate-limiting.md)), in
+which case an `Error` takes the place of the (otherwise absent) reply.
+See [Delivery semantics](#delivery-semantics) for what "published"
+actually guarantees.
 
 ### `Subscribe`
 

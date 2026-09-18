@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use thoth_mesh_core::Topic;
-use thoth_mesh_node::{NodeOptions, PeerTopicFilter, TlsConfig, TopicAcl};
+use thoth_mesh_node::{NodeOptions, PeerTopicFilter, RateLimitConfig, TlsConfig, TopicAcl};
 use tracing_subscriber::EnvFilter;
 
 /// Daemon that runs a thoth-mesh node: wires the local pub/sub broker
@@ -131,6 +131,27 @@ struct Cli {
     /// counted. See ADR-0047 and docs/OPERATIONS.md.
     #[arg(long = "dead-letter-topic")]
     dead_letter_topic: Option<String>,
+
+    /// Sustained per-principal `Publish` rate, in messages/second - a
+    /// client is identified the same way --topic-acl identifies one
+    /// (TLS certificate fingerprint, or "anonymous" with none), and
+    /// never applies to a peer link. Gates the whole feature: with
+    /// none given, no rate limiting runs at all, unchanged from before
+    /// this flag existed. See ADR-0051 and docs/OPERATIONS.md.
+    #[arg(long = "publish-rate-limit-per-sec")]
+    publish_rate_limit_per_sec: Option<u32>,
+
+    /// Token bucket capacity backing --publish-rate-limit-per-sec - how
+    /// far ahead of the sustained rate an idle principal can get
+    /// before being throttled again. Requires
+    /// --publish-rate-limit-per-sec; defaults to that flag's own value
+    /// if omitted (a flat rate with no extra burst allowance). See
+    /// ADR-0051 and docs/OPERATIONS.md.
+    #[arg(
+        long = "publish-rate-limit-burst",
+        requires = "publish_rate_limit_per_sec"
+    )]
+    publish_rate_limit_burst: Option<u32>,
 }
 
 #[tokio::main]
@@ -219,6 +240,13 @@ async fn main() -> std::io::Result<()> {
         })?),
     };
 
+    let rate_limit = cli
+        .publish_rate_limit_per_sec
+        .map(|per_sec| RateLimitConfig {
+            per_sec,
+            burst: cli.publish_rate_limit_burst.unwrap_or(per_sec),
+        });
+
     let options = NodeOptions {
         tls,
         topic_acl,
@@ -229,6 +257,7 @@ async fn main() -> std::io::Result<()> {
             .persisted_message_ttl_secs
             .map(std::time::Duration::from_secs),
         dead_letter_topic,
+        rate_limit,
     };
 
     thoth_mesh_node::run_with_tls(

@@ -7,6 +7,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use thoth_mesh::{Membership, PeerDirectory};
 use thoth_mesh_broker::Broker;
 
+use crate::rate_limit::RateLimiter;
+
 /// The one metric that isn't already naturally owned by an existing
 /// type - `Membership` tracks connected peers and `Broker` tracks
 /// publishes, but nothing currently counts a lagging forwarder's
@@ -59,6 +61,10 @@ pub struct Metrics {
     /// forwarder exhausting its redelivery attempts (ADR-0041). Zero
     /// unless `--dead-letter-topic` is configured.
     dead_lettered_messages: Arc<AtomicU64>,
+    /// `Publish` attempts refused for exceeding a
+    /// `--publish-rate-limit-per-sec` quota (ADR-0051). Zero unless
+    /// one is configured.
+    publish_rate_limit_rejections: Arc<AtomicU64>,
 }
 
 impl Metrics {
@@ -135,6 +141,13 @@ impl Metrics {
             .fetch_add(count, Ordering::Relaxed);
     }
 
+    /// Records that a `Publish` was refused for exceeding its
+    /// principal's `--publish-rate-limit-per-sec` quota (ADR-0051).
+    pub fn record_publish_rate_limit_rejection(&self) {
+        self.publish_rate_limit_rejections
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     fn forwarder_lag_total(&self) -> u64 {
         self.forwarder_lag.load(Ordering::Relaxed)
     }
@@ -174,6 +187,10 @@ impl Metrics {
     fn dead_lettered_messages_total(&self) -> u64 {
         self.dead_lettered_messages.load(Ordering::Relaxed)
     }
+
+    fn publish_rate_limit_rejections_total(&self) -> u64 {
+        self.publish_rate_limit_rejections.load(Ordering::Relaxed)
+    }
 }
 
 /// A snapshot of every metric this node tracks, as typed fields - the
@@ -187,6 +204,7 @@ pub fn summary(
     broker: &Broker,
     discover: &PeerDirectory,
     metrics: &Metrics,
+    rate_limiter: Option<&RateLimiter>,
 ) -> thoth_mesh_core::MetricsSummary {
     thoth_mesh_core::MetricsSummary {
         peers_connected: membership.connected_count() as u64,
@@ -206,6 +224,9 @@ pub fn summary(
         persist_failures_total: broker.persist_failures(),
         expired_messages_total: metrics.expired_messages_total(),
         dead_lettered_messages_total: metrics.dead_lettered_messages_total(),
+        publish_rate_limit_rejections_total: metrics.publish_rate_limit_rejections_total(),
+        rate_limit_principal_evictions_total: rate_limiter
+            .map_or(0, |limiter| limiter.principal_evictions()),
     }
 }
 
@@ -216,8 +237,9 @@ pub fn render_prometheus(
     broker: &Broker,
     discover: &PeerDirectory,
     metrics: &Metrics,
+    rate_limiter: Option<&RateLimiter>,
 ) -> String {
-    let s = summary(membership, broker, discover, metrics);
+    let s = summary(membership, broker, discover, metrics, rate_limiter);
     format!(
         "# TYPE thothmesh_peers_connected gauge\n\
          thothmesh_peers_connected {}\n\
@@ -252,7 +274,11 @@ pub fn render_prometheus(
          # TYPE thothmesh_expired_messages_total counter\n\
          thothmesh_expired_messages_total {}\n\
          # TYPE thothmesh_dead_lettered_messages_total counter\n\
-         thothmesh_dead_lettered_messages_total {}\n",
+         thothmesh_dead_lettered_messages_total {}\n\
+         # TYPE thothmesh_publish_rate_limit_rejections_total counter\n\
+         thothmesh_publish_rate_limit_rejections_total {}\n\
+         # TYPE thothmesh_rate_limit_principal_evictions_total counter\n\
+         thothmesh_rate_limit_principal_evictions_total {}\n",
         s.peers_connected,
         s.messages_published,
         s.forwarder_lag_total,
@@ -270,6 +296,8 @@ pub fn render_prometheus(
         s.persist_failures_total,
         s.expired_messages_total,
         s.dead_lettered_messages_total,
+        s.publish_rate_limit_rejections_total,
+        s.rate_limit_principal_evictions_total,
     )
 }
 
@@ -369,7 +397,7 @@ mod tests {
     }
 
     #[test]
-    fn render_prometheus_includes_all_seventeen_metrics() {
+    fn render_prometheus_includes_all_nineteen_metrics() {
         let membership = Membership::new();
         membership.mark_connected(thoth_mesh_core::PeerId::new(), None);
         let broker = Broker::new();
@@ -385,8 +413,9 @@ mod tests {
         metrics.record_delivery_ack_timeouts(1);
         metrics.record_expired_messages(9);
         metrics.record_dead_lettered_messages(4);
+        metrics.record_publish_rate_limit_rejection();
 
-        let rendered = render_prometheus(&membership, &broker, &discover, &metrics);
+        let rendered = render_prometheus(&membership, &broker, &discover, &metrics, None);
 
         assert!(rendered.contains("thothmesh_peers_connected 1"));
         assert!(rendered.contains("thothmesh_messages_published_total 0"));
@@ -411,6 +440,9 @@ mod tests {
         assert!(rendered.contains("thothmesh_persist_failures_total 0"));
         assert!(rendered.contains("thothmesh_expired_messages_total 9"));
         assert!(rendered.contains("thothmesh_dead_lettered_messages_total 4"));
+        assert!(rendered.contains("thothmesh_publish_rate_limit_rejections_total 1"));
+        // No rate limiter passed in this test - nothing to evict from.
+        assert!(rendered.contains("thothmesh_rate_limit_principal_evictions_total 0"));
     }
 
     #[test]
@@ -425,7 +457,7 @@ mod tests {
         metrics.record_forwarder_lag(7);
         metrics.record_topic_acl_rejection();
 
-        let s = summary(&membership, &broker, &discover, &metrics);
+        let s = summary(&membership, &broker, &discover, &metrics, None);
 
         assert_eq!(s.peers_connected, 1);
         assert_eq!(s.messages_published, 0);
@@ -444,10 +476,52 @@ mod tests {
         assert_eq!(s.persist_failures_total, 0);
         assert_eq!(s.expired_messages_total, 0);
         assert_eq!(s.dead_lettered_messages_total, 0);
+        assert_eq!(s.publish_rate_limit_rejections_total, 0);
+        assert_eq!(s.rate_limit_principal_evictions_total, 0);
 
-        let rendered = render_prometheus(&membership, &broker, &discover, &metrics);
+        let rendered = render_prometheus(&membership, &broker, &discover, &metrics, None);
         assert!(rendered.contains("thothmesh_peers_connected 1"));
         assert!(rendered.contains("thothmesh_forwarder_lag_total 7"));
         assert!(rendered.contains("thothmesh_topic_acl_rejections_total 1"));
+    }
+
+    #[test]
+    fn summary_reads_principal_evictions_from_the_rate_limiter_itself() {
+        // Unlike every other counter here, principal_evictions_total
+        // isn't tracked on `Metrics` at all - it lives on `RateLimiter`
+        // directly (same reasoning as `Membership`'s/`PeerDirectory`'s
+        // own eviction counters), and `summary` reads it from there.
+        let membership = Membership::new();
+        let broker = Broker::new();
+        let discover = PeerDirectory::new();
+        let metrics = Metrics::new();
+        let rate_limiter =
+            crate::rate_limit::RateLimiter::new(crate::rate_limit::RateLimitConfig {
+                per_sec: 1,
+                burst: 1,
+            });
+        for i in 0..=crate::rate_limit::DEFAULT_RATE_LIMIT_PRINCIPAL_CAPACITY as u16 {
+            let mut fingerprint = [0u8; 32];
+            fingerprint[..2].copy_from_slice(&i.to_le_bytes());
+            rate_limiter.allow(crate::topic_acl::Principal::Fingerprint(fingerprint));
+        }
+
+        let s = summary(
+            &membership,
+            &broker,
+            &discover,
+            &metrics,
+            Some(&rate_limiter),
+        );
+        assert_eq!(s.rate_limit_principal_evictions_total, 1);
+
+        let rendered = render_prometheus(
+            &membership,
+            &broker,
+            &discover,
+            &metrics,
+            Some(&rate_limiter),
+        );
+        assert!(rendered.contains("thothmesh_rate_limit_principal_evictions_total 1"));
     }
 }

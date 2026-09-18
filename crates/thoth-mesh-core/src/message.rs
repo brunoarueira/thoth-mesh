@@ -111,6 +111,15 @@ pub struct MetricsSummary {
     /// redelivery (ADR-0041) alike. Always 0 with no dead-letter topic
     /// configured.
     pub dead_lettered_messages_total: u64,
+    /// `Publish` attempts refused for exceeding a client's
+    /// `--publish-rate-limit-per-sec` quota (ADR-0051). Always 0 with
+    /// no rate limit configured.
+    pub publish_rate_limit_rejections_total: u64,
+    /// Principals' rate-limit buckets reclaimed for the tracked-
+    /// principal table sitting over its capacity (ADR-0051). Always 0
+    /// with no rate limit configured, and stays 0 even then unless
+    /// over 4096 distinct principals have ever published.
+    pub rate_limit_principal_evictions_total: u64,
 }
 
 /// The payload of an [`Envelope`](crate::Envelope).

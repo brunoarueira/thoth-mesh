@@ -15,6 +15,7 @@ use tokio::sync::{Semaphore, mpsc};
 use crate::metrics::Metrics;
 use crate::peer_links::PeerLinks;
 use crate::peer_topic_filter::PeerTopicFilter;
+use crate::rate_limit::RateLimiter;
 use crate::topic_acl::TopicAcl;
 
 /// How many outbound dial attempts (`peering::dial_peer`'s connect
@@ -92,6 +93,12 @@ pub struct Shared {
     /// `None` (the default) means unchanged behavior: a giveup is
     /// simply dropped and counted, as before this ADR.
     pub dead_letter_topic: Option<Topic>,
+    /// `--publish-rate-limit-per-sec`/`--publish-rate-limit-burst`
+    /// (ADR-0051): a per-principal token bucket a client connection's
+    /// `Publish` is checked against - never a peer link's, mirroring
+    /// `topic_acl` vs `peer_topic_acl`. `None` (the default) means
+    /// unchanged behavior: no rate limiting at all.
+    pub rate_limiter: Option<Arc<RateLimiter>>,
 }
 
 // Hand-rolled rather than derived: `TlsAcceptor`/`TlsConnector` don't
@@ -118,6 +125,7 @@ impl std::fmt::Debug for Shared {
             .field("peer_topic_acl", &self.peer_topic_acl.is_some())
             .field("peer_topic_filter", &self.peer_topic_filter.is_some())
             .field("dead_letter_topic", &self.dead_letter_topic)
+            .field("rate_limiter", &self.rate_limiter.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -163,6 +171,7 @@ impl Shared {
             peer_topic_acl: None,
             peer_topic_filter: None,
             dead_letter_topic: None,
+            rate_limiter: None,
         };
         (shared, discovered_rx)
     }

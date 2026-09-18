@@ -40,6 +40,7 @@ use tracing::Instrument;
 use crate::metrics::Metrics;
 use crate::peer_links::PeerLinks;
 use crate::peer_topic_filter::PeerTopicFilter;
+use crate::rate_limit::RateLimiter;
 use crate::redelivery::{
     DEFAULT_ACK_TIMEOUT, DEFAULT_MAX_REDELIVERY_ATTEMPTS, PendingAcks, sweep_interval,
 };
@@ -117,6 +118,7 @@ async fn run_connection(socket: MaybeTlsStream, shared: Shared, initial_peer: Op
         peer_topic_acl,
         peer_topic_filter,
         dead_letter_topic,
+        rate_limiter,
     } = shared;
     let (reader, writer) = split(socket);
     let mut reader = reader.compat();
@@ -164,6 +166,7 @@ async fn run_connection(socket: MaybeTlsStream, shared: Shared, initial_peer: Op
         peer_topic_acl,
         peer_topic_filter,
         dead_letter_topic,
+        rate_limiter,
         outgoing_tx,
         forwarders: HashMap::new(),
         peer_identity: None,
@@ -302,6 +305,12 @@ struct ConnectionContext {
     /// forwarder that exhausts its redelivery attempts republishes the
     /// original message, if configured at all.
     dead_letter_topic: Option<Topic>,
+    /// `--publish-rate-limit-per-sec`/`--publish-rate-limit-burst`
+    /// (ADR-0051): a per-principal token bucket a client `Publish` is
+    /// checked against - never checked for a connection already known
+    /// to be a peer link. `None` - the default - means unchanged
+    /// behavior: no rate limiting at all.
+    rate_limiter: Option<Arc<RateLimiter>>,
     outgoing_tx: mpsc::Sender<Arc<Envelope>>,
     /// Every topic filter a `Subscribe` on this connection is
     /// currently registered for - an ordinary forwarder or consumer-
@@ -658,6 +667,21 @@ impl ConnectionContext {
             );
             return self.send(error).await;
         }
+        if !is_peer
+            && let Some(rate_limiter) = &self.rate_limiter
+            && !rate_limiter.allow(self.principal)
+        {
+            tracing::warn!(sender = ?envelope.sender, %topic, "rejected: publish rate limit exceeded");
+            self.metrics.record_publish_rate_limit_rejection();
+            let error = Envelope::new(
+                self.node_id,
+                MessageKind::Error {
+                    in_reply_to: Some(envelope.id),
+                    message: format!("publish rate limit exceeded for {topic}"),
+                },
+            );
+            return self.send(error).await;
+        }
         self.broker.publish(&topic, envelope).await;
         true
     }
@@ -804,6 +828,7 @@ impl ConnectionContext {
                     &self.broker,
                     &self.discover,
                     &self.metrics,
+                    self.rate_limiter.as_deref(),
                 ),
             },
         );
