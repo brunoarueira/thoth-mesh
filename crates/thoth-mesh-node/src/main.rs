@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use thoth_mesh_core::Topic;
-use thoth_mesh_node::{NodeOptions, PeerTopicFilter, TlsConfig, TopicAcl};
+use thoth_mesh_node::{NodeOptions, PeerTopicFilter, RateLimitConfig, TlsConfig, TopicAcl};
 use tracing_subscriber::EnvFilter;
 
 /// Daemon that runs a thoth-mesh node: wires the local pub/sub broker
@@ -131,6 +131,27 @@ struct Cli {
     /// counted. See ADR-0047 and docs/OPERATIONS.md.
     #[arg(long = "dead-letter-topic")]
     dead_letter_topic: Option<String>,
+
+    /// Sustained per-principal `Publish` rate, in messages/second - a
+    /// client is identified the same way --topic-acl identifies one
+    /// (TLS certificate fingerprint, or "anonymous" with none), and
+    /// never applies to a peer link. Gates the whole feature: with
+    /// none given, no rate limiting runs at all, unchanged from before
+    /// this flag existed. See ADR-0051 and docs/OPERATIONS.md.
+    #[arg(long = "publish-rate-limit-per-sec")]
+    publish_rate_limit_per_sec: Option<u32>,
+
+    /// Token bucket capacity backing --publish-rate-limit-per-sec - how
+    /// far ahead of the sustained rate an idle principal can get
+    /// before being throttled again. Requires
+    /// --publish-rate-limit-per-sec; defaults to that flag's own value
+    /// if omitted (a flat rate with no extra burst allowance). See
+    /// ADR-0051 and docs/OPERATIONS.md.
+    #[arg(
+        long = "publish-rate-limit-burst",
+        requires = "publish_rate_limit_per_sec"
+    )]
+    publish_rate_limit_burst: Option<u32>,
 }
 
 #[tokio::main]
@@ -219,6 +240,32 @@ async fn main() -> std::io::Result<()> {
         })?),
     };
 
+    // 0 isn't "disabled" (omitting the flag entirely already means
+    // that) - it's a token bucket that never refills and/or never
+    // holds a token, silently black-holing every publish from every
+    // principal. Reject it outright rather than let an operator
+    // typing 0 get a full publish outage with no clearer signal than
+    // a stream of per-message Error replies.
+    let rate_limit = match (cli.publish_rate_limit_per_sec, cli.publish_rate_limit_burst) {
+        (None, _) => None,
+        (Some(0), _) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "--publish-rate-limit-per-sec must be at least 1 (omit the flag entirely to disable rate limiting)",
+            ));
+        }
+        (Some(_), Some(0)) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "--publish-rate-limit-burst must be at least 1",
+            ));
+        }
+        (Some(per_sec), burst) => Some(RateLimitConfig {
+            per_sec,
+            burst: burst.unwrap_or(per_sec),
+        }),
+    };
+
     let options = NodeOptions {
         tls,
         topic_acl,
@@ -229,6 +276,7 @@ async fn main() -> std::io::Result<()> {
             .persisted_message_ttl_secs
             .map(std::time::Duration::from_secs),
         dead_letter_topic,
+        rate_limit,
     };
 
     thoth_mesh_node::run_with_tls(

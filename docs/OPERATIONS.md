@@ -390,18 +390,24 @@ thothmesh_persist_failures_total 0
 thothmesh_expired_messages_total 0
 # TYPE thothmesh_dead_lettered_messages_total counter
 thothmesh_dead_lettered_messages_total 0
+# TYPE thothmesh_publish_rate_limit_rejections_total counter
+thothmesh_publish_rate_limit_rejections_total 0
+# TYPE thothmesh_rate_limit_principal_evictions_total counter
+thothmesh_rate_limit_principal_evictions_total 0
 ```
 
-Seventeen metrics today (ADR-0013, plus `topic_acl_rejections_total`
+Nineteen metrics today (ADR-0013, plus `topic_acl_rejections_total`
 added by ADR-0018, `metrics_auth_rejections_total` added by ADR-0019,
 `peer_topic_acl_rejections_total` added by ADR-0020,
 `replayed_messages_total` added by ADR-0021, `lag_recovered_total`
 added by ADR-0024, `topic_evictions_total`/`pattern_evictions_total`/
 `membership_evictions_total`/`peer_directory_evictions_total` added by
 ADR-0025, `redelivered_messages_total`/`delivery_ack_timeouts_total`
-added by ADR-0041, `persist_failures_total` added by ADR-0045, and
+added by ADR-0041, `persist_failures_total` added by ADR-0045,
 `expired_messages_total`/`dead_lettered_messages_total` added by
-ADR-0047):
+ADR-0047, and
+`publish_rate_limit_rejections_total`/`rate_limit_principal_evictions_total`
+added by ADR-0051):
 
 | Metric | Type | Meaning |
 | --- | --- | --- |
@@ -422,6 +428,8 @@ ADR-0047):
 | `thothmesh_persist_failures_total` | counter | Publishes the on-disk store failed to durably record (see [Persistence](#persistence)). Delivery still happened, but those messages won't survive a restart. Always 0 without `--data-dir`. Nonzero means the disk is full or failing. |
 | `thothmesh_expired_messages_total` | counter | Messages deleted from the on-disk store for having aged past [`--persisted-message-ttl-secs`](#message-ttl-and-dead-lettering). Always 0 without a TTL configured. |
 | `thothmesh_dead_lettered_messages_total` | counter | Messages republished to [`--dead-letter-topic`](#message-ttl-and-dead-lettering) - from TTL expiry above or an exhausted `ack: true` redelivery alike. Always 0 without a dead-letter topic configured. |
+| `thothmesh_publish_rate_limit_rejections_total` | counter | `Publish` attempts refused for exceeding a principal's [`--publish-rate-limit-per-sec`](#publish-rate-limiting) quota. Always 0 without one configured. |
+| `thothmesh_rate_limit_principal_evictions_total` | counter | Principals' rate-limit buckets reclaimed for the tracked-principal table sitting over its cap (see [Bounded memory footprint](#bounded-memory-footprint)). Always 0 without rate limiting configured, and stays 0 even then unless over 4096 distinct principals have ever published. |
 
 Point a Prometheus `scrape_configs` target at `--metrics-addr` the
 same way you would any other exporter; there's no special
@@ -681,6 +689,62 @@ cargo run -p thoth-mesh-node -- --addr 127.0.0.1:49500 \
   restricted topic simply never becomes something this node tells that
   peer link it wants.
 
+## Publish rate limiting
+
+Nothing stops one noisy client from flooding a node with `Publish`
+traffic by default. `--publish-rate-limit-per-sec <n>` closes that gap
+(see [ADR-0051](adr/0051-per-principal-publish-rate-limiting.md)): a
+sustained token-bucket rate, in messages/second, enforced per
+principal - the same client identity `--topic-acl` already checks (a
+certificate's SHA-256 fingerprint, or the shared `anonymous` identity
+with none), so it survives a reconnect rather than resetting on one.
+Off by default - with no `--publish-rate-limit-per-sec` given, no rate
+limiting runs at all, same as before this flag existed.
+
+```sh
+# Each distinct client (by certificate fingerprint, or "anonymous" if
+# none) may sustain 10 messages/second - an otherwise-idle client can
+# still burst up to 20 at once, the bucket's capacity, before being
+# throttled back down to the sustained rate.
+cargo run -p thoth-mesh-node -- --addr 127.0.0.1:49500 \
+  --publish-rate-limit-per-sec 10 --publish-rate-limit-burst 20
+```
+
+- `--publish-rate-limit-burst <n>` (requires `--publish-rate-limit-per-sec`)
+  sets the bucket's capacity - how far above the sustained rate a
+  principal that's been idle can burst before being throttled again.
+  Omit it once rate limiting is on at all and it defaults to the same
+  value as `--publish-rate-limit-per-sec` itself: a flat `N`/second
+  with no extra burst allowance.
+- Applies to `Publish` only, and only to client connections - never to
+  a peer link, mirroring `--topic-acl` vs `--peer-topic-acl`
+  (legitimate inter-node traffic has a different volume profile than a
+  single client). `Subscribe` is never rate-limited. **Bypass and
+  all**: with no [`--allow-peer`](#peer-allowlist) configured, any
+  connection can send a bare `Hello` and register itself as a peer
+  link (ADR-0017's default is no allowlist enforcement at all) - at
+  which point neither `--topic-acl` nor this rate limit applies to it
+  any more, only the separately-configured `--peer-topic-acl` does.
+  This is the exact same property `--topic-acl` already has today, not
+  something new here - if either restriction needs to hold against an
+  adversarial client, configure `--allow-peer` too.
+- One quota per principal, node-wide across every topic - not scoped
+  per topic. A principal publishing to five different topics draws
+  from the same bucket, not five independent ones.
+- A `Publish` over quota gets an `Error` in place of the silence a
+  fire-and-forget message normally gets, naming the rejected request -
+  the same shape a `--topic-acl` rejection uses. The connection stays
+  open; only that one `Publish` is refused. Counted by
+  `thothmesh_publish_rate_limit_rejections_total` (see
+  [Metrics](#metrics)).
+- In-memory only, per node - a restart resets every principal back to
+  a full bucket. This is abuse mitigation, not a durable allowance
+  ledger, and (like every other per-identity map in this codebase, see
+  [Bounded memory footprint](#bounded-memory-footprint)) the table of
+  tracked principals itself is capped at 4096, oldest reclaimed first
+  once over - counted by
+  `thothmesh_rate_limit_principal_evictions_total`.
+
 ## Message replay
 
 Every topic keeps a bounded, in-memory ring buffer of its most
@@ -904,6 +968,15 @@ happening - distinct from `thothmesh_membership_evictions_total`,
 since this registry has no connected/disconnected concept at all and
 tracks every peer ever heard of, not just ones this node itself
 connected to.
+
+[`--publish-rate-limit-per-sec`](#publish-rate-limiting)'s table of
+per-principal token buckets (ADR-0051) is capped the same way, at the
+same 4096 - oldest-tracked principal reclaimed first, not
+touch-refreshed (unlike the peer directory above): it's checked on
+every single `Publish`, a hot path where a reorder-on-touch scan isn't
+worth the cost. `thothmesh_rate_limit_principal_evictions_total`
+counts this happening. Only ever grows at all with rate limiting
+configured in the first place.
 
 None of these caps are configurable via a flag in v1, consistent with
 every other capacity in this codebase (the replay buffer, the

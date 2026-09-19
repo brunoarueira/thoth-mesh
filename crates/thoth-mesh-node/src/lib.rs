@@ -34,6 +34,7 @@ mod peer_links;
 mod peer_topic_filter;
 mod peering;
 mod persistence;
+mod rate_limit;
 mod redelivery;
 mod shared;
 mod tls_config;
@@ -52,6 +53,8 @@ use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
 pub use peer_topic_filter::{PeerTopicFilter, PeerTopicFilterParseError};
+pub use rate_limit::RateLimitConfig;
+use rate_limit::RateLimiter;
 pub use shared::Shared;
 pub use thoth_mesh::{Interest, Membership, PeerDirectory};
 pub use thoth_mesh_core::DEFAULT_ADDR;
@@ -110,6 +113,12 @@ pub struct NodeOptions {
     /// default) means both sources behave exactly as before this ADR:
     /// silently dropped, only counted.
     pub dead_letter_topic: Option<Topic>,
+    /// Per-principal `Publish` rate limiting for client connections,
+    /// `--publish-rate-limit-per-sec`/`--publish-rate-limit-burst` -
+    /// see ADR-0051. Never applied to a peer link, mirroring
+    /// `topic_acl` vs `peer_topic_acl`. `None` (the default) means
+    /// unchanged behavior: no rate limiting at all.
+    pub rate_limit: Option<RateLimitConfig>,
 }
 
 /// Opens the on-disk message store for `data_dir` (ADR-0045), if one
@@ -240,6 +249,9 @@ pub async fn run_with_tls(
     shared.peer_topic_acl = options.peer_topic_acl.map(Arc::new);
     shared.peer_topic_filter = options.peer_topic_filter.map(Arc::new);
     shared.dead_letter_topic = options.dead_letter_topic.clone();
+    shared.rate_limiter = options
+        .rate_limit
+        .map(|config| Arc::new(RateLimiter::new(config)));
     if let Some(store) = store.clone() {
         rehydrate_from_store(&shared.broker, store).await?;
     }
@@ -270,6 +282,7 @@ pub async fn run_with_tls(
         let broker = Arc::clone(&shared.broker);
         let discover = shared.discover.clone();
         let metrics = shared.metrics.clone();
+        let rate_limiter = shared.rate_limiter.clone();
         tokio::spawn(async move {
             if let Err(err) = metrics_server::serve_metrics(
                 metrics_listener,
@@ -277,6 +290,7 @@ pub async fn run_with_tls(
                 broker,
                 discover,
                 metrics,
+                rate_limiter,
                 metrics_token,
             )
             .await
@@ -330,6 +344,9 @@ pub async fn serve_with_tls(
     shared.peer_topic_acl = options.peer_topic_acl.map(Arc::new);
     shared.peer_topic_filter = options.peer_topic_filter.map(Arc::new);
     shared.dead_letter_topic = options.dead_letter_topic.clone();
+    shared.rate_limiter = options
+        .rate_limit
+        .map(|config| Arc::new(RateLimiter::new(config)));
     if let Some(store) = store.clone() {
         rehydrate_from_store(&shared.broker, store).await?;
     }
@@ -417,6 +434,9 @@ pub fn spawn_with_tls(
     shared.peer_topic_acl = options.peer_topic_acl.map(Arc::new);
     shared.peer_topic_filter = options.peer_topic_filter.map(Arc::new);
     shared.dead_letter_topic = options.dead_letter_topic.clone();
+    shared.rate_limiter = options
+        .rate_limit
+        .map(|config| Arc::new(RateLimiter::new(config)));
     if let Some(store) = store.clone() {
         // spawn_with_tls isn't async; rehydration runs in the
         // background. Every rehydrate_from_store consumer that needs

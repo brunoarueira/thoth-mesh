@@ -37,8 +37,10 @@ TTL and dead-lettering), and
 [ADR-0049](docs/adr/0049-selective-per-peer-link-topic-filtering.md)
 (selective per-peer-link topic filtering), and
 [ADR-0050](docs/adr/0050-request-reply-over-pubsub.md) (request/reply
-over pub/sub). For diagrams of several of these flows, see
-[docs/FLOWS.md](docs/FLOWS.md).
+over pub/sub), and
+[ADR-0051](docs/adr/0051-per-principal-publish-rate-limiting.md)
+(per-principal publish rate limiting). For diagrams of several of
+these flows, see [docs/FLOWS.md](docs/FLOWS.md).
 
 **Status:** version 1, and explicitly unstable — see ADR-0014. Nothing
 here should be assumed to hold across a breaking change; check
@@ -269,9 +271,12 @@ sender's point of view, unless a `--topic-acl`
 ([ADR-0018](docs/adr/0018-per-topic-client-authorization.md)) or, for
 a peer link, a `--peer-topic-acl`
 ([ADR-0020](docs/adr/0020-peer-scoped-topic-restriction.md)) refuses
-it, in which case an `Error` takes the place of the (otherwise absent)
-reply. See [Delivery semantics](#delivery-semantics) for what
-"published" actually guarantees.
+it, or a client (never a peer link) exceeds a configured
+`--publish-rate-limit-per-sec`
+([ADR-0051](docs/adr/0051-per-principal-publish-rate-limiting.md)), in
+which case an `Error` takes the place of the (otherwise absent) reply.
+See [Delivery semantics](#delivery-semantics) for what "published"
+actually guarantees.
 
 ### `Subscribe`
 
@@ -433,7 +438,7 @@ Sent in either direction, unambiguous by which:
 
 Reserved for reporting a protocol-level error, optionally in response
 to a specific message. A malformed frame or envelope still closes the
-connection outright rather than replying with an `Error`. Two cases
+connection outright rather than replying with an `Error`. Three cases
 the reference implementation does send one for:
 
 - A peer link rejected by an `--allow-peer` allowlist
@@ -451,6 +456,12 @@ the reference implementation does send one for:
   peer link) denied on one topic may be entitled to others; only a
   `Subscribe`/`Publish` actually rejected gets an `Error` in place of
   its usual `Ack`/delivery, nothing else about the connection changes.
+- A client `Publish` refused for exceeding a
+  `--publish-rate-limit-per-sec` quota
+  ([ADR-0051](docs/adr/0051-per-principal-publish-rate-limiting.md)):
+  same shape as the `--topic-acl` case above - `in_reply_to` names the
+  refused `Publish`, and the connection stays open. Never sent for a
+  peer link's `Publish`, which this limiter never checks at all.
 
 A client should be able to decode and handle receiving one either
 way.
@@ -503,7 +514,14 @@ No reply is sent for a `PeerAnnounce`, the same as `Publish`.
     "replayed_messages_total": <u64>, "lag_recovered_total": <u64>,
     "topic_evictions_total": <u64>, "pattern_evictions_total": <u64>,
     "membership_evictions_total": <u64>,
-    "peer_directory_evictions_total": <u64>
+    "peer_directory_evictions_total": <u64>,
+    "redelivered_messages_total": <u64>,
+    "delivery_ack_timeouts_total": <u64>,
+    "persist_failures_total": <u64>,
+    "expired_messages_total": <u64>,
+    "dead_lettered_messages_total": <u64>,
+    "publish_rate_limit_rejections_total": <u64>,
+    "rate_limit_principal_evictions_total": <u64>
   }
 }}
 ```

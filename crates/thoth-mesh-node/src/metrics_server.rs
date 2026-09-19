@@ -13,6 +13,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::metrics::{Metrics, render_prometheus};
+use crate::rate_limit::RateLimiter;
 
 /// Serves the current Prometheus render on every connection accepted
 /// on `listener`, until an unrecoverable listener error occurs. If
@@ -29,6 +30,7 @@ pub async fn serve_metrics(
     broker: Arc<Broker>,
     discover: PeerDirectory,
     metrics: Metrics,
+    rate_limiter: Option<Arc<RateLimiter>>,
     token: Option<Arc<str>>,
 ) -> std::io::Result<()> {
     tracing::info!(addr = ?listener.local_addr().ok(), auth = token.is_some(), "metrics endpoint ready");
@@ -38,6 +40,7 @@ pub async fn serve_metrics(
         let broker = Arc::clone(&broker);
         let discover = discover.clone();
         let metrics = metrics.clone();
+        let rate_limiter = rate_limiter.clone();
         let token = token.clone();
         tokio::spawn(async move {
             if let Err(err) = handle_scrape(
@@ -46,6 +49,7 @@ pub async fn serve_metrics(
                 &broker,
                 &discover,
                 &metrics,
+                rate_limiter.as_deref(),
                 token.as_deref(),
             )
             .await
@@ -67,6 +71,7 @@ async fn handle_scrape(
     broker: &Broker,
     discover: &PeerDirectory,
     metrics: &Metrics,
+    rate_limiter: Option<&RateLimiter>,
     token: Option<&str>,
 ) -> std::io::Result<()> {
     let (reader, mut writer) = socket.into_split();
@@ -112,7 +117,7 @@ async fn handle_scrape(
         }
     }
 
-    let body = render_prometheus(membership, broker, discover, metrics);
+    let body = render_prometheus(membership, broker, discover, metrics, rate_limiter);
     let response = format!(
         "HTTP/1.1 200 OK\r\n\
          Content-Type: text/plain; version=0.0.4\r\n\
@@ -166,6 +171,7 @@ mod tests {
             PeerDirectory::new(),
             metrics,
             None,
+            None,
         ));
 
         let mut stream = TcpStream::connect(addr).await.unwrap();
@@ -197,6 +203,7 @@ mod tests {
             PeerDirectory::new(),
             Metrics::new(),
             None,
+            None,
         ));
 
         let mut stream = TcpStream::connect(addr).await.unwrap();
@@ -218,6 +225,7 @@ mod tests {
             Arc::new(Broker::new()),
             PeerDirectory::new(),
             Metrics::new(),
+            None,
             None,
         ));
 
@@ -242,6 +250,7 @@ mod tests {
             Arc::new(Broker::new()),
             PeerDirectory::new(),
             metrics.clone(),
+            None,
             Some(Arc::from("secret-token")),
         ));
 
@@ -269,6 +278,7 @@ mod tests {
             Arc::new(Broker::new()),
             PeerDirectory::new(),
             metrics.clone(),
+            None,
             Some(Arc::from("secret-token")),
         ));
 
@@ -303,6 +313,7 @@ mod tests {
             Arc::new(Broker::new()),
             PeerDirectory::new(),
             Metrics::new(),
+            None,
             Some(Arc::from("secret-token")),
         ));
 
