@@ -736,6 +736,14 @@ fn print_status(reply: &StatusReply) {
             "dead_lettered_messages_total",
             m.dead_lettered_messages_total,
         ),
+        (
+            "publish_rate_limit_rejections_total",
+            m.publish_rate_limit_rejections_total,
+        ),
+        (
+            "rate_limit_principal_evictions_total",
+            m.rate_limit_principal_evictions_total,
+        ),
     ] {
         println!("  {name:<32} {value}");
     }
