@@ -97,7 +97,10 @@ impl SqliteStore {
                          FROM messages
                      ) WHERE rn > ?1
                  )",
-                [DEFAULT_PERSISTED_MESSAGES_PER_TOPIC],
+                // rusqlite no longer implements ToSql for usize
+                // directly (0.40) - a SQLite INTEGER is i64, so this
+                // casts at the query boundary instead.
+                [DEFAULT_PERSISTED_MESSAGES_PER_TOPIC as i64],
             )
             .map(|_| ())
             .map_err(to_io)
@@ -169,7 +172,9 @@ impl MessageStore for SqliteStore {
             )
             .map_err(to_io)?;
         let rows = stmt
-            .query_map([per_topic], |row| {
+            // See prune()'s own cast: rusqlite 0.40 dropped ToSql for
+            // usize, a SQLite INTEGER is i64.
+            .query_map([per_topic as i64], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
             })
             .map_err(to_io)?;
