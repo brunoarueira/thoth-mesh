@@ -240,12 +240,31 @@ async fn main() -> std::io::Result<()> {
         })?),
     };
 
-    let rate_limit = cli
-        .publish_rate_limit_per_sec
-        .map(|per_sec| RateLimitConfig {
+    // 0 isn't "disabled" (omitting the flag entirely already means
+    // that) - it's a token bucket that never refills and/or never
+    // holds a token, silently black-holing every publish from every
+    // principal. Reject it outright rather than let an operator
+    // typing 0 get a full publish outage with no clearer signal than
+    // a stream of per-message Error replies.
+    let rate_limit = match (cli.publish_rate_limit_per_sec, cli.publish_rate_limit_burst) {
+        (None, _) => None,
+        (Some(0), _) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "--publish-rate-limit-per-sec must be at least 1 (omit the flag entirely to disable rate limiting)",
+            ));
+        }
+        (Some(_), Some(0)) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "--publish-rate-limit-burst must be at least 1",
+            ));
+        }
+        (Some(per_sec), burst) => Some(RateLimitConfig {
             per_sec,
-            burst: cli.publish_rate_limit_burst.unwrap_or(per_sec),
-        });
+            burst: burst.unwrap_or(per_sec),
+        }),
+    };
 
     let options = NodeOptions {
         tls,

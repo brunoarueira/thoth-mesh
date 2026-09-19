@@ -671,7 +671,14 @@ impl ConnectionContext {
             && let Some(rate_limiter) = &self.rate_limiter
             && !rate_limiter.allow(self.principal)
         {
-            tracing::warn!(sender = ?envelope.sender, %topic, "rejected: publish rate limit exceeded");
+            // debug, not warn: unlike an ACL rejection (rare,
+            // misconfiguration), this is the expected steady state of
+            // exactly the flooding client this feature defends
+            // against - a sustained one could otherwise write
+            // unbounded warn-level log volume for as long as it keeps
+            // publishing. The counter below still records every
+            // rejection regardless of log level.
+            tracing::debug!(sender = ?envelope.sender, %topic, "rejected: publish rate limit exceeded");
             self.metrics.record_publish_rate_limit_rejection();
             let error = Envelope::new(
                 self.node_id,

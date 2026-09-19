@@ -703,9 +703,9 @@ limiting runs at all, same as before this flag existed.
 
 ```sh
 # Each distinct client (by certificate fingerprint, or "anonymous" if
-# none) may publish at most 10 messages/second, with a little slack
-# above that (up to 20 at once) for an otherwise-idle client that
-# briefly bursts.
+# none) may sustain 10 messages/second - an otherwise-idle client can
+# still burst up to 20 at once, the bucket's capacity, before being
+# throttled back down to the sustained rate.
 cargo run -p thoth-mesh-node -- --addr 127.0.0.1:49500 \
   --publish-rate-limit-per-sec 10 --publish-rate-limit-burst 20
 ```
@@ -717,11 +717,17 @@ cargo run -p thoth-mesh-node -- --addr 127.0.0.1:49500 \
   value as `--publish-rate-limit-per-sec` itself: a flat `N`/second
   with no extra burst allowance.
 - Applies to `Publish` only, and only to client connections - never to
-  a peer link, mirroring `--topic-acl` vs `--peer-topic-acl` (a peer
-  link is already gated by `--allow-peer` trust before it's ever
-  linked at all, and legitimate inter-node traffic has a different
-  volume profile than a single client). `Subscribe` is never
-  rate-limited.
+  a peer link, mirroring `--topic-acl` vs `--peer-topic-acl`
+  (legitimate inter-node traffic has a different volume profile than a
+  single client). `Subscribe` is never rate-limited. **Bypass and
+  all**: with no [`--allow-peer`](#peer-allowlist) configured, any
+  connection can send a bare `Hello` and register itself as a peer
+  link (ADR-0017's default is no allowlist enforcement at all) - at
+  which point neither `--topic-acl` nor this rate limit applies to it
+  any more, only the separately-configured `--peer-topic-acl` does.
+  This is the exact same property `--topic-acl` already has today, not
+  something new here - if either restriction needs to hold against an
+  adversarial client, configure `--allow-peer` too.
 - One quota per principal, node-wide across every topic - not scoped
   per topic. A principal publishing to five different topics draws
   from the same bucket, not five independent ones.

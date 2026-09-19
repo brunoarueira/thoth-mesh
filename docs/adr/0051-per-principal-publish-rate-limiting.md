@@ -58,15 +58,30 @@ own retry/backoff instead of the node silently deciding for it.
   the node-wide case already covers; worth its own issue if a real
   need for it shows up.
 - **Client connections only, not peer links.** Mirrors the existing
-  `topic_acl`/`peer_topic_acl` split (ADR-0018/ADR-0020): a peer link
-  is already gated by `--allow-peer` trust before it's ever linked at
-  all, and legitimate inter-node replication traffic has a
-  fundamentally different volume profile than a single client - lumping
-  the two together risks throttling normal mesh traffic to punish a
-  single noisy client. A `--peer-publish-rate-limit` counterpart is
-  straightforward to add later, exactly the way `--peer-topic-acl` was
-  split out from `--topic-acl`, if a noisy-peer scenario turns out to
-  need it.
+  `topic_acl`/`peer_topic_acl` split (ADR-0018/ADR-0020) exactly,
+  bypass and all: a plain `Hello` - no certificate, no `--allow-peer`
+  entry required unless that flag is actually configured - is already
+  enough to register any connection as a peer link (ADR-0017's default
+  is *no* allowlist enforcement), at which point `topic_acl` no longer
+  applies to it either, only the separately-configured
+  `peer_topic_acl` does. This limiter inherits that exact property
+  rather than inventing a stricter one just for itself: with no
+  `--allow-peer` configured, a client that wants to dodge
+  `--publish-rate-limit-per-sec` can do exactly what it could already
+  do to dodge `--topic-acl` - send `Hello` first. Closing this for both
+  at once (e.g. requiring an authenticated identity before any
+  connection can become a peer link at all) is a real gap worth an ADR
+  of its own; papering over it for rate limiting alone while
+  `--topic-acl` stays equally bypassable would be a false sense of
+  security, not a fix. Operators who need either restriction to hold
+  against an adversarial client need `--allow-peer` configured too.
+  Legitimate inter-node replication traffic also has a fundamentally
+  different volume profile than a single client, which is the other
+  reason to keep the two split rather than lumped into one quota. A
+  `--peer-publish-rate-limit` counterpart is straightforward to add
+  later, exactly the way `--peer-topic-acl` was split out from
+  `--topic-acl`, if a noisy-*trusted*-peer scenario turns out to need
+  it.
 
 ### Token bucket, in-memory only, two flags
 

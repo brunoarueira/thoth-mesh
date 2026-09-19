@@ -145,7 +145,12 @@ async fn a_publish_exceeding_the_burst_is_rejected_and_never_reaches_a_subscribe
 
 #[tokio::test]
 async fn the_bucket_refills_over_time() {
-    let addr = spawn_test_node_with_rate_limit(200, 1).await;
+    // per_sec: 50 refills one token every 20ms - wide enough that the
+    // back-to-back first/second publish below (real socket I/O plus
+    // task scheduling, not just two function calls) can't plausibly
+    // cross it even on a loaded CI runner, unlike a tighter interval
+    // that leaves this timing-sensitive.
+    let addr = spawn_test_node_with_rate_limit(50, 1).await;
     let mut publisher = connect(addr).await;
 
     let first = publish(topic("weather.updates"), b"sunny");
@@ -161,9 +166,10 @@ async fn the_bucket_refills_over_time() {
         other => panic!("expected an Error, got {other:?}"),
     }
 
-    // ...then, after the bucket's had time to refill, a further
-    // publish goes through again (no Error reply).
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    // ...then, after the bucket's had time to refill (well past the
+    // 20ms refill interval above), a further publish goes through
+    // again (no Error reply).
+    tokio::time::sleep(Duration::from_millis(60)).await;
     let third = publish(topic("weather.updates"), b"rain");
     send(&mut publisher, &third).await;
     assert!(
