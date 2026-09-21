@@ -354,16 +354,18 @@ Active topics (2):
   sensor.temp                      subscribers=0 messages_buffered=1
 ```
 
-A topic is listed if it currently has a live subscriber, has at least
-one message in its [replay buffer](#message-replay) (published within
-the replay window), or both - `subscribers`/`messages_buffered` are
-reported separately rather than collapsed into one verdict, so
-`sensor.temp` above (published to, nobody currently listening) and
-`weather.updates` (both) are both visible and distinguishable. Never
-lists a wildcard filter pattern some connection is subscribed with -
-only concrete topic names. Answered on any connection, client or peer
-link, with no `--topic-acl` check - the same posture `status` already
-has (topic *names* can be sensitive, but that's an argument for not
+A topic is listed if it currently has a live subscriber (an ordinary
+fan-out one or a `--group` member ([ADR-0042](adr/0042-consumer-groups.md))
+alike - `subscribers` counts both), has at least one message in its
+[replay buffer](#message-replay) (published within the replay window),
+or both - `subscribers`/`messages_buffered` are reported separately
+rather than collapsed into one verdict, so `sensor.temp` above
+(published to, nobody currently listening) and `weather.updates`
+(both) are both visible and distinguishable. Never lists a wildcard
+filter pattern some connection is subscribed with - only concrete
+topic names. Answered on any connection, client or peer link, with no
+`--topic-acl` check - the same posture `status` already has (topic
+*names* can be sensitive, but that's an argument for not
 exposing this port to an untrusted caller at all, not for a partial
 filter here). Reports only this node's own broker - not a mesh-wide
 aggregate, the same scope `status` itself has.

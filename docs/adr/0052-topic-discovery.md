@@ -39,10 +39,19 @@ Each entry reports two raw numbers rather than the node collapsing
 them into one boolean:
 
 - `subscribers`: how many live connections are currently registered
-  for this *exact* topic right now (`broadcast::Sender::receiver_count`
-  on its channel - the same count `Broker`'s own capacity-eviction
-  logic already reads to decide whether an entry is reclaimable, see
-  ADR-0025).
+  for this *exact* topic right now - an ordinary fan-out subscriber
+  (`broadcast::Sender::receiver_count` on the topic's channel, the
+  same count `Broker`'s own capacity-eviction logic already reads to
+  decide whether an entry is reclaimable, see ADR-0025) *and* a
+  consumer-group member (ADR-0042) both count. The two live in
+  entirely separate `Broker` state (`join_group` never touches the
+  topic's broadcast channel a fan-out subscriber does), so `topics()`
+  reads both and sums them per topic - a group-only topic (published
+  to via a literal-filter group, no ordinary subscriber at all) is
+  still reported, not silently omitted. A wildcard-filter group's
+  membership doesn't count toward any one topic's number, consistent
+  with "exact topics only" below - it corresponds to an unknowable set
+  of topics, not one.
 - `messages_buffered`: how many envelopes currently sit in this
   topic's replay buffer (ADR-0021) - non-zero means it's been
   published to recently (within the replay window), zero doesn't

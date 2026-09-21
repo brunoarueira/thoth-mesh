@@ -1634,20 +1634,37 @@ async fn topics_request_reports_a_subscribed_topic_with_no_publish_yet() {
     send(&mut subscriber, &sub).await;
     recv(&mut subscriber).await; // subscribe ack
 
+    // The ack only confirms handle_subscribe registered the filter in
+    // this connection's own forwarders map - the actual
+    // broker.subscribe() call (what bumps the receiver count
+    // TopicsRequest reads) runs inside the forwarder task
+    // spawn_forwarder just spawned, asynchronously to the ack. So
+    // this polls a fresh TopicsRequest each time rather than trusting
+    // a single request sent right after the ack.
     let mut client = connect(addr).await;
-    let request = Envelope::new(PeerId::new(), MessageKind::TopicsRequest);
-    send(&mut client, &request).await;
-
-    let reply = recv(&mut client).await;
-    match reply.kind {
-        MessageKind::TopicsReply { topics, .. } => {
-            assert_eq!(topics.len(), 1);
-            assert_eq!(topics[0].topic, topic("weather.updates"));
-            assert_eq!(topics[0].subscribers, 1);
-            assert_eq!(topics[0].messages_buffered, 0);
+    let deadline = tokio::time::Instant::now() + TEST_TIMEOUT;
+    let topics = loop {
+        let request = Envelope::new(PeerId::new(), MessageKind::TopicsRequest);
+        send(&mut client, &request).await;
+        let reply = recv(&mut client).await;
+        let topics = match reply.kind {
+            MessageKind::TopicsReply { topics, .. } => topics,
+            other => panic!("expected a TopicsReply, got {other:?}"),
+        };
+        if topics.iter().any(|t| t.subscribers > 0) {
+            break topics;
         }
-        other => panic!("expected a TopicsReply, got {other:?}"),
-    }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "forwarder never registered within {TEST_TIMEOUT:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+
+    assert_eq!(topics.len(), 1);
+    assert_eq!(topics[0].topic, topic("weather.updates"));
+    assert_eq!(topics[0].subscribers, 1);
+    assert_eq!(topics[0].messages_buffered, 0);
 }
 
 #[tokio::test]

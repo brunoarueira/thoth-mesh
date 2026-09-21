@@ -709,15 +709,51 @@ impl Broker {
     /// (ADR-0022) - those live in a separate map entirely. See
     /// ADR-0052.
     pub async fn topics(&self) -> Vec<TopicInfo> {
+        // Consumer-group members (ADR-0042) are live subscribers too,
+        // but registered in `groups` - a completely separate map from
+        // `topics`/`TopicChannel::sender`'s ordinary fan-out receivers
+        // (see `join_group`'s own docs) - so they'd otherwise be
+        // invisible here. Only a group joined with a literal filter
+        // corresponds to exactly one topic; a wildcard-filter group
+        // matches an unknowable set of topics and is left out,
+        // consistent with "exact topics only" (ADR-0052).
+        let mut group_subscribers: HashMap<Topic, u64> = HashMap::new();
+        for ((filter, _group_name), members) in self.groups.lock().unwrap().iter() {
+            if let Some(topic) = filter.as_topic() {
+                *group_subscribers.entry(topic).or_insert(0) += members.members.len() as u64;
+            }
+        }
+
         let topics = self.topics.read().await;
-        topics
+        let mut seen: HashSet<Topic> = HashSet::new();
+        let mut result: Vec<TopicInfo> = topics
             .iter()
-            .map(|(topic, channel)| TopicInfo {
-                topic: topic.clone(),
-                subscribers: channel.sender.receiver_count() as u64,
-                messages_buffered: channel.state.lock().unwrap().buffer.len() as u64,
+            .map(|(topic, channel)| {
+                seen.insert(topic.clone());
+                let fanout = channel.sender.receiver_count() as u64;
+                let group = group_subscribers.get(topic).copied().unwrap_or(0);
+                TopicInfo {
+                    topic: topic.clone(),
+                    subscribers: fanout + group,
+                    messages_buffered: channel.state.lock().unwrap().buffer.len() as u64,
+                }
             })
-            .collect()
+            .collect();
+
+        // A topic with only live group members - never plain-
+        // subscribed to or published to - has no `topics` map entry
+        // at all; surface it too rather than silently dropping it.
+        for (topic, subscribers) in group_subscribers {
+            if !seen.contains(&topic) {
+                result.push(TopicInfo {
+                    topic,
+                    subscribers,
+                    messages_buffered: 0,
+                });
+            }
+        }
+
+        result
     }
 }
 
@@ -2394,6 +2430,44 @@ mod tests {
     #[tokio::test]
     async fn topics_is_empty_for_a_fresh_broker() {
         let broker = Broker::new();
+        assert!(broker.topics().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn topics_counts_consumer_group_members_as_subscribers() {
+        // A group's delivery path never touches the topic's broadcast
+        // channel a fan-out subscriber's receiver_count() reads - so
+        // group membership has to be read from `groups` separately.
+        let broker = Broker::new();
+        let topic = Topic::from_str("weather.updates").unwrap();
+        let _receivers = join_members(&broker, topic.clone().into(), "workers", 2).await;
+
+        let topics = broker.topics().await;
+        assert_eq!(topics.len(), 1);
+        assert_eq!(topics[0].topic, topic);
+        assert_eq!(topics[0].subscribers, 2);
+        assert_eq!(topics[0].messages_buffered, 0);
+    }
+
+    #[tokio::test]
+    async fn topics_sums_fanout_and_group_subscribers_on_the_same_topic() {
+        let broker = Broker::new();
+        let topic = Topic::from_str("weather.updates").unwrap();
+        let _fanout_rx = subscribe_live(&broker, topic.clone()).await;
+        let _group_rx = join_members(&broker, topic.clone().into(), "workers", 3).await;
+
+        let topics = broker.topics().await;
+        assert_eq!(topics.len(), 1);
+        assert_eq!(topics[0].subscribers, 4);
+    }
+
+    #[tokio::test]
+    async fn topics_ignores_a_wildcard_filter_groups_membership() {
+        // A wildcard-filter group matches an unknowable set of topics,
+        // not one - it must never be attributed to any single entry.
+        let broker = Broker::new();
+        let _receivers = join_members(&broker, filter("weather.+"), "workers", 2).await;
+
         assert!(broker.topics().await.is_empty());
     }
 }

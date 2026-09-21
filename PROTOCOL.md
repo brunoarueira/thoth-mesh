@@ -536,12 +536,13 @@ peer the node currently has an open link to (not the full history a
 capped-and-collapsed from), and `metrics` mirrors every counter that
 endpoint's Prometheus text exposes (ADR-0013), just as typed fields
 instead of text - the two field sets correspond 1:1, minus the
-`thothmesh_` prefix. Unlike every other message kind, `StatusRequest` carries no fields at
-all - a unit variant, which serde/ciborium's externally-tagged
-representation encodes as a bare CBOR text string (`"StatusRequest"`),
-not a one-entry map the way every field-carrying variant above is. An
-implementation decoding the envelope's `kind` needs to accept a bare
-string as well as a map with one entry.
+`thothmesh_` prefix. Unlike every field-carrying message kind above,
+`StatusRequest` carries no fields at all - a unit variant, which
+serde/ciborium's externally-tagged representation encodes as a bare
+CBOR text string (`"StatusRequest"`), not a one-entry map the way
+every field-carrying variant is (`TopicsRequest`, just below, is the
+same). An implementation decoding the envelope's `kind` needs to
+accept a bare string as well as a map with one entry.
 
 ### `TopicsRequest` / `TopicsReply`
 
@@ -563,12 +564,14 @@ above).
 A topic appears in `topics` if at least one of the two is non-zero:
 
 - `subscribers`: live connections currently registered for this exact
-  topic.
-- `messages_buffered`: envelopes currently held in this topic's
-  [replay buffer](#message-replay) - non-zero means it's been
-  published to recently (within the replay window); zero doesn't
-  necessarily mean *never*, since an old publish can have aged out of
-  the buffer's bounded capacity.
+  topic - an ordinary fan-out subscriber and a consumer-group member
+  (ADR-0042) both count, even though a group's own delivery path never
+  touches the topic's broadcast channel a fan-out subscriber's does.
+- `messages_buffered`: envelopes currently held in this topic's replay
+  buffer ([ADR-0021](docs/adr/0021-message-replay-ring-buffer.md)) -
+  non-zero means it's been published to recently (within the replay
+  window); zero doesn't necessarily mean *never*, since an old publish
+  can have aged out of the buffer's bounded capacity.
 
 Never includes a wildcard filter pattern (ADR-0022) some connection is
 subscribed with - only concrete topic names a `Publish` could actually
