@@ -58,6 +58,7 @@ thoth-mesh, using the format described in
 | [0050](0050-request-reply-over-pubsub.md) | Request/reply over pub/sub |
 | [0051](0051-per-principal-publish-rate-limiting.md) | Per-principal publish rate limiting |
 | [0052](0052-topic-discovery.md) | Topic discovery |
+| [0053](0053-payload-level-encryption.md) | Payload-level encryption |
 
 To add a new one, copy the format of an existing ADR, number it
 sequentially, and set its status to `Accepted` once the decision is

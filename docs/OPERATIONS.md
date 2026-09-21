@@ -373,6 +373,81 @@ exposing this port to an untrusted caller at all, not for a partial
 filter here). Reports only this node's own broker - not a mesh-wide
 aggregate, the same scope `status` itself has.
 
+## Payload-level encryption
+
+TLS ([below](#tls)) protects a payload in transit between two directly
+connected parties, but a payload relayed through an intermediate peer
+is readable by that peer - there's no end-to-end option built into the
+protocol, and, per [ADR-0053](adr/0053-payload-level-encryption.md),
+there doesn't need to be one: a `Publish` payload is already fully
+opaque bytes (nothing here ever inspects or interprets it), and
+`publish`/`subscribe`'s raw stdin/stdout fidelity
+([ADR-0035](adr/0035-cli-payload-fidelity.md)) already makes piping
+through any external encryption tool a complete end-to-end solution
+today, with nothing to install beyond that tool itself. An
+intermediate relaying peer only ever sees ciphertext.
+
+Two well-known tools, each shown in both its asymmetric (encrypt to a
+recipient's public key) and symmetric (both sides already share a
+passphrase) mode - pick whichever axis matches how the two ends can
+practically exchange key material, and whichever tool matches what's
+already in use where this runs. Key exchange/distribution itself is
+entirely up to you; neither thoth-mesh nor this cookbook attempts it.
+
+**[`age`](https://age-encryption.org)** - modern, minimal, no
+configuration:
+
+```sh
+# Asymmetric: publisher encrypts to the subscriber's public key.
+age-keygen -o subscriber.key   # once, on the subscriber's side; prints
+                                # the matching public key to use below
+age -e -r <subscriber-public-key> secret.bin | thoth-mesh publish secure.topic -
+thoth-mesh subscribe secure.topic --output raw | age -d -i subscriber.key
+
+# Symmetric: both sides already share a passphrase.
+age -e -p secret.bin | thoth-mesh publish secure.topic -   # prompts for it
+thoth-mesh subscribe secure.topic --output raw | age -d    # prompts for it
+```
+
+**[GnuPG](https://gnupg.org)** (`gpg`) - the older, far more widely
+already-deployed option; reach for this instead of `age` if an
+existing PGP keyring/web-of-trust is already in place rather than
+introducing a second key format:
+
+```sh
+# Asymmetric: the subscriber's public key already imported locally.
+gpg --encrypt --recipient <subscriber-key-id-or-email> secret.bin \
+  | thoth-mesh publish secure.topic -
+thoth-mesh subscribe secure.topic --output raw | gpg --decrypt
+
+# Symmetric: both sides already share a passphrase.
+gpg --symmetric --output - secret.bin | thoth-mesh publish secure.topic -
+thoth-mesh subscribe secure.topic --output raw | gpg --decrypt
+```
+
+`openssl enc` is deliberately not shown here despite being close to
+universally installed already - its `enc` subcommand has a long
+history of poor support for authenticated (AEAD) cipher modes, making
+it easy to reach for exactly the flag combination (a non-authenticated
+mode) this cookbook most wants to steer away from. Any tool that
+reads/writes raw bytes on stdin/stdout composes the same way `age`/
+`gpg` do above; these two are just the safest, most turnkey starting
+points, not the only ones that work.
+
+**Known limitation - continuous per-message decryption.**
+`subscribe --output raw` writes every delivered payload back-to-back
+with no delimiter between messages (deliberately, see ADR-0035). The
+recipes above work cleanly for encrypting a `publish` (always exactly
+one payload in, one ciphertext out) and for capturing and decrypting
+exactly *one* delivered message - they do **not** work for feeding a
+long-running `subscribe --output raw` session's continuous stream into
+one long-running decrypt process: none of the ciphertext formats above
+are self-delimiting when naively concatenated, so a decryptor fed the
+whole stream produces one corrupt blob after the first message, not a
+sequence of independently-decrypted ones. A subscriber that genuinely
+needs to decrypt each of many messages independently has to re-invoke
+`subscribe` per message today.
+
 ## Metrics
 
 A node opens no metrics port by default. Pass `--metrics-addr` to
