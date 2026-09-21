@@ -27,7 +27,7 @@ use thoth_mesh_broker::Broker;
 use thoth_mesh_core::async_framing;
 use thoth_mesh_core::{
     Envelope, FramingError, MessageId, MessageKind, PeerAdvert, PeerId, PeerSummary, Topic,
-    TopicFilter,
+    TopicFilter, TopicSummary,
 };
 use thoth_mesh_tls::{MaybeTlsStream, fingerprint};
 use tokio::io::{WriteHalf, split};
@@ -240,10 +240,13 @@ async fn run_connection(socket: MaybeTlsStream, shared: Shared, initial_peer: Op
                 ctx.handle_ack(*in_reply_to);
                 true
             }
-            MessageKind::Error { .. } | MessageKind::StatusReply { .. } => {
+            MessageKind::Error { .. }
+            | MessageKind::StatusReply { .. }
+            | MessageKind::TopicsReply { .. } => {
                 // Not actionable from a client in v1; ignore. A
-                // StatusReply is only ever sent by a node, never a
-                // client, but still has to go somewhere in this match.
+                // StatusReply/TopicsReply is only ever sent by a node,
+                // never a client, but still has to go somewhere in
+                // this match.
                 true
             }
             MessageKind::Hello { listen_addr } => {
@@ -255,6 +258,7 @@ async fn run_connection(socket: MaybeTlsStream, shared: Shared, initial_peer: Op
                 true
             }
             MessageKind::StatusRequest => ctx.handle_status(&envelope).await,
+            MessageKind::TopicsRequest => ctx.handle_topics(&envelope).await,
         };
         if !keep_going {
             break;
@@ -837,6 +841,39 @@ impl ConnectionContext {
                     &self.metrics,
                     self.rate_limiter.as_deref(),
                 ),
+            },
+        );
+        self.send(reply).await
+    }
+
+    /// Handles a `TopicsRequest`: replies with every exact topic this
+    /// node's own broker currently considers active - a live
+    /// subscriber, at least one message in its replay buffer, or both
+    /// (sorted by topic name, for deterministic output - `Broker::topics`
+    /// doesn't guarantee an order). Never a wildcard pattern (ADR-0022).
+    /// Answered on any connection, client or peer link, with no ACL
+    /// check, the same posture `StatusRequest` already has. Returns
+    /// `false` if the outgoing queue has closed and the read loop
+    /// should stop. See ADR-0052.
+    async fn handle_topics(&self, envelope: &Envelope) -> bool {
+        let mut topics: Vec<TopicSummary> = self
+            .broker
+            .topics()
+            .await
+            .into_iter()
+            .filter(|info| info.subscribers > 0 || info.messages_buffered > 0)
+            .map(|info| TopicSummary {
+                topic: info.topic,
+                subscribers: info.subscribers,
+                messages_buffered: info.messages_buffered,
+            })
+            .collect();
+        topics.sort_by(|a, b| a.topic.as_str().cmp(b.topic.as_str()));
+        let reply = Envelope::new(
+            self.node_id,
+            MessageKind::TopicsReply {
+                in_reply_to: envelope.id,
+                topics,
             },
         );
         self.send(reply).await

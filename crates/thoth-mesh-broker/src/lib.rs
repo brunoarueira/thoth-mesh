@@ -700,6 +700,89 @@ impl Broker {
     pub fn persist_failures(&self) -> u64 {
         self.persist_failures.load(Ordering::Relaxed)
     }
+
+    /// Every exact-topic entry this broker currently holds, with its
+    /// live subscriber count and how many envelopes currently sit in
+    /// its replay buffer - the raw signals a caller (namely
+    /// `thoth-mesh-node`'s `TopicsRequest` handler) combines into
+    /// whatever it considers "active." Never a wildcard pattern
+    /// (ADR-0022) - those live in a separate map entirely. See
+    /// ADR-0052.
+    pub async fn topics(&self) -> Vec<TopicInfo> {
+        // Consumer-group members (ADR-0042) are live subscribers too,
+        // but registered in `groups` - a completely separate map from
+        // `topics`/`TopicChannel::sender`'s ordinary fan-out receivers
+        // (see `join_group`'s own docs) - so they'd otherwise be
+        // invisible here. Only a group joined with a literal filter
+        // corresponds to exactly one topic; a wildcard-filter group
+        // matches an unknowable set of topics and is left out,
+        // consistent with "exact topics only" (ADR-0052).
+        let mut group_subscribers: HashMap<Topic, u64> = HashMap::new();
+        for ((filter, _group_name), members) in self.groups.lock().unwrap().iter() {
+            let Some(topic) = filter.as_topic() else {
+                continue;
+            };
+            // A dropped connection's mpsc::Sender only leaves `members`
+            // once its owning connection's shut_down() calls
+            // leave_group - deliver() never prunes on a failed
+            // try_send, so a closed sender can briefly linger after
+            // its connection is already gone. Counting is_closed()
+            // senders would overreport a subscriber who's actually
+            // disconnected, and inserting a zero count for a fully-
+            // vacated group (a stale (filter, group) entry `groups`
+            // never removes outright) would otherwise let the
+            // "no `topics` entry at all" rescue loop below synthesize
+            // a phantom zero/zero entry.
+            let live = members
+                .members
+                .iter()
+                .filter(|member| !member.is_closed())
+                .count() as u64;
+            if live > 0 {
+                *group_subscribers.entry(topic).or_insert(0) += live;
+            }
+        }
+
+        let topics = self.topics.read().await;
+        let mut seen: HashSet<Topic> = HashSet::new();
+        let mut result: Vec<TopicInfo> = topics
+            .iter()
+            .map(|(topic, channel)| {
+                seen.insert(topic.clone());
+                let fanout = channel.sender.receiver_count() as u64;
+                let group = group_subscribers.get(topic).copied().unwrap_or(0);
+                TopicInfo {
+                    topic: topic.clone(),
+                    subscribers: fanout + group,
+                    messages_buffered: channel.state.lock().unwrap().buffer.len() as u64,
+                }
+            })
+            .collect();
+
+        // A topic with only live group members - never plain-
+        // subscribed to or published to - has no `topics` map entry
+        // at all; surface it too rather than silently dropping it.
+        for (topic, subscribers) in group_subscribers {
+            if !seen.contains(&topic) {
+                result.push(TopicInfo {
+                    topic,
+                    subscribers,
+                    messages_buffered: 0,
+                });
+            }
+        }
+
+        result
+    }
+}
+
+/// One exact-topic entry as [`Broker::topics`] reports it. See
+/// ADR-0052.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TopicInfo {
+    pub topic: Topic,
+    pub subscribers: u64,
+    pub messages_buffered: u64,
 }
 
 /// A `HashMap<K, Arc<TopicChannel>>` paired with a `VecDeque<K>`
@@ -2310,5 +2393,129 @@ mod tests {
         assert!(seen.record(a));
         // `c` is recent enough to still be remembered.
         assert!(!seen.record(c));
+    }
+
+    #[tokio::test]
+    async fn topics_reports_subscriber_count_and_buffered_messages() {
+        let broker = Broker::new();
+        let topic = Topic::from_str("weather.updates").unwrap();
+        let rx = subscribe_live(&broker, topic.clone()).await;
+
+        broker
+            .publish(&topic, publish_envelope(&topic, b"sunny"))
+            .await;
+        broker
+            .publish(&topic, publish_envelope(&topic, b"cloudy"))
+            .await;
+
+        let topics = broker.topics().await;
+        assert_eq!(topics.len(), 1);
+        assert_eq!(topics[0].topic, topic);
+        assert_eq!(topics[0].subscribers, 1);
+        assert_eq!(topics[0].messages_buffered, 2);
+
+        drop(rx);
+    }
+
+    #[tokio::test]
+    async fn topics_includes_a_published_topic_with_no_subscriber() {
+        let broker = Broker::new();
+        let topic = Topic::from_str("weather.updates").unwrap();
+
+        broker
+            .publish(&topic, publish_envelope(&topic, b"sunny"))
+            .await;
+
+        let topics = broker.topics().await;
+        assert_eq!(topics.len(), 1);
+        assert_eq!(topics[0].subscribers, 0);
+        assert_eq!(topics[0].messages_buffered, 1);
+    }
+
+    #[tokio::test]
+    async fn topics_includes_a_subscribed_topic_with_no_publish_yet() {
+        let broker = Broker::new();
+        let topic = Topic::from_str("weather.updates").unwrap();
+        let rx = subscribe_live(&broker, topic.clone()).await;
+
+        let topics = broker.topics().await;
+        assert_eq!(topics.len(), 1);
+        assert_eq!(topics[0].subscribers, 1);
+        assert_eq!(topics[0].messages_buffered, 0);
+
+        drop(rx);
+    }
+
+    #[tokio::test]
+    async fn topics_is_empty_for_a_fresh_broker() {
+        let broker = Broker::new();
+        assert!(broker.topics().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn topics_counts_consumer_group_members_as_subscribers() {
+        // A group's delivery path never touches the topic's broadcast
+        // channel a fan-out subscriber's receiver_count() reads - so
+        // group membership has to be read from `groups` separately.
+        let broker = Broker::new();
+        let topic = Topic::from_str("weather.updates").unwrap();
+        let _receivers = join_members(&broker, topic.clone().into(), "workers", 2).await;
+
+        let topics = broker.topics().await;
+        assert_eq!(topics.len(), 1);
+        assert_eq!(topics[0].topic, topic);
+        assert_eq!(topics[0].subscribers, 2);
+        assert_eq!(topics[0].messages_buffered, 0);
+    }
+
+    #[tokio::test]
+    async fn topics_sums_fanout_and_group_subscribers_on_the_same_topic() {
+        let broker = Broker::new();
+        let topic = Topic::from_str("weather.updates").unwrap();
+        let _fanout_rx = subscribe_live(&broker, topic.clone()).await;
+        let _group_rx = join_members(&broker, topic.clone().into(), "workers", 3).await;
+
+        let topics = broker.topics().await;
+        assert_eq!(topics.len(), 1);
+        assert_eq!(topics[0].subscribers, 4);
+    }
+
+    #[tokio::test]
+    async fn topics_ignores_a_wildcard_filter_groups_membership() {
+        // A wildcard-filter group matches an unknowable set of topics,
+        // not one - it must never be attributed to any single entry.
+        let broker = Broker::new();
+        let _receivers = join_members(&broker, filter("weather.+"), "workers", 2).await;
+
+        assert!(broker.topics().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn topics_never_counts_a_dropped_groups_receiver_as_a_live_subscriber() {
+        // deliver() never prunes a closed sender on a failed try_send -
+        // only leave_group (a connection's own shut_down cleanup)
+        // does. Dropping the receiver without calling leave_group
+        // simulates the real window between a connection actually
+        // dying and that cleanup running.
+        let broker = Broker::new();
+        let topic = Topic::from_str("weather.updates").unwrap();
+        let mut receivers = join_members(&broker, topic.clone().into(), "workers", 2).await;
+        drop(receivers.remove(0));
+
+        let topics = broker.topics().await;
+        assert_eq!(topics.len(), 1);
+        assert_eq!(topics[0].subscribers, 1);
+    }
+
+    #[tokio::test]
+    async fn topics_omits_a_fully_vacated_group_entirely() {
+        // A stale (filter, group) entry with every member's receiver
+        // dropped must not surface as a phantom zero/zero topic.
+        let broker = Broker::new();
+        let topic = Topic::from_str("weather.updates").unwrap();
+        let receivers = join_members(&broker, topic.into(), "workers", 2).await;
+        drop(receivers);
+
+        assert!(broker.topics().await.is_empty());
     }
 }

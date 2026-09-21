@@ -39,8 +39,10 @@ TTL and dead-lettering), and
 [ADR-0050](docs/adr/0050-request-reply-over-pubsub.md) (request/reply
 over pub/sub), and
 [ADR-0051](docs/adr/0051-per-principal-publish-rate-limiting.md)
-(per-principal publish rate limiting). For diagrams of several of
-these flows, see [docs/FLOWS.md](docs/FLOWS.md).
+(per-principal publish rate limiting), and
+[ADR-0052](docs/adr/0052-topic-discovery.md) (topic discovery). For
+diagrams of several of these flows, see
+[docs/FLOWS.md](docs/FLOWS.md).
 
 **Status:** version 1, and explicitly unstable — see ADR-0014. Nothing
 here should be assumed to hold across a breaking change; check
@@ -534,12 +536,49 @@ peer the node currently has an open link to (not the full history a
 capped-and-collapsed from), and `metrics` mirrors every counter that
 endpoint's Prometheus text exposes (ADR-0013), just as typed fields
 instead of text - the two field sets correspond 1:1, minus the
-`thothmesh_` prefix. Unlike every other message kind, `StatusRequest` carries no fields at
-all - a unit variant, which serde/ciborium's externally-tagged
-representation encodes as a bare CBOR text string (`"StatusRequest"`),
-not a one-entry map the way every field-carrying variant above is. An
-implementation decoding the envelope's `kind` needs to accept a bare
-string as well as a map with one entry.
+`thothmesh_` prefix. Unlike every field-carrying message kind above,
+`StatusRequest` carries no fields at all - a unit variant, which
+serde/ciborium's externally-tagged representation encodes as a bare
+CBOR text string (`"StatusRequest"`), not a one-entry map the way
+every field-carrying variant is (`TopicsRequest`, just below, is the
+same). An implementation decoding the envelope's `kind` needs to
+accept a bare string as well as a map with one entry.
+
+### `TopicsRequest` / `TopicsReply`
+
+```
+"TopicsRequest"
+{"TopicsReply": {
+  "in_reply_to": <MessageId>,
+  "topics": [{"topic": <Topic>, "subscribers": <u64>, "messages_buffered": <u64>}, ...]
+}}
+```
+
+Requests every exact topic the receiving node's own broker currently
+considers active. Answered on any connection - client or peer link -
+with no ACL check, the same posture `StatusRequest` above already has
+([ADR-0052](docs/adr/0052-topic-discovery.md)). `TopicsRequest` is a
+unit variant, encoded the same bare-string way `StatusRequest` is (see
+above).
+
+A topic appears in `topics` if at least one of the two is non-zero:
+
+- `subscribers`: live connections currently registered for this exact
+  topic - an ordinary fan-out subscriber and a consumer-group member
+  (ADR-0042) both count, even though a group's own delivery path never
+  touches the topic's broadcast channel a fan-out subscriber's does.
+- `messages_buffered`: envelopes currently held in this topic's replay
+  buffer ([ADR-0021](docs/adr/0021-message-replay-ring-buffer.md)) -
+  non-zero means it's been published to recently (within the replay
+  window); zero doesn't necessarily mean *never*, since an old publish
+  can have aged out of the buffer's bounded capacity.
+
+Never includes a wildcard filter pattern (ADR-0022) some connection is
+subscribed with - only concrete topic names a `Publish` could actually
+target. Reports only what *this* node's own broker currently holds
+(which already includes traffic forwarded in from a peer link, since a
+forwarded envelope goes through the same publish path a local client's
+does) - never a mesh-aggregated view across other nodes.
 
 ## Connections: clients vs. peer links
 

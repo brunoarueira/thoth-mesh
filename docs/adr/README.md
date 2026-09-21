@@ -57,6 +57,7 @@ thoth-mesh, using the format described in
 | [0049](0049-selective-per-peer-link-topic-filtering.md) | Selective per-peer-link topic filtering |
 | [0050](0050-request-reply-over-pubsub.md) | Request/reply over pub/sub |
 | [0051](0051-per-principal-publish-rate-limiting.md) | Per-principal publish rate limiting |
+| [0052](0052-topic-discovery.md) | Topic discovery |
 
 To add a new one, copy the format of an existing ADR, number it
 sequentially, and set its status to `Accepted` once the decision is
