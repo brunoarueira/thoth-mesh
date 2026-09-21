@@ -416,7 +416,7 @@ introducing a second key format:
 
 ```sh
 # Asymmetric: the subscriber's public key already imported locally.
-gpg --encrypt --recipient <subscriber-key-id-or-email> secret.bin \
+gpg --encrypt --recipient <subscriber-key-id-or-email> --output - secret.bin \
   | thoth-mesh publish secure.topic -
 thoth-mesh subscribe secure.topic --output raw | gpg --decrypt
 
@@ -444,9 +444,18 @@ long-running `subscribe --output raw` session's continuous stream into
 one long-running decrypt process: none of the ciphertext formats above
 are self-delimiting when naively concatenated, so a decryptor fed the
 whole stream produces one corrupt blob after the first message, not a
-sequence of independently-decrypted ones. A subscriber that genuinely
-needs to decrypt each of many messages independently has to re-invoke
-`subscribe` per message today.
+sequence of independently-decrypted ones. Re-invoking `subscribe` for
+each message isn't a reliable workaround either: a fresh `subscribe`
+replays whatever's already sitting in the topic's
+[replay buffer](#message-replay) (ADR-0021), not just "the next new
+message" - it can hand back several buffered messages at once, or a
+stale one from before this invocation, defeating the same one-message
+assumption. **Decrypting a continuous stream of independent messages
+as they arrive is genuinely unsupported today** - there's no
+one-message or delivery-boundary mode to build a workaround on. This
+is a real, separate follow-up (e.g. a delimited/length-prefixed
+`--output` mode), not something to route around with CLI invocation
+tricks.
 
 ## Metrics
 

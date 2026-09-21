@@ -111,14 +111,17 @@ long-running decrypt process and expecting each message decrypted
 independently - none of the ciphertext formats above are
 self-delimiting when naively concatenated, so a decryptor fed the
 whole stream sees one corrupt blob after the first message, not a
-sequence of independent ones. The cookbook says this plainly rather
-than implying a pattern that quietly breaks past the first message. A
-reader who genuinely needs continuous per-message decryption has to
-either re-invoke `subscribe` per message today, or this becomes a
-real, separate follow-up (e.g. a delimited/length-prefixed
-`--output` mode) if real usage shows it's wanted - not something this
-ADR tries to solve by making the cookbook's advice vaguer than it
-should be.
+sequence of independent ones. Re-invoking `subscribe` per message
+isn't a real workaround either - a fresh `subscribe` replays whatever
+the topic's replay buffer (ADR-0021) already holds, not just "the
+next new message," so it can hand back several buffered messages at
+once or a stale one, defeating the same one-message assumption. The
+cookbook says plainly that continuous per-message decryption is
+genuinely unsupported today, rather than implying a workaround that
+quietly breaks. This is a real, separate follow-up (e.g. a
+delimited/length-prefixed `--output` mode) if real usage shows it's
+wanted - not something this ADR tries to solve by making the
+cookbook's advice vaguer than it should be.
 
 ## Consequences
 
