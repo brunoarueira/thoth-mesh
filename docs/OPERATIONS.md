@@ -122,6 +122,57 @@ If you bind `--addr`/`--metrics-addr` to a port below 1024, the
 default `CapabilityBoundingSet=` (empty) refuses to start — the unit
 file comments where to add `CAP_NET_BIND_SERVICE` instead.
 
+A config file ([below](#node-config-file)) is a self-documenting
+alternative to threading every flag through `NODE_ARGS` - point
+`ExecStart=`'s `$NODE_ARGS` at just `--config /etc/thoth-mesh/node.toml`
+instead, and put the actual settings in that file.
+
+## Node config file
+
+Every flag below can instead be supplied by a TOML config file
+(see [ADR-0054](adr/0054-node-config-file.md)) - the conventional
+per-OS location (`~/.config/thoth-mesh/node.toml` on Linux) if
+`--config <path>` isn't given, same idea as `thoth-mesh-cli`'s own
+config file (`config.toml`, in the same directory - two files, not two
+locations). A flag given on the command line always overrides the same
+key in the file; a repeated flag (`--peer`, `--topic-acl`, and the
+rest of the list-shaped ones) becomes a TOML array, and a non-empty
+CLI list replaces the file's array outright rather than merging with
+it - the same "CLI wins, in full" rule as every scalar flag, not a
+union:
+
+```toml
+addr = "0.0.0.0:49500"
+log_level = "info"
+peer = ["node-b.internal:49500", "node-c.internal:49500"]
+metrics_addr = "0.0.0.0:9090"
+metrics_token_file = "/etc/thoth-mesh/metrics-token"
+data_dir = "/var/lib/thoth-mesh"
+tls_cert = "/etc/thoth-mesh/node-cert.pem"
+tls_key = "/etc/thoth-mesh/node-key.pem"
+tls_ca = "/etc/thoth-mesh/ca-cert.pem"
+allow_peer = ["3F:08:CA:D2:92:03:BB:AA:B8:DD:92:32:33:8B:BD:0E:F8:E6:D9:E4:70:27:87:4E:51:D3:24:6E:CC:1A:92:10"]
+topic_acl = ["anonymous|sub|status.public"]
+peer_topic_acl = []
+peer_topic_filter = []
+persisted_message_ttl_secs = 604800
+dead_letter_topic = "dead-letter"
+publish_rate_limit_per_sec = 100
+publish_rate_limit_burst = 200
+```
+
+Every key is optional and every combination the flags themselves
+require together (the TLS trio, `--allow-peer` needing `--tls-cert`,
+`--metrics-token-file` needing `--metrics-addr`,
+`--persisted-message-ttl-secs` needing `--data-dir`,
+`--publish-rate-limit-burst` needing `--publish-rate-limit-per-sec`)
+is enforced the same way even when the pieces are split across a flag
+and the file - naming a certificate in the file but its key only as a
+flag is still an error, not silently ignored. An unrecognized key
+(a typo) is a hard error too, at either kind of path; a config file
+that simply doesn't exist - explicit `--config` or the conventional
+location - isn't, and is treated as empty.
+
 ## Single-node quickstart
 
 Start a node. By default it listens on `127.0.0.1:49500`
