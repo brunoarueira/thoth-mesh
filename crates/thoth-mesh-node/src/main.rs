@@ -53,18 +53,20 @@ struct Cli {
     data_dir: Option<PathBuf>,
 
     /// This node's TLS certificate (PEM). Requires --tls-key and
-    /// --tls-ca too - TLS is off (plaintext, as before) unless all
-    /// three are given. See ADR-0016 and docs/OPERATIONS.md.
-    #[arg(long, requires_all = ["tls_key", "tls_ca"])]
+    /// --tls-ca too (from either this flag or the config file - see
+    /// EffectiveConfig::merge, ADR-0054) - TLS is off (plaintext, as
+    /// before) unless all three are given. See ADR-0016 and
+    /// docs/OPERATIONS.md.
+    #[arg(long)]
     tls_cert: Option<PathBuf>,
 
     /// This node's TLS private key (PEM). See --tls-cert.
-    #[arg(long, requires_all = ["tls_cert", "tls_ca"])]
+    #[arg(long)]
     tls_key: Option<PathBuf>,
 
     /// CA certificate (PEM) this node trusts to verify anyone else's
     /// TLS certificate. See --tls-cert.
-    #[arg(long, requires_all = ["tls_cert", "tls_key"])]
+    #[arg(long)]
     tls_ca: Option<PathBuf>,
 
     /// SHA-256 fingerprint (as printed by `openssl x509 -fingerprint
@@ -72,7 +74,7 @@ struct Cli {
     /// Repeatable. Requires --tls-cert/--tls-key/--tls-ca too - with
     /// none given, every peer link is allowed, unchanged from before
     /// this flag existed. See ADR-0017 and docs/OPERATIONS.md.
-    #[arg(long = "allow-peer", requires = "tls_cert")]
+    #[arg(long = "allow-peer")]
     allow_peer: Vec<String>,
 
     /// Per-topic client publish/subscribe permission, shaped
@@ -117,7 +119,7 @@ struct Cli {
     /// metrics port opens at all; with --metrics-addr but no token
     /// file, any connection to it gets the render, unchanged from
     /// before this flag existed. See ADR-0019 and docs/OPERATIONS.md.
-    #[arg(long = "metrics-token-file", requires = "metrics_addr")]
+    #[arg(long = "metrics-token-file")]
     metrics_token_file: Option<PathBuf>,
 
     /// How long (in seconds) a message survives in the on-disk store
@@ -129,7 +131,7 @@ struct Cli {
     /// age-based expiry runs; the on-disk log is only ever pruned by
     /// count, unchanged from before this flag existed. See ADR-0047
     /// and docs/OPERATIONS.md.
-    #[arg(long = "persisted-message-ttl-secs", requires = "data_dir")]
+    #[arg(long = "persisted-message-ttl-secs")]
     persisted_message_ttl_secs: Option<u64>,
 
     /// A literal topic (not a wildcard) to republish an otherwise-
@@ -159,10 +161,7 @@ struct Cli {
     /// --publish-rate-limit-per-sec; defaults to that flag's own value
     /// if omitted (a flat rate with no extra burst allowance). See
     /// ADR-0051 and docs/OPERATIONS.md.
-    #[arg(
-        long = "publish-rate-limit-burst",
-        requires = "publish_rate_limit_per_sec"
-    )]
+    #[arg(long = "publish-rate-limit-burst")]
     publish_rate_limit_burst: Option<u32>,
 }
 
@@ -199,12 +198,15 @@ impl EffectiveConfig {
     /// `cli.or(file).unwrap_or(built_in_default)` (only `addr`/
     /// `log_level` have one); a repeated flag is the CLI's own list in
     /// full if it's non-empty, otherwise the file's list untouched -
-    /// never a union of both (see ADR-0054). `clap`'s own `requires`/
-    /// `requires_all` on `Cli` already catches a pure-CLI violation of
-    /// every constraint re-checked below before this ever runs; this
-    /// re-checks the same constraints on the *merged* values, since a
-    /// combination split across both sources (one half a flag, the
-    /// other half only in the file) is invisible to clap.
+    /// never a union of both (see ADR-0054). Every cross-flag
+    /// constraint below (the TLS trio, `--allow-peer` needing
+    /// `--tls-cert`, and the rest) is `Cli`'s sole enforcement of it -
+    /// deliberately *not* also `clap`'s own `requires`/`requires_all`,
+    /// which only ever sees what was actually typed on the command
+    /// line: it can't know a flag's dependency was satisfied by the
+    /// config file instead, and would reject an otherwise-valid
+    /// split-source invocation before this function ever ran. One
+    /// check, here, covering every source uniformly.
     fn merge(cli: Cli, file: config::Config) -> std::io::Result<Self> {
         let tls_cert = cli.tls_cert.or(file.tls_cert);
         let tls_key = cli.tls_key.or(file.tls_key);
@@ -323,9 +325,9 @@ async fn main() -> std::io::Result<()> {
         Some(fingerprints)
     };
 
-    // clap's requires_all/requires already enforces all-or-nothing
-    // across the three TLS flags (and that --allow-peer needs them
-    // too); this just assembles them once that's guaranteed.
+    // EffectiveConfig::merge already enforces all-or-nothing across
+    // the three TLS flags (and that --allow-peer needs them too, from
+    // either source); this just assembles them once that's guaranteed.
     let tls = match (cli.tls_cert, cli.tls_key, cli.tls_ca) {
         (Some(cert), Some(key), Some(ca)) => Some(TlsConfig {
             cert,
@@ -614,5 +616,56 @@ mod tests {
         let effective = EffectiveConfig::merge(cli, file).unwrap();
         assert_eq!(effective.addr, "127.0.0.1:49500");
         assert_eq!(effective.allow_peer, vec!["AA:BB"]);
+    }
+
+    /// The scenario a real invocation actually hits: `--allow-peer`
+    /// given as a flag, with the TLS trio it depends on supplied
+    /// entirely by the config file. Exercising this only through
+    /// `merge` directly (as every other test here does) wouldn't have
+    /// caught that `Cli`'s own clap-level `requires` attributes used
+    /// to reject this exact invocation before `merge` ever ran, since
+    /// clap has no visibility into the file - see the git history of
+    /// this test for the actual `thoth-mesh-node` invocation that
+    /// reproduced it.
+    #[test]
+    fn cli_flag_whose_requirement_is_satisfied_only_by_the_config_file_is_accepted() {
+        let cli = Cli {
+            allow_peer: vec!["AA:BB".to_owned()],
+            ..empty_cli()
+        };
+        let file = config::Config {
+            tls_cert: Some(PathBuf::from("cert.pem")),
+            tls_key: Some(PathBuf::from("key.pem")),
+            tls_ca: Some(PathBuf::from("ca.pem")),
+            ..Default::default()
+        };
+        let effective = EffectiveConfig::merge(cli, file).unwrap();
+        assert_eq!(effective.allow_peer, vec!["AA:BB"]);
+        assert!(effective.tls_cert.is_some());
+    }
+
+    /// The actual layer the original bug lived in: `Cli::parse`
+    /// itself, not `merge`. Every test above calls `merge` directly,
+    /// which can't see a clap-level `requires`/`requires_all`
+    /// rejecting the invocation before `merge` ever runs - this is
+    /// the one that would have caught it. `--allow-peer` alone (no
+    /// `--tls-cert`/`--tls-key`/`--tls-ca` flags at all) must parse
+    /// cleanly now; whether it's actually a *valid* combination is
+    /// `merge`'s job, covered above and elsewhere.
+    #[test]
+    fn cli_parsing_no_longer_rejects_a_flag_whose_requirement_might_come_from_the_file() {
+        let cli = Cli::try_parse_from([
+            "thoth-mesh-node",
+            "--allow-peer",
+            "AA:BB",
+            "--metrics-token-file",
+            "token.txt",
+            "--persisted-message-ttl-secs",
+            "60",
+            "--publish-rate-limit-burst",
+            "200",
+        ])
+        .unwrap();
+        assert_eq!(cli.allow_peer, vec!["AA:BB"]);
     }
 }

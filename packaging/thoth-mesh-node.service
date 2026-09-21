@@ -19,6 +19,16 @@ Type=simple
 # if the service is later removed.
 DynamicUser=yes
 
+# Creates /var/lib/thoth-mesh, owned by the DynamicUser above, and
+# carves out just that one directory as writable despite
+# ProtectSystem=strict below - the systemd-recommended way to combine
+# the two, rather than loosening ProtectSystem itself. Needed only if
+# you actually pass --data-dir /var/lib/thoth-mesh (ADR-0045,
+# docs/OPERATIONS.md's "Persistence" section and this unit's own
+# config-file example both use that path) - harmless, an empty unused
+# directory, if you don't.
+StateDirectory=thoth-mesh
+
 # thoth-mesh-node takes CLI flags, not environment variables, for its
 # configuration - there's no env-var surface to bind Environment=
 # directives to directly. An *unquoted* $NODE_ARGS in ExecStart= is
