@@ -1070,8 +1070,10 @@ name = "thoth-mesh-node"
 version = "0.2.0"
 dependencies = [
  "clap",
+ "directories",
  "rcgen",
  "rusqlite",
+ "serde",
  "tempfile",
  "thiserror",
  "thoth-mesh",
@@ -1080,6 +1082,7 @@ dependencies = [
  "thoth-mesh-tls",
  "tokio",
  "tokio-util",
+ "toml",
  "tracing",
  "tracing-subscriber",
 ]

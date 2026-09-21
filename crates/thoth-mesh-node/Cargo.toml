@@ -29,6 +29,9 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 clap = { version = "4.6.6", features = ["derive"] }
 thiserror = "2.0.19"
 rusqlite = { version = "0.40", features = ["bundled"] }
+directories = "6.0.0"
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.1.5"
 
 [dev-dependencies]
 rcgen = "0.14"

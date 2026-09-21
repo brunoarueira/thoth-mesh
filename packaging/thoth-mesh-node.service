@@ -15,9 +15,28 @@ Wants=network-online.target
 Type=simple
 
 # systemd allocates and tears down an ephemeral, unprivileged user for
-# this unit's lifetime - no useradd/groupadd step, nothing left behind
-# if the service is later removed.
+# this unit's lifetime - no useradd/groupadd step, and (unlike
+# StateDirectory below) genuinely nothing left behind once the service
+# stops.
 DynamicUser=yes
+
+# Creates /var/lib/thoth-mesh, owned by the DynamicUser above, and
+# carves out just that one directory as writable despite
+# ProtectSystem=strict below - the systemd-recommended way to combine
+# the two, rather than loosening ProtectSystem itself. Needed only if
+# you actually pass --data-dir /var/lib/thoth-mesh (ADR-0045,
+# docs/OPERATIONS.md's "Persistence" section and this unit's own
+# config-file example both use that path) - an empty, unused directory
+# if you don't.
+#
+# Unlike DynamicUser above, this directory is deliberately NOT torn
+# down when the service stops, is disabled, or the unit file itself is
+# removed - that's the entire point of a *state* directory (ADR-0045's
+# on-disk message log needs to survive a restart). If you actually
+# decommission this node, `rm -rf /var/lib/thoth-mesh` is a separate,
+# explicit step you still need to take - it won't happen on its own,
+# and it can hold real published message history until you do.
+StateDirectory=thoth-mesh
 
 # thoth-mesh-node takes CLI flags, not environment variables, for its
 # configuration - there's no env-var surface to bind Environment=
