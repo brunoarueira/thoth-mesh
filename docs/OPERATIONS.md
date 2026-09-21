@@ -112,7 +112,14 @@ systemd allocates and tears down with the unit's lifetime, not a
 manually-created account — plus a standard hardening bundle
 (`ProtectSystem=strict`, `NoNewPrivileges=yes`, and friends; see the
 unit file's own comments for the full list and why each is safe for
-this daemon specifically). Since `thoth-mesh-node` takes CLI flags,
+this daemon specifically). `StateDirectory=thoth-mesh` in that same
+bundle is what makes `/var/lib/thoth-mesh` writable at all despite
+`ProtectSystem=strict` — unlike the ephemeral `DynamicUser` above,
+this directory (and whatever [`--data-dir`](#persistence) wrote to it)
+is *not* removed when the service is stopped, disabled, or the unit
+file itself deleted; decommissioning a node that used `--data-dir`
+means `rm -rf /var/lib/thoth-mesh` as its own explicit step. Since
+`thoth-mesh-node` takes CLI flags,
 not environment variables, for its configuration, the env file sets a
 single `NODE_ARGS` that `ExecStart=` word-splits the same way a shell
 would — see the unit and env-file comments for why that specific
