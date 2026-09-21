@@ -17,7 +17,7 @@ use std::time::Duration;
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use thoth_mesh_core::{
     Envelope, MessageId, MessageKind, MetricsSummary, PeerId, PeerSummary, Topic, TopicFilter,
-    async_framing,
+    TopicSummary, async_framing,
 };
 use thoth_mesh_tls::{
     MaybeTlsStream, TlsConnector, client_config, fingerprint, load_certs, load_private_key,
@@ -170,6 +170,10 @@ pub enum Command {
     /// Print the node's connected peers and a metrics summary, then
     /// exit. See ADR-0037.
     Status,
+    /// Print every topic the node's own broker currently considers
+    /// active - subscribed to, published to recently, or both - then
+    /// exit. See ADR-0052.
+    Topics,
 }
 
 /// `subscribe --output <MODE>`. See ADR-0035.
@@ -211,6 +215,7 @@ pub async fn run(cli: Cli) -> std::io::Result<()> {
             }
         }
         Command::Status => {}
+        Command::Topics => {}
         Command::Completions { .. } => unreachable!("returned above"),
     }
 
@@ -289,6 +294,7 @@ pub async fn run(cli: Cli) -> std::io::Result<()> {
             subscribe_and_print(&mut conn, sender, filters, output, ack, group, durable).await
         }
         Command::Status => status_and_print(&mut conn, sender).await,
+        Command::Topics => topics_and_print(&mut conn, sender).await,
         Command::Completions { .. } => unreachable!("returned above"),
     }
 }
@@ -746,6 +752,57 @@ fn print_status(reply: &StatusReply) {
         ),
     ] {
         println!("  {name:<32} {value}");
+    }
+}
+
+/// Sends a `TopicsRequest` and waits for the matching `TopicsReply`,
+/// skipping anything else that arrives first - the same "wait for the
+/// reply that's actually ours" pattern [`request_status`] uses. Kept
+/// separate from printing (see [`topics_and_print`]) so it's testable
+/// without capturing stdout. See ADR-0052.
+async fn request_topics(
+    conn: &mut Compat<MaybeTlsStream>,
+    sender: PeerId,
+) -> std::io::Result<Vec<TopicSummary>> {
+    let envelope = Envelope::new(sender, MessageKind::TopicsRequest);
+    send(conn, &envelope).await?;
+    loop {
+        let received = recv(conn).await?;
+        if let MessageKind::TopicsReply {
+            in_reply_to,
+            topics,
+        } = received.kind
+            && in_reply_to == envelope.id
+        {
+            return Ok(topics);
+        }
+    }
+}
+
+/// Requests and prints every topic the node's own broker currently
+/// considers active. See ADR-0052.
+async fn topics_and_print(
+    conn: &mut Compat<MaybeTlsStream>,
+    sender: PeerId,
+) -> std::io::Result<()> {
+    let topics = request_topics(conn, sender).await?;
+    print_topics(&topics);
+    Ok(())
+}
+
+fn print_topics(topics: &[TopicSummary]) {
+    if topics.is_empty() {
+        println!("No active topics.");
+        return;
+    }
+    println!("Active topics ({}):", topics.len());
+    for topic in topics {
+        println!(
+            "  {:<32} subscribers={} messages_buffered={}",
+            topic.topic.as_str(),
+            topic.subscribers,
+            topic.messages_buffered
+        );
     }
 }
 
@@ -1564,6 +1621,64 @@ mod tests {
             tls_cert: None,
             tls_key: None,
             command: Command::Status,
+        };
+        run(cli).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn request_topics_reports_nothing_on_a_fresh_node() {
+        let addr = spawn_test_node().await;
+        let mut client = connect(addr).await;
+
+        let topics = timeout(TEST_TIMEOUT, request_topics(&mut client, PeerId::new()))
+            .await
+            .expect("timed out waiting for the topics reply")
+            .unwrap();
+
+        assert!(topics.is_empty());
+    }
+
+    #[tokio::test]
+    async fn request_topics_reports_a_topic_published_on_the_same_connection() {
+        let addr = spawn_test_node().await;
+        let mut client = connect(addr).await;
+
+        let publish = Envelope::new(
+            PeerId::new(),
+            MessageKind::Publish {
+                topic: "weather.updates".parse().unwrap(),
+                payload: b"sunny".to_vec(),
+                retain: false,
+                content_type: None,
+                reply_to: None,
+                in_reply_to: None,
+            },
+        );
+        send(&mut client, &publish).await.unwrap();
+
+        let topics = timeout(TEST_TIMEOUT, request_topics(&mut client, PeerId::new()))
+            .await
+            .expect("timed out waiting for the topics reply")
+            .unwrap();
+
+        assert_eq!(topics.len(), 1);
+        assert_eq!(topics[0].topic, "weather.updates".parse().unwrap());
+        assert_eq!(topics[0].messages_buffered, 1);
+    }
+
+    #[tokio::test]
+    async fn run_handles_the_topics_command_end_to_end() {
+        // request_topics's own tests above cover the reply's content
+        // in detail; this just proves Command::Topics actually flows
+        // through run()'s validation-then-dispatch path.
+        let addr = spawn_test_node().await;
+        let cli = Cli {
+            addr: Some(addr.to_string()),
+            config: Some(nonexistent_config_path()),
+            tls_ca: None,
+            tls_cert: None,
+            tls_key: None,
+            command: Command::Topics,
         };
         run(cli).await.unwrap();
     }

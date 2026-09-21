@@ -700,6 +700,34 @@ impl Broker {
     pub fn persist_failures(&self) -> u64 {
         self.persist_failures.load(Ordering::Relaxed)
     }
+
+    /// Every exact-topic entry this broker currently holds, with its
+    /// live subscriber count and how many envelopes currently sit in
+    /// its replay buffer - the raw signals a caller (namely
+    /// `thoth-mesh-node`'s `TopicsRequest` handler) combines into
+    /// whatever it considers "active." Never a wildcard pattern
+    /// (ADR-0022) - those live in a separate map entirely. See
+    /// ADR-0052.
+    pub async fn topics(&self) -> Vec<TopicInfo> {
+        let topics = self.topics.read().await;
+        topics
+            .iter()
+            .map(|(topic, channel)| TopicInfo {
+                topic: topic.clone(),
+                subscribers: channel.sender.receiver_count() as u64,
+                messages_buffered: channel.state.lock().unwrap().buffer.len() as u64,
+            })
+            .collect()
+    }
+}
+
+/// One exact-topic entry as [`Broker::topics`] reports it. See
+/// ADR-0052.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TopicInfo {
+    pub topic: Topic,
+    pub subscribers: u64,
+    pub messages_buffered: u64,
 }
 
 /// A `HashMap<K, Arc<TopicChannel>>` paired with a `VecDeque<K>`
@@ -2310,5 +2338,62 @@ mod tests {
         assert!(seen.record(a));
         // `c` is recent enough to still be remembered.
         assert!(!seen.record(c));
+    }
+
+    #[tokio::test]
+    async fn topics_reports_subscriber_count_and_buffered_messages() {
+        let broker = Broker::new();
+        let topic = Topic::from_str("weather.updates").unwrap();
+        let rx = subscribe_live(&broker, topic.clone()).await;
+
+        broker
+            .publish(&topic, publish_envelope(&topic, b"sunny"))
+            .await;
+        broker
+            .publish(&topic, publish_envelope(&topic, b"cloudy"))
+            .await;
+
+        let topics = broker.topics().await;
+        assert_eq!(topics.len(), 1);
+        assert_eq!(topics[0].topic, topic);
+        assert_eq!(topics[0].subscribers, 1);
+        assert_eq!(topics[0].messages_buffered, 2);
+
+        drop(rx);
+    }
+
+    #[tokio::test]
+    async fn topics_includes_a_published_topic_with_no_subscriber() {
+        let broker = Broker::new();
+        let topic = Topic::from_str("weather.updates").unwrap();
+
+        broker
+            .publish(&topic, publish_envelope(&topic, b"sunny"))
+            .await;
+
+        let topics = broker.topics().await;
+        assert_eq!(topics.len(), 1);
+        assert_eq!(topics[0].subscribers, 0);
+        assert_eq!(topics[0].messages_buffered, 1);
+    }
+
+    #[tokio::test]
+    async fn topics_includes_a_subscribed_topic_with_no_publish_yet() {
+        let broker = Broker::new();
+        let topic = Topic::from_str("weather.updates").unwrap();
+        let rx = subscribe_live(&broker, topic.clone()).await;
+
+        let topics = broker.topics().await;
+        assert_eq!(topics.len(), 1);
+        assert_eq!(topics[0].subscribers, 1);
+        assert_eq!(topics[0].messages_buffered, 0);
+
+        drop(rx);
+    }
+
+    #[tokio::test]
+    async fn topics_is_empty_for_a_fresh_broker() {
+        let broker = Broker::new();
+        assert!(broker.topics().await.is_empty());
     }
 }

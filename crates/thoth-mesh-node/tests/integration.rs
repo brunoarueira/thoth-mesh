@@ -1596,6 +1596,97 @@ async fn status_request_reports_a_metrics_summary_reflecting_activity() {
     }
 }
 
+#[tokio::test]
+async fn topics_request_reports_nothing_on_a_fresh_node() {
+    let addr = spawn_test_node().await;
+    let mut client = connect(addr).await;
+
+    let request = Envelope::new(PeerId::new(), MessageKind::TopicsRequest);
+    send(&mut client, &request).await;
+
+    let reply = recv(&mut client).await;
+    match reply.kind {
+        MessageKind::TopicsReply {
+            in_reply_to,
+            topics,
+        } => {
+            assert_eq!(in_reply_to, request.id);
+            assert!(topics.is_empty());
+        }
+        other => panic!("expected a TopicsReply, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn topics_request_reports_a_subscribed_topic_with_no_publish_yet() {
+    let addr = spawn_test_node().await;
+    let mut subscriber = connect(addr).await;
+
+    let sub = Envelope::new(
+        PeerId::new(),
+        MessageKind::Subscribe {
+            filter: topic("weather.updates").into(),
+            ack: false,
+            group: None,
+            durable: false,
+        },
+    );
+    send(&mut subscriber, &sub).await;
+    recv(&mut subscriber).await; // subscribe ack
+
+    let mut client = connect(addr).await;
+    let request = Envelope::new(PeerId::new(), MessageKind::TopicsRequest);
+    send(&mut client, &request).await;
+
+    let reply = recv(&mut client).await;
+    match reply.kind {
+        MessageKind::TopicsReply { topics, .. } => {
+            assert_eq!(topics.len(), 1);
+            assert_eq!(topics[0].topic, topic("weather.updates"));
+            assert_eq!(topics[0].subscribers, 1);
+            assert_eq!(topics[0].messages_buffered, 0);
+        }
+        other => panic!("expected a TopicsReply, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn topics_request_reports_a_published_topic_with_no_subscriber() {
+    let addr = spawn_test_node().await;
+    let mut publisher = connect(addr).await;
+
+    let publish = Envelope::new(
+        PeerId::new(),
+        MessageKind::Publish {
+            topic: topic("weather.updates"),
+            payload: b"sunny".to_vec(),
+            retain: false,
+            content_type: None,
+            reply_to: None,
+            in_reply_to: None,
+        },
+    );
+    send(&mut publisher, &publish).await;
+
+    // Same connection, right after publishing - the node's dispatch
+    // loop processes frames strictly in order, so the topic entry
+    // this creates is guaranteed visible by the time this request is
+    // handled, with no polling needed.
+    let request = Envelope::new(PeerId::new(), MessageKind::TopicsRequest);
+    send(&mut publisher, &request).await;
+
+    let reply = recv(&mut publisher).await;
+    match reply.kind {
+        MessageKind::TopicsReply { topics, .. } => {
+            assert_eq!(topics.len(), 1);
+            assert_eq!(topics[0].topic, topic("weather.updates"));
+            assert_eq!(topics[0].subscribers, 0);
+            assert_eq!(topics[0].messages_buffered, 1);
+        }
+        other => panic!("expected a TopicsReply, got {other:?}"),
+    }
+}
+
 /// A node run with `--data-dir` persists every publish to disk, and a
 /// fresh node pointed at the same directory rehydrates its replay
 /// buffers and retained values from it (ADR-0045) - so a restart is

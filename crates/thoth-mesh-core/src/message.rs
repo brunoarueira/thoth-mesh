@@ -122,6 +122,21 @@ pub struct MetricsSummary {
     pub rate_limit_principal_evictions_total: u64,
 }
 
+/// One topic a [`MessageKind::TopicsReply`] reports, as reported by
+/// the answering node's own broker. See ADR-0052.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TopicSummary {
+    pub topic: Topic,
+    /// Live connections currently registered for this exact topic.
+    pub subscribers: u64,
+    /// Envelopes currently held in this topic's replay buffer
+    /// (ADR-0021) - non-zero means it's been published to recently
+    /// (within the replay window); zero doesn't necessarily mean
+    /// *never*, since an old publish can have aged out of the
+    /// buffer's bounded capacity.
+    pub messages_buffered: u64,
+}
+
 /// The payload of an [`Envelope`](crate::Envelope).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MessageKind {
@@ -240,6 +255,17 @@ pub enum MessageKind {
         peers: Vec<PeerSummary>,
         metrics: MetricsSummary,
     },
+    /// Request every topic the receiving node's own broker currently
+    /// considers active - subscribed to, published to recently, or
+    /// both (see [`MessageKind::TopicsReply`]). Answered on any
+    /// connection, client or peer link, with no authorization check -
+    /// see ADR-0052.
+    TopicsRequest,
+    /// Reply to a `TopicsRequest`.
+    TopicsReply {
+        in_reply_to: MessageId,
+        topics: Vec<TopicSummary>,
+    },
 }
 
 #[cfg(test)]
@@ -332,7 +358,7 @@ mod tests {
                 durable: true,
             },
             MessageKind::Unsubscribe {
-                filter: topic.into(),
+                filter: topic.clone().into(),
             },
             MessageKind::Ack {
                 in_reply_to: MessageId::new(),
@@ -370,6 +396,19 @@ mod tests {
                     messages_published: 2,
                     ..Default::default()
                 },
+            },
+            MessageKind::TopicsRequest,
+            MessageKind::TopicsReply {
+                in_reply_to: MessageId::new(),
+                topics: vec![TopicSummary {
+                    topic: topic.clone(),
+                    subscribers: 2,
+                    messages_buffered: 5,
+                }],
+            },
+            MessageKind::TopicsReply {
+                in_reply_to: MessageId::new(),
+                topics: vec![],
             },
         ];
 
