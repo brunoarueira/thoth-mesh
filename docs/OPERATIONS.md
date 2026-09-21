@@ -355,8 +355,11 @@ Active topics (2):
 ```
 
 A topic is listed if it currently has a live subscriber (an ordinary
-fan-out one or a `--group` member ([ADR-0042](adr/0042-consumer-groups.md))
-alike - `subscribers` counts both), has at least one message in its
+fan-out one or a `--group` member against a literal topic
+([ADR-0042](adr/0042-consumer-groups.md)) alike - `subscribers` counts
+both; a `--group` joined against a *wildcard* filter doesn't count
+toward any one topic's number, since it can't be attributed to a
+single concrete topic), has at least one message in its
 [replay buffer](#message-replay) (published within the replay window),
 or both - `subscribers`/`messages_buffered` are reported separately
 rather than collapsed into one verdict, so `sensor.temp` above

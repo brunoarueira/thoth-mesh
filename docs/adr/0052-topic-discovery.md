@@ -46,10 +46,15 @@ them into one boolean:
   consumer-group member (ADR-0042) both count. The two live in
   entirely separate `Broker` state (`join_group` never touches the
   topic's broadcast channel a fan-out subscriber does), so `topics()`
-  reads both and sums them per topic - a group-only topic (published
-  to via a literal-filter group, no ordinary subscriber at all) is
-  still reported, not silently omitted. A wildcard-filter group's
-  membership doesn't count toward any one topic's number, consistent
+  reads both and sums them per topic - including a topic known *only*
+  through a literal-filter group (no fan-out subscriber, never yet
+  published to, so it has no entry in `Broker`'s own topics map at
+  all): `topics()` still surfaces it with its group-member count
+  rather than silently omitting it. A dropped connection's group
+  membership doesn't linger either - a closed sender still sitting in
+  `Broker` state (pending its own connection's cleanup) is never
+  counted as live. A wildcard-filter group's membership doesn't count
+  toward any one topic's number, consistent
   with "exact topics only" below - it corresponds to an unknowable set
   of topics, not one.
 - `messages_buffered`: how many envelopes currently sit in this

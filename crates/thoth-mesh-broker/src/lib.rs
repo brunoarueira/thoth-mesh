@@ -719,8 +719,27 @@ impl Broker {
         // consistent with "exact topics only" (ADR-0052).
         let mut group_subscribers: HashMap<Topic, u64> = HashMap::new();
         for ((filter, _group_name), members) in self.groups.lock().unwrap().iter() {
-            if let Some(topic) = filter.as_topic() {
-                *group_subscribers.entry(topic).or_insert(0) += members.members.len() as u64;
+            let Some(topic) = filter.as_topic() else {
+                continue;
+            };
+            // A dropped connection's mpsc::Sender only leaves `members`
+            // once its owning connection's shut_down() calls
+            // leave_group - deliver() never prunes on a failed
+            // try_send, so a closed sender can briefly linger after
+            // its connection is already gone. Counting is_closed()
+            // senders would overreport a subscriber who's actually
+            // disconnected, and inserting a zero count for a fully-
+            // vacated group (a stale (filter, group) entry `groups`
+            // never removes outright) would otherwise let the
+            // "no `topics` entry at all" rescue loop below synthesize
+            // a phantom zero/zero entry.
+            let live = members
+                .members
+                .iter()
+                .filter(|member| !member.is_closed())
+                .count() as u64;
+            if live > 0 {
+                *group_subscribers.entry(topic).or_insert(0) += live;
             }
         }
 
@@ -2467,6 +2486,35 @@ mod tests {
         // not one - it must never be attributed to any single entry.
         let broker = Broker::new();
         let _receivers = join_members(&broker, filter("weather.+"), "workers", 2).await;
+
+        assert!(broker.topics().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn topics_never_counts_a_dropped_groups_receiver_as_a_live_subscriber() {
+        // deliver() never prunes a closed sender on a failed try_send -
+        // only leave_group (a connection's own shut_down cleanup)
+        // does. Dropping the receiver without calling leave_group
+        // simulates the real window between a connection actually
+        // dying and that cleanup running.
+        let broker = Broker::new();
+        let topic = Topic::from_str("weather.updates").unwrap();
+        let mut receivers = join_members(&broker, topic.clone().into(), "workers", 2).await;
+        drop(receivers.remove(0));
+
+        let topics = broker.topics().await;
+        assert_eq!(topics.len(), 1);
+        assert_eq!(topics[0].subscribers, 1);
+    }
+
+    #[tokio::test]
+    async fn topics_omits_a_fully_vacated_group_entirely() {
+        // A stale (filter, group) entry with every member's receiver
+        // dropped must not surface as a phantom zero/zero topic.
+        let broker = Broker::new();
+        let topic = Topic::from_str("weather.updates").unwrap();
+        let receivers = join_members(&broker, topic.into(), "workers", 2).await;
+        drop(receivers);
 
         assert!(broker.topics().await.is_empty());
     }
