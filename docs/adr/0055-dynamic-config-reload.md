@@ -182,5 +182,21 @@ attempts to work through.
   `--data-dir`-adjacent settings, or rate limiting; an admin-command
   reload trigger (rejected on its own security grounds above, not
   merely deferred).
+- **Known limitation**: a reload only changes what a *new*
+  `Subscribe`/`Publish`/`Hello` is checked against - it doesn't
+  reconcile access already granted before the reload. Tightening
+  `topic_acl`/`peer_topic_acl` doesn't stop a forwarder a connection
+  already has running for a now-denied topic; tightening `allow_peer`
+  doesn't disconnect a peer link whose fingerprint was just removed
+  (`allowlist_permits` is only ever checked once, at the `Hello`/dial
+  handshake); changing `peer_topic_filter` doesn't reconcile interest
+  already propagated to an active peer link under the old filter.
+  Reaching into live per-connection/per-peer-link state from the
+  node-level reload task needs a real mechanism `PeerLinks` doesn't
+  have today (a "force-disconnect by identity" primitive, plus a way
+  to diff and reconcile each active link's already-propagated
+  interest) - a materially larger feature than this ADR's own "swap a
+  reference" mechanism, deliberately left to a follow-up rather than
+  grown into this one. See #187.
 
 Closes #143.

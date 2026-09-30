@@ -22,9 +22,21 @@ use crate::topic_acl::TopicAcl;
 /// quick, synchronous, in-memory read or write, never held across an
 /// `.await` point, the same reasoning `RateLimiter` already used
 /// (ADR-0051).
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Reloadable<T> {
     current: Arc<RwLock<Option<Arc<T>>>>,
+}
+
+// Hand-rolled rather than derived: `#[derive(Clone)]` would add a
+// `T: Clone` bound to the generated impl even though cloning a
+// `Reloadable<T>` only ever clones the outer `Arc`, never `T` itself
+// - the same reason `Arc<T>`'s own `Clone` impl isn't derived either.
+impl<T> Clone for Reloadable<T> {
+    fn clone(&self) -> Self {
+        Self {
+            current: Arc::clone(&self.current),
+        }
+    }
 }
 
 impl<T> Reloadable<T> {
@@ -48,9 +60,19 @@ impl<T> Reloadable<T> {
 
     /// Replaces the current value outright - visible to the very next
     /// `.get()` call from any connection holding this same handle,
-    /// including one already established before this call.
+    /// including one already established before this call. The write
+    /// lock is only ever held for the pointer swap itself: the
+    /// previous value comes back out from under it and is dropped
+    /// afterward, so dropping a large outgoing `T` (with no reader
+    /// still holding its own `Arc` to it) can never block a
+    /// concurrent `.get()`.
     pub fn set(&self, new: Option<T>) {
-        *self.current.write().expect("Reloadable lock poisoned") = new.map(Arc::new);
+        let new = new.map(Arc::new);
+        let old = {
+            let mut current = self.current.write().expect("Reloadable lock poisoned");
+            std::mem::replace(&mut *current, new)
+        };
+        drop(old);
     }
 }
 

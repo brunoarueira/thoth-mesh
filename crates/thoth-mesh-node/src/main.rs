@@ -303,6 +303,16 @@ fn merge_list(cli: Vec<String>, file: Vec<String>) -> Vec<String> {
 /// reloadable (ADR-0055).
 struct ReloadSource {
     config_path: Option<PathBuf>,
+    /// Whether `config_path` actually pointed at a real file when
+    /// this node started. If so, a reload requires it to still be
+    /// there - `config::load` otherwise treats a missing file as an
+    /// empty config, fine for startup (nothing's been applied yet)
+    /// but not for a reload: a file that supplied live ACLs vanishing
+    /// out from under a running node (deleted, renamed, a transient
+    /// mount hiccup) must never be silently read as "nothing
+    /// configured," which would mean every file-sourced ACL quietly
+    /// disappearing, live.
+    config_file_existed_at_startup: bool,
     cli_allow_peer: Vec<String>,
     cli_topic_acl: Vec<String>,
     cli_peer_topic_acl: Vec<String>,
@@ -324,6 +334,24 @@ impl ReloadSource {
     /// have refused this same combination at startup - never a
     /// partial subset of the four applied.
     fn reload(&self) -> std::io::Result<ReloadableAcls> {
+        if self.config_file_existed_at_startup {
+            // `config_file_existed_at_startup` is only ever true
+            // alongside a concrete `config_path` - it's derived from
+            // checking that exact path's existence at startup.
+            let path = self
+                .config_path
+                .as_deref()
+                .expect("config_file_existed_at_startup implies a resolved config_path");
+            if let Err(err) = std::fs::metadata(path) {
+                return Err(std::io::Error::new(
+                    err.kind(),
+                    format!(
+                        "config file {} existed at startup but can no longer be read ({err}) - refusing to reload, which would otherwise silently clear every file-sourced ACL",
+                        path.display()
+                    ),
+                ));
+            }
+        }
         let file = config::load(self.config_path.as_deref())?;
 
         let allow_peer = merge_list(self.cli_allow_peer.clone(), file.allow_peer);
@@ -391,18 +419,28 @@ impl ReloadSource {
 fn spawn_sighup_reloader(source: ReloadSource) -> Option<watch::Receiver<ReloadableAcls>> {
     use tokio::signal::unix::{SignalKind, signal};
 
+    // Registered here, synchronously, before this function returns -
+    // not inside the spawned task below. `signal()` itself installs
+    // the OS-level handler immediately when called; deferring that
+    // call to the task's own body would leave it unregistered until
+    // the runtime actually polls that task for the first time, a
+    // window (however short) in which SIGHUP's default disposition
+    // (terminate the process) still applies - an operator running
+    // `systemctl reload` moments after start could kill the node
+    // instead of reloading it.
+    let mut sighup = match signal(SignalKind::hangup()) {
+        Ok(sighup) => sighup,
+        Err(err) => {
+            tracing::error!(
+                %err,
+                "failed to install a SIGHUP handler - dynamic config reload is unavailable for this run"
+            );
+            return None;
+        }
+    };
+
     let (tx, rx) = watch::channel(ReloadableAcls::default());
     tokio::spawn(async move {
-        let mut sighup = match signal(SignalKind::hangup()) {
-            Ok(sighup) => sighup,
-            Err(err) => {
-                tracing::error!(
-                    %err,
-                    "failed to install a SIGHUP handler - dynamic config reload is unavailable for this run"
-                );
-                return;
-            }
-        };
         while sighup.recv().await.is_some() {
             tracing::info!(
                 "SIGHUP received: reloading --topic-acl/--peer-topic-acl/--allow-peer/--peer-topic-filter from the config file"
@@ -435,12 +473,18 @@ async fn main() -> std::io::Result<()> {
     // Captured before `cli` is consumed by `EffectiveConfig::merge`
     // below - `spawn_sighup_reloader` needs these same CLI-sourced
     // values later, to replay the same merge on each reload (ADR-0055).
-    let config_path = cli.config.clone();
+    // Resolved once, to the same conventional per-OS path
+    // `config::load(None)` would otherwise re-resolve internally every
+    // time, so a reload's "did this file exist at startup" check
+    // (`config_file_existed_at_startup` below) asks about the exact
+    // path a reload will actually re-read.
+    let config_path = cli.config.clone().or_else(config::default_path);
+    let config_file_existed_at_startup = config_path.as_deref().is_some_and(|path| path.exists());
     let cli_allow_peer = cli.allow_peer.clone();
     let cli_topic_acl = cli.topic_acl.clone();
     let cli_peer_topic_acl = cli.peer_topic_acl.clone();
     let cli_peer_topic_filter = cli.peer_topic_filter.clone();
-    let file = config::load(cli.config.as_deref())?;
+    let file = config::load(config_path.as_deref())?;
     let cli = EffectiveConfig::merge(cli, file)?;
 
     // RUST_LOG wins when it's set, even if it fails to parse (in
@@ -558,6 +602,7 @@ async fn main() -> std::io::Result<()> {
 
     let reload = spawn_sighup_reloader(ReloadSource {
         config_path,
+        config_file_existed_at_startup,
         cli_allow_peer,
         cli_topic_acl,
         cli_peer_topic_acl,
@@ -837,6 +882,7 @@ mod tests {
     fn empty_reload_source(tls_configured: bool) -> ReloadSource {
         ReloadSource {
             config_path: Some(nonexistent_config_path()),
+            config_file_existed_at_startup: false,
             cli_allow_peer: Vec::new(),
             cli_topic_acl: Vec::new(),
             cli_peer_topic_acl: Vec::new(),
@@ -930,5 +976,47 @@ mod tests {
         };
         let err = source.reload().unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    /// The hazard `config_file_existed_at_startup` exists to prevent:
+    /// without it, a file that supplied a live ACL vanishing out from
+    /// under a running node would have `config::load` quietly treat
+    /// that as "no file, no config" and clear every file-sourced ACL
+    /// on the very next reload - a silent, live security regression
+    /// rather than a refused reload.
+    #[test]
+    fn reload_rejects_a_config_file_that_existed_at_startup_but_is_now_missing() {
+        let dir = std::env::temp_dir().join(format!(
+            "thoth-mesh-node-reload-test-vanished-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("node.toml");
+        std::fs::write(&path, "topic_acl = [\"anonymous|pub|from.file\"]\n").unwrap();
+
+        let source = ReloadSource {
+            config_path: Some(path.clone()),
+            config_file_existed_at_startup: true,
+            ..empty_reload_source(false)
+        };
+        // Still there - reload succeeds normally.
+        assert!(source.reload().unwrap().topic_acl.is_some());
+
+        std::fs::remove_file(&path).unwrap();
+        let err = source.reload().unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The counterpart: a node that never had a config file at
+    /// startup (nothing to protect) still reloads fine against a path
+    /// that simply doesn't exist - matching `config::load`'s own
+    /// "missing file is an empty config, not an error" rule.
+    #[test]
+    fn reload_tolerates_a_missing_file_when_none_existed_at_startup() {
+        let source = empty_reload_source(false);
+        assert!(!source.config_file_existed_at_startup);
+        assert!(source.reload().unwrap().topic_acl.is_none());
     }
 }

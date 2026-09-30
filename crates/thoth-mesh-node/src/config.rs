@@ -75,7 +75,11 @@ pub fn load(explicit: Option<&Path>) -> std::io::Result<Config> {
 /// appropriate equivalent on macOS/Windows) - the same directory
 /// `thoth-mesh-cli`'s own `config.toml` lives in (ADR-0034), since
 /// both binaries belong to one project, just a different file.
-fn default_path() -> Option<PathBuf> {
+/// `pub(crate)` rather than private: `main.rs`'s `SIGHUP` reload path
+/// (ADR-0055) resolves this same path once at startup, to know
+/// whether a file it will later re-read on each reload actually
+/// existed then.
+pub(crate) fn default_path() -> Option<PathBuf> {
     directories::ProjectDirs::from("", "", "thoth-mesh")
         .map(|dirs| dirs.config_dir().join("node.toml"))
 }

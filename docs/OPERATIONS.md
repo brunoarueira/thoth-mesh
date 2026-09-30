@@ -202,11 +202,26 @@ reloadable, a reload that would introduce a non-empty `allow_peer` on a
 node started without TLS is rejected outright, exactly like it would
 be at startup. Any parse or validation failure rejects the whole
 reload - logged, live config left completely unchanged, never a
-partial update.
+partial update. If the config file existed at startup, it's required
+to still be there for a reload to succeed too - a reload against a
+since-deleted or since-unreadable file is rejected outright rather
+than silently treated as an empty config, which would otherwise mean
+every file-sourced ACL quietly disappearing, live.
 
 `SIGHUP` handling is Unix-only; on a platform with no such signal, the
 node runs exactly as it did before this ADR and dynamic reload simply
 isn't available.
+
+**Known limitation**: a reload only changes what a *new*
+`Subscribe`/`Publish`/`Hello` is checked against - it doesn't revoke
+access already granted before the reload. A connection's existing
+subscription to a topic keeps delivering even after `topic_acl`/
+`peer_topic_acl` tightens to deny it; an existing peer link stays
+connected even after its fingerprint is removed from `allow_peer`;
+and `peer_topic_filter` changes don't reconcile interest already
+announced to an active peer link. A connection actually picking up a
+tightened ACL still requires it to reconnect. See
+[thoth-mesh#187](https://github.com/brunoarueira/thoth-mesh/issues/187).
 
 ## Single-node quickstart
 
