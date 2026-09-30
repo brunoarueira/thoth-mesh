@@ -8,7 +8,10 @@ use std::sync::Arc;
 
 use clap::Parser;
 use thoth_mesh_core::Topic;
-use thoth_mesh_node::{NodeOptions, PeerTopicFilter, RateLimitConfig, TlsConfig, TopicAcl};
+use thoth_mesh_node::{
+    NodeOptions, PeerTopicFilter, RateLimitConfig, ReloadableAcls, TlsConfig, TopicAcl,
+};
+use tokio::sync::watch;
 use tracing_subscriber::EnvFilter;
 
 /// Daemon that runs a thoth-mesh node: wires the local pub/sub broker
@@ -294,9 +297,149 @@ fn merge_list(cli: Vec<String>, file: Vec<String>) -> Vec<String> {
     if cli.is_empty() { file } else { cli }
 }
 
+/// Everything a `SIGHUP` needs to re-derive a fresh [`ReloadableAcls`],
+/// captured once at startup, before `cli: Cli` is consumed by
+/// `EffectiveConfig::merge`, since only these four fields are ever
+/// reloadable (ADR-0055).
+struct ReloadSource {
+    config_path: Option<PathBuf>,
+    cli_allow_peer: Vec<String>,
+    cli_topic_acl: Vec<String>,
+    cli_peer_topic_acl: Vec<String>,
+    cli_peer_topic_filter: Vec<String>,
+    /// Whether this node was started with TLS - `--allow-peer` still
+    /// requires it (ADR-0054's own rule). TLS identity itself isn't
+    /// reloadable (ADR-0055), so this is a fixed startup-time
+    /// snapshot, not re-derived on each reload.
+    tls_configured: bool,
+}
+
+impl ReloadSource {
+    /// Re-reads the config file and re-runs the exact same CLI-over-
+    /// file precedence `EffectiveConfig::merge` applies at startup
+    /// (ADR-0054), restricted to the four fields ADR-0055 made
+    /// reloadable - a CLI-sourced value here never changes as a
+    /// result, only ever a file-sourced one. Every parse/validation
+    /// failure rejects the whole reload, exactly mirroring what would
+    /// have refused this same combination at startup - never a
+    /// partial subset of the four applied.
+    fn reload(&self) -> std::io::Result<ReloadableAcls> {
+        let file = config::load(self.config_path.as_deref())?;
+
+        let allow_peer = merge_list(self.cli_allow_peer.clone(), file.allow_peer);
+        if !allow_peer.is_empty() && !self.tls_configured {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "--allow-peer requires --tls-cert/--tls-key/--tls-ca - TLS identity isn't itself reloadable (ADR-0055), and this node was started without it",
+            ));
+        }
+        let allow_peer = if allow_peer.is_empty() {
+            None
+        } else {
+            let mut fingerprints = HashSet::new();
+            for raw in &allow_peer {
+                let fingerprint = thoth_mesh_tls::parse_fingerprint(raw).map_err(|err| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("--allow-peer {raw:?}: {err}"),
+                    )
+                })?;
+                fingerprints.insert(fingerprint);
+            }
+            Some(fingerprints)
+        };
+
+        let topic_acl = parse_topic_acl(
+            "--topic-acl",
+            &merge_list(self.cli_topic_acl.clone(), file.topic_acl),
+        )?;
+        let peer_topic_acl = parse_topic_acl(
+            "--peer-topic-acl",
+            &merge_list(self.cli_peer_topic_acl.clone(), file.peer_topic_acl),
+        )?;
+        let peer_topic_filter_entries =
+            merge_list(self.cli_peer_topic_filter.clone(), file.peer_topic_filter);
+        let peer_topic_filter = if peer_topic_filter_entries.is_empty() {
+            None
+        } else {
+            Some(
+                PeerTopicFilter::parse(peer_topic_filter_entries.iter().map(String::as_str))
+                    .map_err(|err| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            format!("--peer-topic-filter {err}"),
+                        )
+                    })?,
+            )
+        };
+
+        Ok(ReloadableAcls {
+            topic_acl,
+            peer_topic_acl,
+            allow_peer,
+            peer_topic_filter,
+        })
+    }
+}
+
+/// Installs the `SIGHUP`-triggered config reload (ADR-0055) and
+/// returns the receiving end for `NodeOptions::reload`. `None` on a
+/// platform with no `SIGHUP` concept (non-Unix) - dynamic reload just
+/// isn't available there, and the node otherwise runs exactly as
+/// before this ADR.
+#[cfg(unix)]
+fn spawn_sighup_reloader(source: ReloadSource) -> Option<watch::Receiver<ReloadableAcls>> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let (tx, rx) = watch::channel(ReloadableAcls::default());
+    tokio::spawn(async move {
+        let mut sighup = match signal(SignalKind::hangup()) {
+            Ok(sighup) => sighup,
+            Err(err) => {
+                tracing::error!(
+                    %err,
+                    "failed to install a SIGHUP handler - dynamic config reload is unavailable for this run"
+                );
+                return;
+            }
+        };
+        while sighup.recv().await.is_some() {
+            tracing::info!(
+                "SIGHUP received: reloading --topic-acl/--peer-topic-acl/--allow-peer/--peer-topic-filter from the config file"
+            );
+            match source.reload() {
+                Ok(acls) => {
+                    if tx.send(acls).is_err() {
+                        // No receivers left - the node itself has
+                        // already shut down. Nothing left to reload.
+                        break;
+                    }
+                }
+                Err(err) => {
+                    tracing::error!(%err, "config reload failed - live config left unchanged");
+                }
+            }
+        }
+    });
+    Some(rx)
+}
+
+#[cfg(not(unix))]
+fn spawn_sighup_reloader(_source: ReloadSource) -> Option<watch::Receiver<ReloadableAcls>> {
+    None
+}
+
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     let cli = Cli::parse();
+    // Captured before `cli` is consumed by `EffectiveConfig::merge`
+    // below - `spawn_sighup_reloader` needs these same CLI-sourced
+    // values later, to replay the same merge on each reload (ADR-0055).
+    let config_path = cli.config.clone();
+    let cli_allow_peer = cli.allow_peer.clone();
+    let cli_topic_acl = cli.topic_acl.clone();
+    let cli_peer_topic_acl = cli.peer_topic_acl.clone();
+    let cli_peer_topic_filter = cli.peer_topic_filter.clone();
     let file = config::load(cli.config.as_deref())?;
     let cli = EffectiveConfig::merge(cli, file)?;
 
@@ -337,6 +480,11 @@ async fn main() -> std::io::Result<()> {
         }),
         _ => None,
     };
+    // Fixed for this node's lifetime - TLS identity isn't itself
+    // reloadable (ADR-0055), so a reload that would introduce
+    // --allow-peer on a node started without TLS is rejected against
+    // this same startup-time snapshot, never re-derived per reload.
+    let tls_configured = tls.is_some();
 
     let topic_acl = parse_topic_acl("--topic-acl", &cli.topic_acl)?;
     let peer_topic_acl = parse_topic_acl("--peer-topic-acl", &cli.peer_topic_acl)?;
@@ -408,6 +556,15 @@ async fn main() -> std::io::Result<()> {
         }),
     };
 
+    let reload = spawn_sighup_reloader(ReloadSource {
+        config_path,
+        cli_allow_peer,
+        cli_topic_acl,
+        cli_peer_topic_acl,
+        cli_peer_topic_filter,
+        tls_configured,
+    });
+
     let options = NodeOptions {
         tls,
         topic_acl,
@@ -419,6 +576,7 @@ async fn main() -> std::io::Result<()> {
             .map(std::time::Duration::from_secs),
         dead_letter_topic,
         rate_limit,
+        reload,
     };
 
     thoth_mesh_node::run_with_tls(
@@ -667,5 +825,110 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(cli.allow_peer, vec!["AA:BB"]);
+    }
+
+    /// A path guaranteed never to exist - `config::load` treats a
+    /// missing file the same as no file at all (an empty `Config`),
+    /// same deterministic fixture `config.rs`'s own tests use.
+    fn nonexistent_config_path() -> PathBuf {
+        PathBuf::from("/nonexistent/thoth-mesh-node-reload-test/node.toml")
+    }
+
+    fn empty_reload_source(tls_configured: bool) -> ReloadSource {
+        ReloadSource {
+            config_path: Some(nonexistent_config_path()),
+            cli_allow_peer: Vec::new(),
+            cli_topic_acl: Vec::new(),
+            cli_peer_topic_acl: Vec::new(),
+            cli_peer_topic_filter: Vec::new(),
+            tls_configured,
+        }
+    }
+
+    #[test]
+    fn reload_parses_every_reloadable_field_from_a_freshly_read_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "thoth-mesh-node-reload-test-full-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("node.toml");
+        std::fs::write(
+            &path,
+            format!(
+                r#"
+                topic_acl = ["anonymous|pub|status.public"]
+                peer_topic_acl = ["anonymous|pub|weather.updates"]
+                peer_topic_filter = ["{}|weather.updates"]
+                "#,
+                "AB".repeat(32)
+            ),
+        )
+        .unwrap();
+
+        let source = ReloadSource {
+            config_path: Some(path),
+            ..empty_reload_source(false)
+        };
+        let acls = source.reload().unwrap();
+        assert!(acls.topic_acl.is_some());
+        assert!(acls.peer_topic_acl.is_some());
+        assert!(acls.peer_topic_filter.is_some());
+        assert!(acls.allow_peer.is_none());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The whole point of re-running the merge on every reload rather
+    /// than just re-reading the file directly: a field this node
+    /// started with nothing on the CLI for picks up whatever the file
+    /// now holds, file changed or not.
+    #[test]
+    fn reload_picks_up_a_file_sourced_value_the_cli_never_set() {
+        let dir = std::env::temp_dir().join(format!(
+            "thoth-mesh-node-reload-test-file-sourced-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("node.toml");
+        std::fs::write(&path, "topic_acl = [\"anonymous|pub|from.file\"]\n").unwrap();
+
+        let source = ReloadSource {
+            config_path: Some(path),
+            ..empty_reload_source(false)
+        };
+        assert!(source.reload().unwrap().topic_acl.is_some());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn reload_rejects_a_newly_introduced_allow_peer_on_a_node_started_without_tls() {
+        let source = ReloadSource {
+            cli_allow_peer: vec!["AA:BB".to_owned()],
+            ..empty_reload_source(false)
+        };
+        let err = source.reload().unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn reload_accepts_allow_peer_on_a_node_started_with_tls() {
+        let source = ReloadSource {
+            cli_allow_peer: vec!["AB".repeat(32)],
+            ..empty_reload_source(true)
+        };
+        let acls = source.reload().unwrap();
+        assert!(acls.allow_peer.is_some());
+    }
+
+    #[test]
+    fn reload_propagates_an_invalid_topic_acl_entry_as_an_error() {
+        let source = ReloadSource {
+            cli_topic_acl: vec!["not-a-valid-entry".to_owned()],
+            ..empty_reload_source(false)
+        };
+        let err = source.reload().unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 }

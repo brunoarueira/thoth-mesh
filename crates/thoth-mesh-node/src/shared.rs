@@ -16,6 +16,7 @@ use crate::metrics::Metrics;
 use crate::peer_links::PeerLinks;
 use crate::peer_topic_filter::PeerTopicFilter;
 use crate::rate_limit::RateLimiter;
+use crate::reload::Reloadable;
 use crate::topic_acl::TopicAcl;
 
 /// How many outbound dial attempts (`peering::dial_peer`'s connect
@@ -59,21 +60,25 @@ pub struct Shared {
     /// unchanged behavior: no allowlist enforcement, same as before
     /// this ADR. `Some` (including an empty set) enforces on every
     /// peer link regardless of which side dialed. See ADR-0017.
-    pub allowed_peers: Option<Arc<HashSet<[u8; 32]>>>,
+    /// Live-reloadable (ADR-0055) - a `Reloadable` handle, not a plain
+    /// snapshot, so a connection re-reads it on every check rather
+    /// than capturing it once.
+    pub allowed_peers: Reloadable<HashSet<[u8; 32]>>,
     /// Per-topic client publish/subscribe permissions, `--topic-acl`
     /// (repeatable). `None` - the default - means unchanged behavior:
     /// any client can publish/subscribe to anything. `Some` enforces
     /// default-deny for whatever's not explicitly listed, against
     /// connections not (yet) known to be peer links. See ADR-0018.
-    pub topic_acl: Option<Arc<TopicAcl>>,
+    /// Live-reloadable (ADR-0055).
+    pub topic_acl: Reloadable<TopicAcl>,
     /// Per-topic peer-link publish/subscribe permissions,
     /// `--peer-topic-acl` (repeatable). `None` - the default - means
     /// unchanged behavior: any peer link can carry anything. `Some`
     /// enforces default-deny for whatever's not explicitly listed,
     /// against connections already known to be peer links -
     /// independent of `topic_acl`, which never applies to one. See
-    /// ADR-0020.
-    pub peer_topic_acl: Option<Arc<TopicAcl>>,
+    /// ADR-0020. Live-reloadable (ADR-0055).
+    pub peer_topic_acl: Reloadable<TopicAcl>,
     /// `--peer-topic-filter` (repeatable). `None` - the default -
     /// means unchanged behavior: every peer link is proactively told
     /// about all of this node's aggregate interest. `Some` restricts
@@ -81,8 +86,8 @@ pub struct Shared {
     /// exactly what's listed for its own authenticated identity -
     /// distinct from `peer_topic_acl`, which gates an explicit request
     /// from the peer rather than what this node volunteers unasked.
-    /// See ADR-0049.
-    pub peer_topic_filter: Option<Arc<PeerTopicFilter>>,
+    /// See ADR-0049. Live-reloadable (ADR-0055).
+    pub peer_topic_filter: Reloadable<PeerTopicFilter>,
     /// `--dead-letter-topic` (ADR-0047): if set, an `ack: true`
     /// forwarder that exhausts its redelivery attempts (ADR-0041)
     /// republishes the original message to
@@ -119,11 +124,11 @@ impl std::fmt::Debug for Shared {
             .field("tls_connector", &self.tls_connector.is_some())
             .field(
                 "allowed_peers",
-                &self.allowed_peers.as_ref().map(|set| set.len()),
+                &self.allowed_peers.get().map(|set| set.len()),
             )
-            .field("topic_acl", &self.topic_acl.is_some())
-            .field("peer_topic_acl", &self.peer_topic_acl.is_some())
-            .field("peer_topic_filter", &self.peer_topic_filter.is_some())
+            .field("topic_acl", &self.topic_acl.get().is_some())
+            .field("peer_topic_acl", &self.peer_topic_acl.get().is_some())
+            .field("peer_topic_filter", &self.peer_topic_filter.get().is_some())
             .field("dead_letter_topic", &self.dead_letter_topic)
             .field("rate_limiter", &self.rate_limiter.is_some())
             .finish_non_exhaustive()
@@ -166,10 +171,10 @@ impl Shared {
             dial_semaphore: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_DIALS)),
             tls_acceptor: None,
             tls_connector: None,
-            allowed_peers: None,
-            topic_acl: None,
-            peer_topic_acl: None,
-            peer_topic_filter: None,
+            allowed_peers: Reloadable::new(None),
+            topic_acl: Reloadable::new(None),
+            peer_topic_acl: Reloadable::new(None),
+            peer_topic_filter: Reloadable::new(None),
             dead_letter_topic: None,
             rate_limiter: None,
         };

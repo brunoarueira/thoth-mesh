@@ -44,6 +44,7 @@ use crate::rate_limit::RateLimiter;
 use crate::redelivery::{
     DEFAULT_ACK_TIMEOUT, DEFAULT_MAX_REDELIVERY_ATTEMPTS, PendingAcks, sweep_interval,
 };
+use crate::reload::Reloadable;
 use crate::shared::Shared;
 use crate::topic_acl::{Action, Principal, TopicAcl};
 
@@ -294,17 +295,19 @@ struct ConnectionContext {
     metrics: Metrics,
     discover: PeerDirectory,
     discovered_tx: mpsc::UnboundedSender<String>,
-    allowed_peers: Option<Arc<HashSet<[u8; 32]>>>,
-    topic_acl: Option<Arc<TopicAcl>>,
-    peer_topic_acl: Option<Arc<TopicAcl>>,
+    allowed_peers: Reloadable<HashSet<[u8; 32]>>,
+    topic_acl: Reloadable<TopicAcl>,
+    peer_topic_acl: Reloadable<TopicAcl>,
     /// `--peer-topic-filter` (ADR-0049): restricts which of this
     /// node's own aggregate interest this connection - if it becomes a
     /// peer link - is proactively told about via interest propagation
     /// (ADR-0011). Distinct from `peer_topic_acl`: that gates an
     /// explicit request from the peer, this gates what this node
     /// volunteers unasked. `None` - the default - means unchanged
-    /// behavior: every peer link hears about everything.
-    peer_topic_filter: Option<Arc<PeerTopicFilter>>,
+    /// behavior: every peer link hears about everything. Live-
+    /// reloadable (ADR-0055) - read fresh via `.get()` on every check,
+    /// not captured once here.
+    peer_topic_filter: Reloadable<PeerTopicFilter>,
     /// `--dead-letter-topic` (ADR-0047): where an `ack: true`
     /// forwarder that exhausts its redelivery attempts republishes the
     /// original message, if configured at all.
@@ -390,7 +393,7 @@ impl ConnectionContext {
         // read loop can't reach - this is the dial side's already-known
         // identity, established before that loop starts. See ADR-0039.
         let peer_id = self.authenticated_sender(peer_id);
-        if !allowlist_permits(&self.allowed_peers, self.peer_fingerprint) {
+        if !allowlist_permits(self.allowed_peers.get(), self.peer_fingerprint) {
             tracing::warn!(
                 ?peer_id,
                 "closing connection: peer certificate not on the --allow-peer allowlist"
@@ -416,7 +419,7 @@ impl ConnectionContext {
             self.principal,
             listen_addr,
             &self.outgoing_tx,
-            self.peer_topic_filter.as_deref(),
+            self.peer_topic_filter.get().as_deref(),
         );
         true
     }
@@ -477,8 +480,8 @@ impl ConnectionContext {
         }
         let is_peer = self.is_peer();
         if !filter_acl_permits(
-            &self.topic_acl,
-            &self.peer_topic_acl,
+            self.topic_acl.get(),
+            self.peer_topic_acl.get(),
             is_peer,
             self.principal,
             &filter,
@@ -575,7 +578,7 @@ impl ConnectionContext {
                 self.node_id,
                 filter,
                 true,
-                self.peer_topic_filter.as_deref(),
+                self.peer_topic_filter.get().as_deref(),
             );
         }
         true
@@ -614,7 +617,7 @@ impl ConnectionContext {
                 self.node_id,
                 filter,
                 false,
-                self.peer_topic_filter.as_deref(),
+                self.peer_topic_filter.get().as_deref(),
             );
         }
         true
@@ -649,8 +652,8 @@ impl ConnectionContext {
         let topic = topic.clone();
         let is_peer = self.is_peer();
         if !acl_permits(
-            &self.topic_acl,
-            &self.peer_topic_acl,
+            self.topic_acl.get(),
+            self.peer_topic_acl.get(),
             is_peer,
             self.principal,
             &topic,
@@ -708,7 +711,7 @@ impl ConnectionContext {
             peer_listen_addr = ?listen_addr,
             "peer said hello"
         );
-        if !allowlist_permits(&self.allowed_peers, self.peer_fingerprint) {
+        if !allowlist_permits(self.allowed_peers.get(), self.peer_fingerprint) {
             tracing::warn!(
                 sender = ?envelope.sender,
                 "closing connection: peer certificate not on the --allow-peer allowlist"
@@ -754,7 +757,7 @@ impl ConnectionContext {
             self.principal,
             listen_addr,
             &self.outgoing_tx,
-            self.peer_topic_filter.as_deref(),
+            self.peer_topic_filter.get().as_deref(),
         );
         true
     }
@@ -900,7 +903,7 @@ impl ConnectionContext {
                     self.node_id,
                     filter,
                     false,
-                    self.peer_topic_filter.as_deref(),
+                    self.peer_topic_filter.get().as_deref(),
                 );
             }
         }
@@ -1106,7 +1109,7 @@ fn propagate_interest(
 /// fingerprint (no client certificate presented) never satisfies a
 /// configured allowlist; it just never matches one.
 fn allowlist_permits(
-    allowed_peers: &Option<Arc<HashSet<[u8; 32]>>>,
+    allowed_peers: Option<Arc<HashSet<[u8; 32]>>>,
     peer_fingerprint: Option<[u8; 32]>,
 ) -> bool {
     match allowed_peers {
@@ -1120,7 +1123,7 @@ fn allowlist_permits(
 /// everything, unchanged from before ADR-0018. `Some` is default-deny:
 /// only combinations an entry explicitly lists are permitted.
 fn topic_acl_permits(
-    topic_acl: &Option<Arc<TopicAcl>>,
+    topic_acl: Option<Arc<TopicAcl>>,
     principal: Principal,
     topic: &Topic,
     action: Action,
@@ -1138,8 +1141,8 @@ fn topic_acl_permits(
 /// A client is never checked against `peer_topic_acl`, and a peer link
 /// is never checked against `topic_acl`.
 fn acl_permits(
-    topic_acl: &Option<Arc<TopicAcl>>,
-    peer_topic_acl: &Option<Arc<TopicAcl>>,
+    topic_acl: Option<Arc<TopicAcl>>,
+    peer_topic_acl: Option<Arc<TopicAcl>>,
     is_peer: bool,
     principal: Principal,
     topic: &Topic,
@@ -1161,8 +1164,8 @@ fn acl_permits(
 /// still permits everything, wildcard or not, same as before
 /// ADR-0022.
 fn filter_acl_permits(
-    topic_acl: &Option<Arc<TopicAcl>>,
-    peer_topic_acl: &Option<Arc<TopicAcl>>,
+    topic_acl: Option<Arc<TopicAcl>>,
+    peer_topic_acl: Option<Arc<TopicAcl>>,
     is_peer: bool,
     principal: Principal,
     filter: &TopicFilter,

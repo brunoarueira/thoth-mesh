@@ -180,6 +180,34 @@ flag is still an error, not silently ignored. An unrecognized key
 that simply doesn't exist - explicit `--config` or the conventional
 location - isn't, and is treated as empty.
 
+### Dynamic config reload
+
+`SIGHUP` (`kill -HUP <pid>`, or `systemctl reload thoth-mesh-node` under
+the packaged systemd unit) re-reads the config file above and live-
+applies four of its keys - `topic_acl`, `peer_topic_acl`, `allow_peer`,
+`peer_topic_filter` - to every already-established connection, with no
+restart and nothing dropped (see
+[ADR-0055](adr/0055-dynamic-config-reload.md)). Everything else
+(`addr`, the TLS trio, `data_dir`, rate limiting, and the rest) is
+unaffected by a reload - changing any of those still needs a restart.
+
+A reloaded key only actually changes if it came from the file in the
+first place: the same CLI-over-file precedence from the section above
+is replayed against the freshly-read file, so a value given as a flag
+stays exactly what the flag said, unaffected by anything now in the
+file for that key. In practice, a key meant to be reloadable has to be
+set via the file, not a flag. `allow_peer` still requires this node to
+have been started with the TLS trio - since TLS identity isn't itself
+reloadable, a reload that would introduce a non-empty `allow_peer` on a
+node started without TLS is rejected outright, exactly like it would
+be at startup. Any parse or validation failure rejects the whole
+reload - logged, live config left completely unchanged, never a
+partial update.
+
+`SIGHUP` handling is Unix-only; on a platform with no such signal, the
+node runs exactly as it did before this ADR and dynamic reload simply
+isn't available.
+
 ## Single-node quickstart
 
 Start a node. By default it listens on `127.0.0.1:49500`
