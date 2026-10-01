@@ -75,10 +75,20 @@ async fn send(stream: &mut Compat<OwnedWriteHalf>, envelope: &Envelope) {
 /// Cancel-safe: `mpsc::UnboundedReceiver::recv` never partially
 /// consumes a message, so a timed-out attempt loses nothing that a
 /// later call would otherwise have seen.
+///
+/// Panics outright if the reader task has actually ended (the channel
+/// closed) rather than returning `None` for that too - otherwise it's
+/// indistinguishable from an ordinary timeout, and the polling loop
+/// below would busy-spin publishing until `TEST_TIMEOUT` and fail
+/// with a generic "reload never reached" message that hides the real
+/// cause (the connection closing unexpectedly, or a malformed
+/// envelope panicking the reader task with nothing to observe it).
 async fn try_recv(incoming: &mut mpsc::UnboundedReceiver<Envelope>) -> Option<Envelope> {
-    timeout(Duration::from_millis(50), incoming.recv())
-        .await
-        .ok()?
+    match timeout(Duration::from_millis(50), incoming.recv()).await {
+        Ok(Some(envelope)) => Some(envelope),
+        Ok(None) => panic!("the background reader task ended before a reply arrived"),
+        Err(_) => None,
+    }
 }
 
 fn topic(s: &str) -> Topic {
