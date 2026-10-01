@@ -180,6 +180,49 @@ flag is still an error, not silently ignored. An unrecognized key
 that simply doesn't exist - explicit `--config` or the conventional
 location - isn't, and is treated as empty.
 
+### Dynamic config reload
+
+`SIGHUP` (`kill -HUP <pid>`, or `systemctl reload thoth-mesh-node` under
+the packaged systemd unit) re-reads the config file above and live-
+applies four of its keys - `topic_acl`, `peer_topic_acl`, `allow_peer`,
+`peer_topic_filter` - to every already-established connection, with no
+restart and nothing dropped (see
+[ADR-0055](adr/0055-dynamic-config-reload.md)). Everything else
+(`addr`, the TLS trio, `data_dir`, rate limiting, and the rest) is
+unaffected by a reload - changing any of those still needs a restart.
+
+A reloaded key only actually changes if it came from the file in the
+first place: the same CLI-over-file precedence from the section above
+is replayed against the freshly-read file, so a value given as a flag
+stays exactly what the flag said, unaffected by anything now in the
+file for that key. In practice, a key meant to be reloadable has to be
+set via the file, not a flag. `allow_peer` still requires this node to
+have been started with the TLS trio - since TLS identity isn't itself
+reloadable, a reload that would introduce a non-empty `allow_peer` on a
+node started without TLS is rejected outright, exactly like it would
+be at startup. Any parse or validation failure rejects the whole
+reload - logged, live config left completely unchanged, never a
+partial update. If the config file existed at startup, it's required
+to still be there for a reload to succeed too - a reload against a
+since-deleted or since-unreadable file is rejected outright rather
+than silently treated as an empty config, which would otherwise mean
+every file-sourced ACL quietly disappearing, live.
+
+`SIGHUP` handling is Unix-only; on a platform with no such signal, the
+node runs exactly as it did before this ADR and dynamic reload simply
+isn't available.
+
+**Known limitation**: a reload only changes what a *new*
+`Subscribe`/`Publish`/`Hello` is checked against - it doesn't revoke
+access already granted before the reload. A connection's existing
+subscription to a topic keeps delivering even after `topic_acl`/
+`peer_topic_acl` tightens to deny it; an existing peer link stays
+connected even after its fingerprint is removed from `allow_peer`;
+and `peer_topic_filter` changes don't reconcile interest already
+announced to an active peer link. A connection actually picking up a
+tightened ACL still requires it to reconnect. See
+[thoth-mesh#187](https://github.com/brunoarueira/thoth-mesh/issues/187).
+
 ## Single-node quickstart
 
 Start a node. By default it listens on `127.0.0.1:49500`

@@ -36,6 +36,7 @@ mod peering;
 mod persistence;
 mod rate_limit;
 mod redelivery;
+mod reload;
 mod shared;
 mod tls_config;
 mod topic_acl;
@@ -50,11 +51,13 @@ use thoth_mesh_broker::{Broker, DEFAULT_REPLAY_BUFFER_CAPACITY, MessageStore};
 use thoth_mesh_core::{PeerId, Topic};
 use thoth_mesh_tls::MaybeTlsStream;
 use tokio::net::TcpListener;
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 pub use peer_topic_filter::{PeerTopicFilter, PeerTopicFilterParseError};
 pub use rate_limit::RateLimitConfig;
 use rate_limit::RateLimiter;
+pub use reload::{Reloadable, ReloadableAcls};
 pub use shared::Shared;
 pub use thoth_mesh::{Interest, Membership, PeerDirectory};
 pub use thoth_mesh_core::DEFAULT_ADDR;
@@ -119,6 +122,14 @@ pub struct NodeOptions {
     /// `topic_acl` vs `peer_topic_acl`. `None` (the default) means
     /// unchanged behavior: no rate limiting at all.
     pub rate_limit: Option<RateLimitConfig>,
+    /// A channel a caller can push a fresh [`ReloadableAcls`] through
+    /// at any point after this node starts, live-replacing
+    /// `topic_acl`/`peer_topic_acl`/`--allow-peer`/`peer_topic_filter`
+    /// with no restart and no dropped connection - see ADR-0055.
+    /// `None` (the default) means exactly what it always has: those
+    /// four are fixed for this node's lifetime, set once from the
+    /// fields above.
+    pub reload: Option<watch::Receiver<ReloadableAcls>>,
 }
 
 /// Opens the on-disk message store for `data_dir` (ADR-0045), if one
@@ -195,6 +206,32 @@ fn maybe_spawn_ttl_sweeper(
     ttl::spawn(store, Arc::clone(broker), ttl, dead_letter, metrics);
 }
 
+/// If `reload` is given, spawns a background task that applies every
+/// [`ReloadableAcls`] it receives to `shared`'s four reloadable
+/// fields, a plain `Reloadable::set` per field, so an already-
+/// established connection's very next check sees it, not just a
+/// connection made after the reload (see ADR-0055). A no-op if
+/// `reload` is `None`: every aspect of this node behaves exactly as
+/// it did before this ADR. `watch::Receiver::changed` returning `Err`
+/// means every `Sender` has been dropped (the caller is done
+/// reloading this node entirely, e.g. in a test); the task simply
+/// ends rather than treating that as an error.
+fn spawn_reload_applier(reload: Option<watch::Receiver<ReloadableAcls>>, shared: Shared) {
+    let Some(mut reload) = reload else {
+        return;
+    };
+    tokio::spawn(async move {
+        while reload.changed().await.is_ok() {
+            let acls = reload.borrow_and_update().clone();
+            shared.topic_acl.set(acls.topic_acl);
+            shared.peer_topic_acl.set(acls.peer_topic_acl);
+            shared.allowed_peers.set(acls.allow_peer);
+            shared.peer_topic_filter.set(acls.peer_topic_filter);
+            tracing::info!("applied a config reload");
+        }
+    });
+}
+
 /// Binds `addr` and serves connections until an unrecoverable listener
 /// error occurs, dialing each of `seed_peers` in the background. If
 /// `metrics_addr` is given, also binds it and serves a Prometheus
@@ -239,15 +276,15 @@ pub async fn run_with_tls(
         let (acceptor, connector, own_fingerprint) = tls.build()?;
         shared.tls_acceptor = Some(acceptor);
         shared.tls_connector = Some(connector);
-        shared.allowed_peers = allowed_peers.map(Arc::new);
+        shared.allowed_peers = Reloadable::new(allowed_peers);
         // A node with its own certificate has a stable identity to
         // derive - persistent across restarts as long as the
         // certificate is, unlike the random one below. See ADR-0038.
         shared.node_id = PeerId::from_fingerprint(own_fingerprint);
     }
-    shared.topic_acl = options.topic_acl.map(Arc::new);
-    shared.peer_topic_acl = options.peer_topic_acl.map(Arc::new);
-    shared.peer_topic_filter = options.peer_topic_filter.map(Arc::new);
+    shared.topic_acl = Reloadable::new(options.topic_acl);
+    shared.peer_topic_acl = Reloadable::new(options.peer_topic_acl);
+    shared.peer_topic_filter = Reloadable::new(options.peer_topic_filter);
     shared.dead_letter_topic = options.dead_letter_topic.clone();
     shared.rate_limiter = options
         .rate_limit
@@ -275,6 +312,7 @@ pub async fn run_with_tls(
         discovered_rx,
         shared.clone(),
     ));
+    spawn_reload_applier(options.reload, shared.clone());
 
     if let Some(metrics_addr) = metrics_addr {
         let metrics_listener = TcpListener::bind(&metrics_addr).await?;
@@ -334,15 +372,15 @@ pub async fn serve_with_tls(
         let (acceptor, connector, own_fingerprint) = tls.build()?;
         shared.tls_acceptor = Some(acceptor);
         shared.tls_connector = Some(connector);
-        shared.allowed_peers = allowed_peers.map(Arc::new);
+        shared.allowed_peers = Reloadable::new(allowed_peers);
         // A node with its own certificate has a stable identity to
         // derive - persistent across restarts as long as the
         // certificate is, unlike the random one below. See ADR-0038.
         shared.node_id = PeerId::from_fingerprint(own_fingerprint);
     }
-    shared.topic_acl = options.topic_acl.map(Arc::new);
-    shared.peer_topic_acl = options.peer_topic_acl.map(Arc::new);
-    shared.peer_topic_filter = options.peer_topic_filter.map(Arc::new);
+    shared.topic_acl = Reloadable::new(options.topic_acl);
+    shared.peer_topic_acl = Reloadable::new(options.peer_topic_acl);
+    shared.peer_topic_filter = Reloadable::new(options.peer_topic_filter);
     shared.dead_letter_topic = options.dead_letter_topic.clone();
     shared.rate_limiter = options
         .rate_limit
@@ -370,6 +408,7 @@ pub async fn serve_with_tls(
         discovered_rx,
         shared.clone(),
     ));
+    spawn_reload_applier(options.reload, shared.clone());
     peering::spawn_seed_peers(seed_peers, shared.clone());
     accept_loop(listener, shared, None).await
 }
@@ -424,15 +463,15 @@ pub fn spawn_with_tls(
         let (acceptor, connector, own_fingerprint) = tls.build()?;
         shared.tls_acceptor = Some(acceptor);
         shared.tls_connector = Some(connector);
-        shared.allowed_peers = allowed_peers.map(Arc::new);
+        shared.allowed_peers = Reloadable::new(allowed_peers);
         // A node with its own certificate has a stable identity to
         // derive - persistent across restarts as long as the
         // certificate is, unlike the random one below. See ADR-0038.
         shared.node_id = PeerId::from_fingerprint(own_fingerprint);
     }
-    shared.topic_acl = options.topic_acl.map(Arc::new);
-    shared.peer_topic_acl = options.peer_topic_acl.map(Arc::new);
-    shared.peer_topic_filter = options.peer_topic_filter.map(Arc::new);
+    shared.topic_acl = Reloadable::new(options.topic_acl);
+    shared.peer_topic_acl = Reloadable::new(options.peer_topic_acl);
+    shared.peer_topic_filter = Reloadable::new(options.peer_topic_filter);
     shared.dead_letter_topic = options.dead_letter_topic.clone();
     shared.rate_limiter = options
         .rate_limit
@@ -469,6 +508,7 @@ pub fn spawn_with_tls(
         discovered_rx,
         shared.clone(),
     ));
+    spawn_reload_applier(options.reload, shared.clone());
     // Re-read rather than reusing the `node_id` local above: the TLS
     // block may have overridden `shared.node_id` with a
     // certificate-derived one (ADR-0038), and this `Node` needs to

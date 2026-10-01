@@ -60,6 +60,7 @@ thoth-mesh, using the format described in
 | [0052](0052-topic-discovery.md) | Topic discovery |
 | [0053](0053-payload-level-encryption.md) | Payload-level encryption |
 | [0054](0054-node-config-file.md) | `thoth-mesh-node` config file for daemon options |
+| [0055](0055-dynamic-config-reload.md) | Dynamic config reload |
 
 To add a new one, copy the format of an existing ADR, number it
 sequentially, and set its status to `Accepted` once the decision is

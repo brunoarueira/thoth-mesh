@@ -46,6 +46,13 @@ StateDirectory=thoth-mesh
 EnvironmentFile=-/etc/thoth-mesh/node.env
 ExecStart=/usr/local/bin/thoth-mesh-node $NODE_ARGS
 
+# `systemctl reload thoth-mesh-node` sends SIGHUP to the running
+# process, which live-reloads --topic-acl/--peer-topic-acl/
+# --allow-peer/--peer-topic-filter from the config file - see
+# ADR-0055 and docs/OPERATIONS.md's "Dynamic config reload" section.
+# Type=simple means $MAINPID is just this process's own PID.
+ExecReload=/bin/kill -HUP $MAINPID
+
 # The daemon already has its own connection-level reconnect/backoff
 # for peer links (ADR-0012) - this is the outer layer for the process
 # itself dying (panic, OOM-killed, etc.), not a replacement for that.
