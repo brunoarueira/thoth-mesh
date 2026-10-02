@@ -133,9 +133,11 @@ has a working, correctly-wired `Readiness` to hand to
   no store to rehydrate) - never from `accept_loop` itself, which
   starts before that background task is guaranteed to finish.
 - `metrics_server::handle_request` now actually parses the request
-  line (method + path, query string stripped before matching) instead
-  of discarding it as an ordinary header line - routing `/livez`/
-  `/readyz` distinctly, every other path unchanged.
+  line and routes on its request target (query string stripped before
+  matching) instead of discarding the whole line as an ordinary
+  header - the method itself is never inspected, same as before this
+  ADR. Routes `/livez`/`/readyz` distinctly; every other path
+  unchanged.
 - No new CLI flag, no new port, no new Prometheus metric.
 
 Closes #144.
