@@ -688,6 +688,44 @@ the main port, this is one shared secret, not a per-scraper identity —
 anyone with the token can scrape, and there's no way to revoke just
 one holder of it.
 
+### Health/readiness checks
+
+Two more routes on the same `--metrics-addr` port - no new flag, no
+new port to open (see [ADR-0056](adr/0056-health-readiness-endpoints.md)):
+
+```sh
+curl -s http://127.0.0.1:9090/livez   # 200 OK, "ok" - always, if this node is up at all
+curl -s http://127.0.0.1:9090/readyz  # 200 OK, "ready" once accepting connections; 503 before that
+```
+
+`/livez` is unconditional - if it answers at all, this process is
+alive. `/readyz` answers `503 Service Unavailable` until this node
+actually reaches its accept loop (TLS built, the on-disk store
+rehydrated if `--data-dir` is set, the listener bound - everything
+that has to happen first, in order, before this node can usefully
+serve anything), `200 OK` from that point on for the rest of this
+node's lifetime; it never goes back to `503` once set. Neither route
+is gated by [`--metrics-token-file`](#metrics-authentication), even
+when one is configured - an orchestrator's health probe is expected
+to just work with no extra credential wiring, and "is this node up"
+reveals nothing the token exists to protect.
+
+A Kubernetes probe example:
+
+```yaml
+livenessProbe:
+  httpGet: { path: /livez, port: 9090 }
+readinessProbe:
+  httpGet: { path: /readyz, port: 9090 }
+```
+
+Like the Prometheus render, these two are only reachable when
+`--metrics-addr` is actually given - there's no separate flag just
+for health checks. Every other path on this port - including
+`/metrics` and anything not recognized - keeps serving the
+Prometheus render exactly as before; `/livez`/`/readyz` are the only
+two with dedicated meaning.
+
 ## TLS
 
 Off by default — every connection (client or peer) is plaintext

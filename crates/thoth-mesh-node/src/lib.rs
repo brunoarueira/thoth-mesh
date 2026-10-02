@@ -28,6 +28,7 @@
 
 pub mod connection;
 mod dead_letter;
+mod health;
 pub mod metrics;
 mod metrics_server;
 mod peer_links;
@@ -54,6 +55,7 @@ use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
+pub use health::Readiness;
 pub use peer_topic_filter::{PeerTopicFilter, PeerTopicFilterParseError};
 pub use rate_limit::RateLimitConfig;
 use rate_limit::RateLimiter;
@@ -292,6 +294,12 @@ pub async fn run_with_tls(
     if let Some(store) = store.clone() {
         rehydrate_from_store(&shared.broker, store).await?;
     }
+    // Everything readiness (ADR-0056) needs to already be true has
+    // just finished: TLS (if any) is built, and - critically, since
+    // this entry point actually awaits it rather than leaving it
+    // running in the background (see spawn_with_tls below) -
+    // rehydration (if any) has completed.
+    shared.readiness.mark_ready();
     let dead_letter_config = dead_letter::DeadLetterConfig {
         node_id: shared.node_id,
         topic: options.dead_letter_topic,
@@ -321,6 +329,7 @@ pub async fn run_with_tls(
         let discover = shared.discover.clone();
         let metrics = shared.metrics.clone();
         let rate_limiter = shared.rate_limiter.clone();
+        let readiness = shared.readiness.clone();
         tokio::spawn(async move {
             if let Err(err) = metrics_server::serve_metrics(
                 metrics_listener,
@@ -329,6 +338,7 @@ pub async fn run_with_tls(
                 discover,
                 metrics,
                 rate_limiter,
+                readiness,
                 metrics_token,
             )
             .await
@@ -388,6 +398,8 @@ pub async fn serve_with_tls(
     if let Some(store) = store.clone() {
         rehydrate_from_store(&shared.broker, store).await?;
     }
+    // See run_with_tls's identical comment just above its own call.
+    shared.readiness.mark_ready();
     let dead_letter_config = dead_letter::DeadLetterConfig {
         node_id: shared.node_id,
         topic: options.dead_letter_topic,
@@ -419,6 +431,14 @@ pub async fn serve_with_tls(
 pub struct Node {
     pub id: PeerId,
     pub membership: Membership,
+    /// Whether this node is actually ready to serve yet - see
+    /// ADR-0056 and `Shared::readiness`'s own doc comment for exactly
+    /// what that requires. `spawn_with_tls` returns well before
+    /// that's necessarily true (rehydration from `--data-dir`, if
+    /// any, runs in the background); a test asserting readiness
+    /// should poll this rather than assume it's already set the
+    /// instant `spawn_with_tls` returns.
+    pub readiness: Readiness,
     /// Every peer this node has learned a dialable address for, via
     /// direct handshake or gossip (see ADR-0015).
     pub discover: PeerDirectory,
@@ -481,12 +501,27 @@ pub fn spawn_with_tls(
         // background. Every rehydrate_from_store consumer that needs
         // the data visible *before* the first read uses the async
         // run_with_tls/serve_with_tls path instead.
+        //
+        // Readiness (ADR-0056) still has to wait for it though -
+        // marked from inside this same task, after the attempt
+        // (successful or not: a failed rehydration still leaves this
+        // node operational, just without whatever didn't load, the
+        // same tolerance `run_with_tls`/`serve_with_tls` have), rather
+        // than from `accept_loop` - unlike those two, this entry
+        // point reaches `accept_loop` *without* waiting for this task
+        // to finish, so `accept_loop` marking it unconditionally would
+        // let readiness go true before rehydration actually has.
         let broker = Arc::clone(&shared.broker);
+        let readiness = shared.readiness.clone();
         tokio::spawn(async move {
             if let Err(err) = rehydrate_from_store(&broker, store).await {
                 tracing::error!(%err, "rehydrating broker state from disk failed");
             }
+            readiness.mark_ready();
         });
+    } else {
+        // Nothing to wait for.
+        shared.readiness.mark_ready();
     }
     let dead_letter_config = dead_letter::DeadLetterConfig {
         node_id: shared.node_id,
@@ -516,6 +551,7 @@ pub fn spawn_with_tls(
     // value `Shared::new_with_discovery` was first built with.
     let node_id = shared.node_id;
     let membership = shared.membership.clone();
+    let readiness = shared.readiness.clone();
     let discover = shared.discover.clone();
     let peer_dials = peering::spawn_seed_peers(seed_peers, shared.clone());
     let accepted_connections = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -527,6 +563,7 @@ pub fn spawn_with_tls(
     Ok(Node {
         id: node_id,
         membership,
+        readiness,
         discover,
         accept_loop,
         peer_dials,
@@ -573,6 +610,12 @@ async fn accept_loop(
     shared: Shared,
     connections: Option<Arc<std::sync::Mutex<Vec<JoinHandle<()>>>>>,
 ) -> std::io::Result<()> {
+    // Readiness (ADR-0056) is marked by each caller, not here - see
+    // the comments at every `mark_ready` call site above. This log
+    // line and that moment usually coincide, but aren't the same
+    // thing: `spawn_with_tls` with `--data-dir` reaches this line
+    // before its own background rehydration finishes, and readiness
+    // deliberately waits for that instead.
     tracing::info!(
         node_id = ?shared.node_id,
         addr = ?shared.my_listen_addr,

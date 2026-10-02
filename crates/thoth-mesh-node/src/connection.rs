@@ -109,6 +109,9 @@ async fn run_connection(socket: MaybeTlsStream, shared: Shared, initial_peer: Op
         node_id,
         my_listen_addr,
         metrics,
+        // Not consulted per-connection - readiness is only ever read
+        // by the health endpoint (see ADR-0056).
+        readiness: _,
         discover,
         discovered_tx,
         dial_semaphore: _,
