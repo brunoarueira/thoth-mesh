@@ -12,6 +12,7 @@ use thoth_mesh_core::{PeerId, Topic};
 use thoth_mesh_tls::{TlsAcceptor, TlsConnector};
 use tokio::sync::{Semaphore, mpsc};
 
+use crate::health::Readiness;
 use crate::metrics::Metrics;
 use crate::peer_links::PeerLinks;
 use crate::peer_topic_filter::PeerTopicFilter;
@@ -36,6 +37,12 @@ pub struct Shared {
     pub node_id: PeerId,
     pub my_listen_addr: Option<String>,
     pub metrics: Metrics,
+    /// Whether this node has reached `accept_loop` and is actually
+    /// serving connections - see ADR-0056. Set unconditionally by
+    /// every entry point (`run_with_tls`/`serve_with_tls`/
+    /// `spawn_with_tls` alike), regardless of whether a metrics/health
+    /// port was ever opened to report it.
+    pub readiness: Readiness,
     /// Every peer known to be dialable, and where - see ADR-0015.
     pub discover: PeerDirectory,
     /// Where a connection task pushes an address it wants dialed,
@@ -119,6 +126,7 @@ impl std::fmt::Debug for Shared {
             .field("node_id", &self.node_id)
             .field("my_listen_addr", &self.my_listen_addr)
             .field("metrics", &self.metrics)
+            .field("readiness", &self.readiness.is_ready())
             .field("discover", &self.discover)
             .field("tls_acceptor", &self.tls_acceptor.is_some())
             .field("tls_connector", &self.tls_connector.is_some())
@@ -166,6 +174,7 @@ impl Shared {
             node_id,
             my_listen_addr,
             metrics: Metrics::new(),
+            readiness: Readiness::new(),
             discover: PeerDirectory::new(),
             discovered_tx,
             dial_semaphore: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_DIALS)),

@@ -28,6 +28,7 @@
 
 pub mod connection;
 mod dead_letter;
+mod health;
 pub mod metrics;
 mod metrics_server;
 mod peer_links;
@@ -54,6 +55,7 @@ use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
+pub use health::Readiness;
 pub use peer_topic_filter::{PeerTopicFilter, PeerTopicFilterParseError};
 pub use rate_limit::RateLimitConfig;
 use rate_limit::RateLimiter;
@@ -321,6 +323,7 @@ pub async fn run_with_tls(
         let discover = shared.discover.clone();
         let metrics = shared.metrics.clone();
         let rate_limiter = shared.rate_limiter.clone();
+        let readiness = shared.readiness.clone();
         tokio::spawn(async move {
             if let Err(err) = metrics_server::serve_metrics(
                 metrics_listener,
@@ -329,6 +332,7 @@ pub async fn run_with_tls(
                 discover,
                 metrics,
                 rate_limiter,
+                readiness,
                 metrics_token,
             )
             .await
@@ -419,6 +423,11 @@ pub async fn serve_with_tls(
 pub struct Node {
     pub id: PeerId,
     pub membership: Membership,
+    /// Whether this node has reached `accept_loop` yet - see
+    /// ADR-0056. `spawn_with_tls` returns before that's necessarily
+    /// true; a test asserting readiness should poll this rather than
+    /// assume it's already set the instant `spawn_with_tls` returns.
+    pub readiness: Readiness,
     /// Every peer this node has learned a dialable address for, via
     /// direct handshake or gossip (see ADR-0015).
     pub discover: PeerDirectory,
@@ -516,6 +525,7 @@ pub fn spawn_with_tls(
     // value `Shared::new_with_discovery` was first built with.
     let node_id = shared.node_id;
     let membership = shared.membership.clone();
+    let readiness = shared.readiness.clone();
     let discover = shared.discover.clone();
     let peer_dials = peering::spawn_seed_peers(seed_peers, shared.clone());
     let accepted_connections = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -527,6 +537,7 @@ pub fn spawn_with_tls(
     Ok(Node {
         id: node_id,
         membership,
+        readiness,
         discover,
         accept_loop,
         peer_dials,
@@ -573,6 +584,7 @@ async fn accept_loop(
     shared: Shared,
     connections: Option<Arc<std::sync::Mutex<Vec<JoinHandle<()>>>>>,
 ) -> std::io::Result<()> {
+    shared.readiness.mark_ready();
     tracing::info!(
         node_id = ?shared.node_id,
         addr = ?shared.my_listen_addr,
