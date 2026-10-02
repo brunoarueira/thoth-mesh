@@ -42,8 +42,10 @@ server exposes for itself.
 
 Every other path - including `/metrics`, and anything not recognized
 - keeps today's behavior exactly as-is: the current Prometheus render,
-regardless of method or path (see ADR-0013's `handle_scrape`). No
-existing scrape target pointed at a nonstandard path breaks.
+regardless of method or path (see ADR-0013's original `handle_scrape`,
+renamed `handle_request` by this ADR now that it routes on more than
+one path). No existing scrape target pointed at a nonstandard path
+breaks.
 
 ### Liveness: unconditionally `200`
 
@@ -55,24 +57,33 @@ already being unable to accept the TCP connection in the first place
 that's exactly what a liveness probe's own connection-level timeout
 is for).
 
-### Readiness: a one-way latch, flipped once `accept_loop` starts
+### Readiness: a one-way latch, flipped once startup actually finishes
 
 A new `Readiness` handle (`crates/thoth-mesh-node/src/health.rs`) -
 cheaply `Clone` (an `Arc<AtomicBool>` under the hood), same pattern as
 `Membership`/`Interest`/`PeerLinks` elsewhere in this crate. Starts
-`false`; `accept_loop` (shared by every entry point - `run_with_tls`,
-`serve_with_tls`, `spawn_with_tls` alike) calls `.mark_ready()` at the
-exact point it already logs "node ready, accepting connections" -
-that log line already *is* this project's definition of ready, just
-not externally observable until now. `/readyz` returns `200 OK` /
-`ready\n` once set, `503 Service Unavailable` / `not ready\n` before.
+`false`; `/readyz` returns `200 OK`/`ready\n` once set, `503 Service
+Unavailable`/`not ready\n` before.
 
-This means "ready" already implies TLS was built, the on-disk store
-(if any) finished rehydrating, and the listener is bound - every
-entry point runs that setup synchronously, in order, before
-`accept_loop` is ever reached. No separate readiness logic to keep in
-sync with startup order; it's a direct signal off the same moment
-that already existed.
+"Ready" means: TLS (if any) is built, and the on-disk store (if any)
+has finished rehydrating. `run_with_tls`/`serve_with_tls` call
+`.mark_ready()` right after their own `rehydrate_from_store(...)
+.await` - both already await it synchronously before doing anything
+else, so by the time either reaches `accept_loop`, this was already
+true anyway. `spawn_with_tls` is the one exception: it isn't `async`,
+so rehydration already ran in a detached background task before this
+ADR (a pre-existing, deliberate choice - see its own comment), and
+`accept_loop` starting is *not* evidence that task has finished.
+Marking readiness from `accept_loop` uniformly, as an earlier draft of
+this ADR did, would have let `/readyz` go `200` before a
+`spawn_with_tls` node's persisted messages/retained values were
+actually back - so `spawn_with_tls` instead marks it from inside that
+same background task, right after the rehydration attempt completes
+(successful or not - a failed rehydration still leaves this node
+operational, just degraded, the same tolerance already in play before
+this ADR); with no store to rehydrate at all, it marks immediately,
+same as the other two. `accept_loop` itself marks nothing - each
+entry point now owns the exact moment that's actually true for it.
 
 Deliberately a one-way latch, never reset back to `false`: today's
 failure model gives `accept_loop` nowhere to go but down on a fatal
@@ -98,8 +109,8 @@ token exists to gate in the first place.
 
 ### `Shared`/`Node` always carry a `Readiness`, even without a metrics port
 
-`accept_loop` marks readiness unconditionally, regardless of which
-entry point called it or whether a metrics port was ever opened -
+Each entry point marks its own `shared.readiness` unconditionally,
+regardless of whether a metrics port was ever opened to report it -
 `Shared` gains a plain `readiness: Readiness` field (initialized in
 `Shared::new`, no behavior change for anything that doesn't read it),
 and `Node` (returned by `spawn_with_tls`) exposes its own clone of the
@@ -116,12 +127,15 @@ has a working, correctly-wired `Readiness` to hand to
 - New `crates/thoth-mesh-node/src/health.rs`: `Readiness`, public.
 - `Shared` gains a `readiness: Readiness` field; `Node` gains one too,
   for test/introspection use (mirrors `membership`/`discover`).
-- `accept_loop` calls `shared.readiness.mark_ready()` at its existing
-  "node ready, accepting connections" log line.
-- `metrics_server::handle_scrape` now actually parses the request
-  line (method + path) instead of discarding it as an ordinary
-  header line - routing `/livez`/`/readyz` distinctly, every other
-  path unchanged.
+- `run_with_tls`/`serve_with_tls` call `shared.readiness.mark_ready()`
+  right after their own awaited rehydration; `spawn_with_tls` marks it
+  from inside its background rehydration task (or immediately, with
+  no store to rehydrate) - never from `accept_loop` itself, which
+  starts before that background task is guaranteed to finish.
+- `metrics_server::handle_request` now actually parses the request
+  line (method + path, query string stripped before matching) instead
+  of discarding it as an ordinary header line - routing `/livez`/
+  `/readyz` distinctly, every other path unchanged.
 - No new CLI flag, no new port, no new Prometheus metric.
 
 Closes #144.

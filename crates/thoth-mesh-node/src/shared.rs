@@ -37,11 +37,16 @@ pub struct Shared {
     pub node_id: PeerId,
     pub my_listen_addr: Option<String>,
     pub metrics: Metrics,
-    /// Whether this node has reached `accept_loop` and is actually
-    /// serving connections - see ADR-0056. Set unconditionally by
+    /// Whether this node has finished everything that has to happen
+    /// before it's actually ready to serve - see ADR-0056. Marked by
     /// every entry point (`run_with_tls`/`serve_with_tls`/
-    /// `spawn_with_tls` alike), regardless of whether a metrics/health
-    /// port was ever opened to report it.
+    /// `spawn_with_tls` alike) once that's true for it specifically -
+    /// for the first two, that's right after rehydrating from the
+    /// on-disk store (if any), which they await; `spawn_with_tls`
+    /// doesn't await that (it isn't `async`), so it marks this from
+    /// inside that same background task instead, once *it* finishes.
+    /// Set regardless of whether a metrics/health port was ever
+    /// opened to report it.
     pub readiness: Readiness,
     /// Every peer known to be dialable, and where - see ADR-0015.
     pub discover: PeerDirectory,

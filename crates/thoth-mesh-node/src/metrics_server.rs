@@ -92,12 +92,17 @@ async fn handle_request(
 
     let mut request_line = String::new();
     reader.read_line(&mut request_line).await?;
-    // "GET /readyz HTTP/1.1" - the path is whichever's in the middle;
-    // a blank/malformed/missing request line (nothing sent, or a
-    // client that doesn't speak HTTP at all) has no second field and
-    // falls through to the default, render-serving path below, same
-    // as any other unrecognized one.
-    let path = request_line.split_whitespace().nth(1).unwrap_or("");
+    // "GET /readyz?probe=1 HTTP/1.1" - the request-target is
+    // whichever's in the middle, query string and all; strip it
+    // before matching so a probe that appends one (not unusual for
+    // cache-busting) still reaches /livez or /readyz rather than
+    // falling through to the render below. A blank/malformed/missing
+    // request line (nothing sent, or a client that doesn't speak HTTP
+    // at all) has no second field and falls through to that same
+    // default, render-serving path, same as any other unrecognized
+    // one.
+    let target = request_line.split_whitespace().nth(1).unwrap_or("");
+    let path = target.split_once('?').map_or(target, |(path, _)| path);
 
     let mut line = String::new();
     let mut authorization: Option<String> = None;
@@ -449,6 +454,34 @@ mod tests {
         let mut stream = TcpStream::connect(addr).await.unwrap();
         stream
             .write_all(b"GET /readyz HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.ends_with("ready\n"));
+    }
+
+    #[tokio::test]
+    async fn readyz_still_matches_with_a_query_string_appended() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let readiness = Readiness::new();
+        readiness.mark_ready();
+        tokio::spawn(serve_metrics(
+            listener,
+            Membership::new(),
+            Arc::new(Broker::new()),
+            PeerDirectory::new(),
+            Metrics::new(),
+            None,
+            readiness,
+            None,
+        ));
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(b"GET /readyz?probe=1 HTTP/1.1\r\n\r\n")
             .await
             .unwrap();
         let mut response = String::new();
