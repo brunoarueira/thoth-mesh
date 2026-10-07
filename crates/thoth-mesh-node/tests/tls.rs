@@ -323,6 +323,7 @@ async fn a_reload_removing_a_peer_from_the_allowlist_disconnects_its_live_link()
     .unwrap();
 
     eventually(|| node_a.membership.is_reachable(node_b.id)).await;
+    eventually(|| node_b.membership.is_reachable(node_a.id)).await;
 
     // Explicitly empty, not None: `None` would mean "no allowlist at
     // all", which revokes nobody.

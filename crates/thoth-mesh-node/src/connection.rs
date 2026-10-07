@@ -295,7 +295,15 @@ async fn run_connection(socket: MaybeTlsStream, shared: Shared, initial_peer: Op
                         message: "disconnected: no longer on --allow-peer allowlist (config reload)".to_owned(),
                     },
                 );
-                let _ = ctx.send(error).await;
+                // try_send, not ctx.send(...).await: this notice is
+                // best-effort, and a revoked peer has every incentive
+                // to let its own outgoing queue back up (simply
+                // stop reading) specifically to delay its own
+                // eviction - awaiting queue capacity here would hand
+                // it exactly that lever. A full queue just means the
+                // notice is skipped; teardown proceeds immediately
+                // either way.
+                let _ = ctx.outgoing_tx.try_send(Arc::new(error));
                 break;
             }
         }
@@ -435,7 +443,7 @@ impl ConnectionContext {
         // read loop can't reach - this is the dial side's already-known
         // identity, established before that loop starts. See ADR-0039.
         let peer_id = self.authenticated_sender(peer_id);
-        if !allowlist_permits(self.allowed_peers.get(), self.peer_fingerprint) {
+        if !allowlist_permits(self.allowed_peers.get().as_deref(), self.principal) {
             tracing::warn!(
                 ?peer_id,
                 "closing connection: peer certificate not on the --allow-peer allowlist"
@@ -464,6 +472,19 @@ impl ConnectionContext {
             self.peer_topic_filter.get().as_deref(),
             Arc::clone(&self.disconnect),
         );
+        // Closes the gap between the check above and actually
+        // registering: a reload's own disconnect_unless scan (ADR-0057)
+        // can only ever see a link once it's in the registry, so one
+        // that revoked this exact fingerprint in that window would
+        // otherwise never reach it. Re-checking against the freshest
+        // allowed_peers here and firing our own disconnect handle if it
+        // no longer passes closes that window down to this recheck
+        // itself, rather than waiting for some future reload to catch
+        // it - the very next loop iteration tears the connection down
+        // via the exact same path a reload-triggered one would.
+        if !allowlist_permits(self.allowed_peers.get().as_deref(), self.principal) {
+            self.disconnect.notify_one();
+        }
         true
     }
 
@@ -754,7 +775,7 @@ impl ConnectionContext {
             peer_listen_addr = ?listen_addr,
             "peer said hello"
         );
-        if !allowlist_permits(self.allowed_peers.get(), self.peer_fingerprint) {
+        if !allowlist_permits(self.allowed_peers.get().as_deref(), self.principal) {
             tracing::warn!(
                 sender = ?envelope.sender,
                 "closing connection: peer certificate not on the --allow-peer allowlist"
@@ -803,6 +824,11 @@ impl ConnectionContext {
             self.peer_topic_filter.get().as_deref(),
             Arc::clone(&self.disconnect),
         );
+        // See admit_initial_peer's identical recheck for why - closes
+        // the gap between the check above and actually registering.
+        if !allowlist_permits(self.allowed_peers.get().as_deref(), self.principal) {
+            self.disconnect.notify_one();
+        }
         true
     }
 
@@ -1148,18 +1174,23 @@ fn propagate_interest(
     );
 }
 
-/// Whether a peer link presenting `peer_fingerprint` is allowed to
+/// Whether a peer link authenticated as `principal` is allowed to
 /// register, given `allowed_peers`. `None` - no `--allow-peer` given -
-/// permits everything, unchanged from before ADR-0017. A missing
-/// fingerprint (no client certificate presented) never satisfies a
-/// configured allowlist; it just never matches one.
-fn allowlist_permits(
-    allowed_peers: Option<Arc<HashSet<[u8; 32]>>>,
-    peer_fingerprint: Option<[u8; 32]>,
+/// permits everything, unchanged from before ADR-0017.
+/// `Principal::Anonymous` (no client certificate presented) never
+/// satisfies a configured allowlist; it just never matches one.
+/// `pub(crate)`, not private: also the single source of truth
+/// `spawn_reload_applier` (`lib.rs`) checks a reloaded `--allow-peer`
+/// against, rather than a second copy of this same rule - see
+/// ADR-0057.
+pub(crate) fn allowlist_permits(
+    allowed_peers: Option<&HashSet<[u8; 32]>>,
+    principal: Principal,
 ) -> bool {
-    match allowed_peers {
-        None => true,
-        Some(allowed) => peer_fingerprint.is_some_and(|fp| allowed.contains(&fp)),
+    match (allowed_peers, principal) {
+        (None, _) => true,
+        (Some(allowed), Principal::Fingerprint(fp)) => allowed.contains(&fp),
+        (Some(_), Principal::Anonymous) => false,
     }
 }
 

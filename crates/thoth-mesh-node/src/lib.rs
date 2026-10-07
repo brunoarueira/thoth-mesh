@@ -232,14 +232,13 @@ fn spawn_reload_applier(reload: Option<watch::Receiver<ReloadableAcls>>, shared:
             // - not yet installed into shared.allowed_peers below -
             // before it's installed as what every *new* connection's
             // own Hello/dial-handshake check will see from here on.
+            // The same allowlist_permits connection.rs itself checks
+            // against at handshake time - one rule, not a second copy
+            // of it here that could silently drift out of sync.
             let allow_peer = acls.allow_peer.as_ref();
-            shared
-                .peer_links
-                .disconnect_unless(|principal| match (allow_peer, principal) {
-                    (None, _) => true,
-                    (Some(allowed), Principal::Fingerprint(fp)) => allowed.contains(&fp),
-                    (Some(_), Principal::Anonymous) => false,
-                });
+            shared.peer_links.disconnect_unless(|principal| {
+                connection::allowlist_permits(allow_peer, principal)
+            });
             shared.allowed_peers.set(acls.allow_peer);
             shared.peer_topic_filter.set(acls.peer_topic_filter);
             tracing::info!("applied a config reload");
