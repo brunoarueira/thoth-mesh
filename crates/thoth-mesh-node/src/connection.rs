@@ -31,6 +31,7 @@ use thoth_mesh_core::{
 };
 use thoth_mesh_tls::{MaybeTlsStream, fingerprint};
 use tokio::io::{WriteHalf, split};
+use tokio::sync::Notify;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -149,6 +150,13 @@ async fn run_connection(socket: MaybeTlsStream, shared: Shared, initial_peer: Op
     // is reading from this side any more.
     let writer_task = AbortOnDrop(tokio::spawn(write_loop(writer, outgoing_rx)));
 
+    // Every connection gets one, client or peer link alike - cheap
+    // enough not to bother special-casing, even though only a
+    // confirmed peer link's own clone (handed to `PeerLinks` by
+    // `register_peer_link`) is ever actually fired, by an
+    // `--allow-peer` reload revoking it. See ADR-0057.
+    let disconnect = Arc::new(Notify::new());
+
     // Bundles everything a dispatched envelope's handling needs -
     // both the shared collaborators `Shared` was destructured into
     // above and this connection's own local state (`forwarders`,
@@ -176,6 +184,7 @@ async fn run_connection(socket: MaybeTlsStream, shared: Shared, initial_peer: Op
         peer_identity: None,
         peer_fingerprint,
         principal,
+        disconnect: Arc::clone(&disconnect),
     };
 
     if let Some(PeerInfo {
@@ -191,81 +200,104 @@ async fn run_connection(socket: MaybeTlsStream, shared: Shared, initial_peer: Op
     }
 
     loop {
-        let bytes = match async_framing::read_frame(&mut reader).await {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                if is_clean_disconnect(&err) {
-                    tracing::debug!("client disconnected");
-                } else {
-                    tracing::warn!(%err, "closing connection: frame read error");
-                }
-                break;
-            }
-        };
-        let mut envelope = match Envelope::from_bytes(&bytes) {
-            Ok(envelope) => envelope,
-            Err(err) => {
-                tracing::warn!(%err, "closing connection: malformed envelope");
-                break;
-            }
-        };
-        // Authenticated once, here, rather than in each handler below
-        // - every message kind that carries a meaningful `sender`
-        // (Hello, Publish, Subscribe, Unsubscribe, StatusRequest) is
-        // covered by this one call, and a Publish's corrected sender
-        // is what actually gets broadcast to subscribers. See
-        // ADR-0039.
-        envelope.sender = ctx.authenticated_sender(envelope.sender);
+        // The second branch only ever fires for a confirmed peer link
+        // whose `--allow-peer` entry a reload just revoked (ADR-0057)
+        // - racing `read_frame` here is safe *only* because taking
+        // that branch means this loop never calls `read_frame` on
+        // `reader` again either way; see this function's own ADR-0029
+        // comment above for why that's not true of the frame-reading
+        // branch continuing on afterward.
+        tokio::select! {
+            result = async_framing::read_frame(&mut reader) => {
+                let bytes = match result {
+                    Ok(bytes) => bytes,
+                    Err(err) => {
+                        if is_clean_disconnect(&err) {
+                            tracing::debug!("client disconnected");
+                        } else {
+                            tracing::warn!(%err, "closing connection: frame read error");
+                        }
+                        break;
+                    }
+                };
+                let mut envelope = match Envelope::from_bytes(&bytes) {
+                    Ok(envelope) => envelope,
+                    Err(err) => {
+                        tracing::warn!(%err, "closing connection: malformed envelope");
+                        break;
+                    }
+                };
+                // Authenticated once, here, rather than in each handler
+                // below - every message kind that carries a meaningful
+                // `sender` (Hello, Publish, Subscribe, Unsubscribe,
+                // StatusRequest) is covered by this one call, and a
+                // Publish's corrected sender is what actually gets
+                // broadcast to subscribers. See ADR-0039.
+                envelope.sender = ctx.authenticated_sender(envelope.sender);
 
-        let keep_going = match &envelope.kind {
-            MessageKind::Subscribe {
-                filter,
-                ack,
-                group,
-                durable,
-            } => {
-                let filter = filter.clone();
-                let ack = *ack;
-                let group = group.clone();
-                let durable = *durable;
-                ctx.handle_subscribe(&envelope, filter, ack, group, durable)
-                    .await
+                let keep_going = match &envelope.kind {
+                    MessageKind::Subscribe {
+                        filter,
+                        ack,
+                        group,
+                        durable,
+                    } => {
+                        let filter = filter.clone();
+                        let ack = *ack;
+                        let group = group.clone();
+                        let durable = *durable;
+                        ctx.handle_subscribe(&envelope, filter, ack, group, durable)
+                            .await
+                    }
+                    MessageKind::Unsubscribe { filter } => {
+                        let filter = filter.clone();
+                        ctx.handle_unsubscribe(&envelope, filter).await
+                    }
+                    MessageKind::Publish { .. } => ctx.handle_publish(envelope).await,
+                    MessageKind::Ack { in_reply_to } => {
+                        // A node never receives a Subscribe/Unsubscribe
+                        // from a client to acknowledge, so any Ack it
+                        // receives is unambiguously a client acking an
+                        // individual ack: true delivery (ADR-0041).
+                        ctx.handle_ack(*in_reply_to);
+                        true
+                    }
+                    MessageKind::Error { .. }
+                    | MessageKind::StatusReply { .. }
+                    | MessageKind::TopicsReply { .. } => {
+                        // Not actionable from a client in v1; ignore. A
+                        // StatusReply/TopicsReply is only ever sent by a
+                        // node, never a client, but still has to go
+                        // somewhere in this match.
+                        true
+                    }
+                    MessageKind::Hello { listen_addr } => {
+                        let listen_addr = listen_addr.clone();
+                        ctx.handle_hello(&envelope, listen_addr).await
+                    }
+                    MessageKind::PeerAnnounce { peers } => {
+                        ctx.handle_peer_announce(peers);
+                        true
+                    }
+                    MessageKind::StatusRequest => ctx.handle_status(&envelope).await,
+                    MessageKind::TopicsRequest => ctx.handle_topics(&envelope).await,
+                };
+                if !keep_going {
+                    break;
+                }
             }
-            MessageKind::Unsubscribe { filter } => {
-                let filter = filter.clone();
-                ctx.handle_unsubscribe(&envelope, filter).await
+            _ = disconnect.notified() => {
+                tracing::warn!("closing connection: no longer on --allow-peer (config reload)");
+                let error = Envelope::new(
+                    ctx.node_id,
+                    MessageKind::Error {
+                        in_reply_to: None,
+                        message: "disconnected: no longer on --allow-peer allowlist (config reload)".to_owned(),
+                    },
+                );
+                let _ = ctx.send(error).await;
+                break;
             }
-            MessageKind::Publish { .. } => ctx.handle_publish(envelope).await,
-            MessageKind::Ack { in_reply_to } => {
-                // A node never receives a Subscribe/Unsubscribe from a
-                // client to acknowledge, so any Ack it receives is
-                // unambiguously a client acking an individual
-                // ack: true delivery (ADR-0041).
-                ctx.handle_ack(*in_reply_to);
-                true
-            }
-            MessageKind::Error { .. }
-            | MessageKind::StatusReply { .. }
-            | MessageKind::TopicsReply { .. } => {
-                // Not actionable from a client in v1; ignore. A
-                // StatusReply/TopicsReply is only ever sent by a node,
-                // never a client, but still has to go somewhere in
-                // this match.
-                true
-            }
-            MessageKind::Hello { listen_addr } => {
-                let listen_addr = listen_addr.clone();
-                ctx.handle_hello(&envelope, listen_addr).await
-            }
-            MessageKind::PeerAnnounce { peers } => {
-                ctx.handle_peer_announce(peers);
-                true
-            }
-            MessageKind::StatusRequest => ctx.handle_status(&envelope).await,
-            MessageKind::TopicsRequest => ctx.handle_topics(&envelope).await,
-        };
-        if !keep_going {
-            break;
         }
     }
 
@@ -335,6 +367,13 @@ struct ConnectionContext {
     peer_identity: Option<PeerId>,
     peer_fingerprint: Option<[u8; 32]>,
     principal: Principal,
+    /// This connection's own signal to end itself, raced against the
+    /// read loop via `select!` in `run_connection` - see ADR-0057.
+    /// Every connection gets one, even a plain client that never
+    /// becomes a peer link; only `register_peer_link` ever actually
+    /// hands a clone of it to anything that would fire it
+    /// (`PeerLinks::disconnect_unless`, on an `--allow-peer` reload).
+    disconnect: Arc<Notify>,
 }
 
 impl ConnectionContext {
@@ -423,6 +462,7 @@ impl ConnectionContext {
             listen_addr,
             &self.outgoing_tx,
             self.peer_topic_filter.get().as_deref(),
+            Arc::clone(&self.disconnect),
         );
         true
     }
@@ -761,6 +801,7 @@ impl ConnectionContext {
             listen_addr,
             &self.outgoing_tx,
             self.peer_topic_filter.get().as_deref(),
+            Arc::clone(&self.disconnect),
         );
         true
     }
@@ -946,8 +987,9 @@ fn register_peer_link(
     peer_listen_addr: Option<String>,
     outgoing_tx: &mpsc::Sender<Arc<Envelope>>,
     peer_topic_filter: Option<&PeerTopicFilter>,
+    disconnect: Arc<Notify>,
 ) {
-    peer_links.register(peer_id, outgoing_tx.clone(), principal);
+    peer_links.register(peer_id, outgoing_tx.clone(), principal, disconnect);
     for filter in interest.snapshot() {
         if let Some(peer_topic_filter) = peer_topic_filter {
             let permitted = filter
@@ -2044,7 +2086,12 @@ mod tests {
         let discover = PeerDirectory::new();
         let (discovered_tx, mut discovered_rx) = mpsc::unbounded_channel();
         let (link_tx, mut link_rx) = mpsc::channel(8);
-        peer_links.register(PeerId::new(), link_tx, Principal::Anonymous);
+        peer_links.register(
+            PeerId::new(),
+            link_tx,
+            Principal::Anonymous,
+            Arc::new(Notify::new()),
+        );
 
         let peers = vec![
             PeerAdvert {
@@ -2092,7 +2139,12 @@ mod tests {
         let discover = PeerDirectory::new();
         let (discovered_tx, _discovered_rx) = mpsc::unbounded_channel();
         let (link_tx, mut link_rx) = mpsc::channel(8);
-        peer_links.register(PeerId::new(), link_tx, Principal::Anonymous);
+        peer_links.register(
+            PeerId::new(),
+            link_tx,
+            Principal::Anonymous,
+            Arc::new(Notify::new()),
+        );
 
         let already_known = PeerId::new();
         discover.record(already_known, "127.0.0.1:1".to_owned());
@@ -2133,6 +2185,7 @@ mod tests {
             Some("127.0.0.1:2".to_owned()),
             &outgoing_tx,
             None,
+            Arc::new(Notify::new()),
         );
 
         let mut announced_peers = Vec::new();
@@ -2184,6 +2237,7 @@ mod tests {
             None,
             &outgoing_tx,
             None,
+            Arc::new(Notify::new()),
         );
 
         // Nothing to catch up on, and nothing recorded about the new

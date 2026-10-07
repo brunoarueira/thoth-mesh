@@ -62,6 +62,7 @@ thoth-mesh, using the format described in
 | [0054](0054-node-config-file.md) | `thoth-mesh-node` config file for daemon options |
 | [0055](0055-dynamic-config-reload.md) | Dynamic config reload |
 | [0056](0056-health-readiness-endpoints.md) | Health/readiness endpoints |
+| [0057](0057-reload-revocation-of-already-granted-access.md) | Reload revocation of already-granted access |
 
 To add a new one, copy the format of an existing ADR, number it
 sequentially, and set its status to `Accepted` once the decision is

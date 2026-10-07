@@ -227,6 +227,19 @@ fn spawn_reload_applier(reload: Option<watch::Receiver<ReloadableAcls>>, shared:
             let acls = reload.borrow_and_update().clone();
             shared.topic_acl.set(acls.topic_acl);
             shared.peer_topic_acl.set(acls.peer_topic_acl);
+            // Disconnects any peer link the fresh allow_peer no longer
+            // permits (ADR-0057), using the just-reloaded value itself
+            // - not yet installed into shared.allowed_peers below -
+            // before it's installed as what every *new* connection's
+            // own Hello/dial-handshake check will see from here on.
+            let allow_peer = acls.allow_peer.as_ref();
+            shared
+                .peer_links
+                .disconnect_unless(|principal| match (allow_peer, principal) {
+                    (None, _) => true,
+                    (Some(allowed), Principal::Fingerprint(fp)) => allowed.contains(&fp),
+                    (Some(_), Principal::Anonymous) => false,
+                });
             shared.allowed_peers.set(acls.allow_peer);
             shared.peer_topic_filter.set(acls.peer_topic_filter);
             tracing::info!("applied a config reload");

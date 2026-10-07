@@ -13,9 +13,10 @@ use std::time::Duration;
 use rcgen::{CertificateParams, KeyPair};
 use thoth_mesh_core::{Envelope, MessageKind, Topic, async_framing};
 use thoth_mesh_node::test_support::eventually;
-use thoth_mesh_node::{NodeOptions, TlsConfig};
+use thoth_mesh_node::{NodeOptions, ReloadableAcls, TlsConfig};
 use thoth_mesh_tls::MaybeTlsStream;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::watch;
 use tokio::time::timeout;
 use tokio_util::compat::{Compat, TokioAsyncReadCompatExt};
 
@@ -280,6 +281,60 @@ async fn two_tls_nodes_federate_with_a_mutual_allowlist() {
 
     eventually(|| node_b.membership.is_reachable(node_a.id)).await;
     eventually(|| node_a.membership.is_reachable(node_b.id)).await;
+}
+
+/// ADR-0057: a peer link already federated under `--allow-peer` is
+/// torn down, not just left running, when a config reload removes its
+/// fingerprint from the allowlist - the very next thing either side
+/// sees is the link going away, without anyone restarting anything.
+#[tokio::test]
+async fn a_reload_removing_a_peer_from_the_allowlist_disconnects_its_live_link() {
+    let ca = TestCa::new();
+
+    let mut node_a_identity = ca.issue();
+    let mut node_b_identity = ca.issue();
+    node_a_identity.allowed_peers = Some(HashSet::from([fingerprint_of(&node_b_identity)]));
+    node_b_identity.allowed_peers = Some(HashSet::from([fingerprint_of(&node_a_identity)]));
+
+    let (reload_tx, reload_rx) = watch::channel(ReloadableAcls::default());
+
+    let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_a = listener_a.local_addr().unwrap();
+    let node_a = thoth_mesh_node::spawn_with_tls(
+        listener_a,
+        Vec::new(),
+        NodeOptions {
+            tls: Some(node_a_identity),
+            reload: Some(reload_rx),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let listener_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let node_b = thoth_mesh_node::spawn_with_tls(
+        listener_b,
+        vec![addr_a.to_string()],
+        NodeOptions {
+            tls: Some(node_b_identity),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    eventually(|| node_a.membership.is_reachable(node_b.id)).await;
+
+    // Explicitly empty, not None: `None` would mean "no allowlist at
+    // all", which revokes nobody.
+    reload_tx
+        .send(ReloadableAcls {
+            allow_peer: Some(HashSet::new()),
+            ..ReloadableAcls::default()
+        })
+        .unwrap();
+
+    eventually(|| !node_a.membership.is_reachable(node_b.id)).await;
+    eventually(|| !node_b.membership.is_reachable(node_a.id)).await;
 }
 
 /// ADR-0017, accept side: a connection presenting a CA-signed but
