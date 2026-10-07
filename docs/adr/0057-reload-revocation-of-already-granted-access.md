@@ -114,7 +114,8 @@ than growing a second copy of the same rule in `lib.rs`). `None` (no
 entirely) never disconnects anyone - consistent with
 `allowlist_permits`'s own "no list, no restriction" rule.
 
-Two gaps worth being explicit about, both closed:
+Two gaps worth being explicit about: the registration race is
+closed; the overlapping-connection gap remains open.
 
 - **The registration race.** An inbound `Hello`/dial handshake can
   pass the allowlist check against the value live *before* a reload,
