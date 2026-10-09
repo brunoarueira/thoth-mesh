@@ -165,7 +165,7 @@ async fn run_connection(socket: MaybeTlsStream, shared: Shared, initial_peer: Op
     // --peer-topic-acl reload (ADR-0057) can reach them the moment
     // this connection exists, not just once it's subscribed to
     // something.
-    let (connection_id, forwarders, is_peer_flag) =
+    let (registration, forwarders, is_peer_flag) =
         connections.register(principal, outgoing_tx.clone());
 
     // Bundles everything a dispatched envelope's handling needs -
@@ -179,8 +179,7 @@ async fn run_connection(socket: MaybeTlsStream, shared: Shared, initial_peer: Op
         membership,
         interest,
         peer_links,
-        connections,
-        connection_id,
+        _registration: registration,
         node_id,
         my_listen_addr,
         metrics,
@@ -209,16 +208,18 @@ async fn run_connection(socket: MaybeTlsStream, shared: Shared, initial_peer: Op
         && !ctx.admit_initial_peer(peer_id, listen_addr, hello_id).await
     {
         // A rejection this early never touches peer_identity/
-        // forwarders, so shut_down's own cleanup for those is a no-op
-        // here - but it's also the only thing that unregisters this
-        // connection from `connections` (ADR-0057), registered
-        // unconditionally above before admit_initial_peer ever ran.
-        // Skipping it would leak this connection's outgoing_tx clone
-        // into that registry forever, which write_loop's own
-        // while-let-Some(...)-from-outgoing_rx loop below never sees
-        // as fully closed - the socket would never actually close.
-        ctx.shut_down();
-        drop(ctx.outgoing_tx);
+        // forwarders, so shut_down's own cleanup for those would be a
+        // no-op here anyway - not called at all. `ctx`'s own
+        // `_registration` field still unregisters this connection
+        // from `connections` (ADR-0057), once `ctx` itself is
+        // dropped - registered unconditionally above, before
+        // admit_initial_peer even ran. `drop(ctx)`, not just
+        // `drop(ctx.outgoing_tx)`, and *before* awaiting writer_task:
+        // the registry's own outgoing_tx clone, released only by
+        // that drop, would otherwise alone keep write_loop's
+        // `outgoing_rx.recv()` from ever seeing the channel as
+        // closed - the socket would never actually close.
+        drop(ctx);
         let _ = writer_task.await;
         return;
     }
@@ -336,13 +337,14 @@ async fn run_connection(socket: MaybeTlsStream, shared: Shared, initial_peer: Op
     ctx.shut_down();
 
     // Every other outgoing_tx clone (forwarders, the peer_links
-    // registry entry) is already gone by this point - dropping this
-    // last one closes the channel write_loop is reading from, and it
-    // exits on its own once it's drained whatever was already queued.
-    // Joined rather than left as a fire-and-forget background task, so
-    // this connection isn't considered fully done until its last reply
-    // has actually been flushed (or the write side already failed).
-    drop(ctx.outgoing_tx);
+    // registry entry) is already gone by this point except one:
+    // `ctx._registration` (ADR-0057) itself still holds the
+    // `connections` registry's own clone, released only once `ctx` is
+    // dropped - which has to happen *before* awaiting `writer_task`
+    // below, not after, or that clone alone would keep write_loop's
+    // `outgoing_rx.recv()` from ever seeing the channel as closed.
+    // `drop(ctx)`, not just `drop(ctx.outgoing_tx)`, for exactly that.
+    drop(ctx);
     let _ = writer_task.await;
 }
 
@@ -359,10 +361,12 @@ struct ConnectionContext {
     peer_links: PeerLinks,
     /// Where this connection's own `forwarders`/`is_peer_flag` (below)
     /// are also registered, so a `--topic-acl`/`--peer-topic-acl`
-    /// reload can reach them from outside this connection's own task.
-    /// See ADR-0057.
-    connections: ConnectionRegistry,
-    connection_id: ConnectionId,
+    /// reload can reach them from outside this connection's own task,
+    /// see ADR-0057. Never read directly; held only for the
+    /// unregister its `Drop` runs, including if this connection's
+    /// whole task is ever aborted rather than reaching `shut_down`
+    /// normally.
+    _registration: ConnectionRegistration,
     node_id: PeerId,
     my_listen_addr: Option<String>,
     metrics: Metrics,
@@ -676,6 +680,64 @@ impl ConnectionContext {
             });
             is_new_forwarder
         };
+
+        // Closes a gap a --topic-acl/--peer-topic-acl reload's own
+        // reconciliation sweep (ADR-0057) could otherwise land in:
+        // the check at the top of this method ran against whatever
+        // was live *then*, but nothing stopped a reload from running
+        // its sweep - finding nothing yet, since this forwarder
+        // wasn't inserted until just now - in the gap between that
+        // check and the insert above. Re-checking against the
+        // freshest ACL immediately, synchronously, with no `.await` in
+        // between, means a reload landing in that exact window is
+        // guaranteed to be caught by one check or the other: either
+        // the one above (if it lands first) or this one (if it lands
+        // after) - never neither.
+        if is_new_forwarder
+            && !filter_acl_permits(
+                self.topic_acl.get(),
+                self.peer_topic_acl.get(),
+                is_peer,
+                self.principal,
+                &filter,
+                Action::Subscribe,
+            )
+        {
+            if let Some(subscription) = self.forwarders.lock().unwrap().remove(&filter) {
+                match subscription {
+                    Subscription::Forwarder(forwarder) => forwarder.handle.abort(),
+                    Subscription::Group(group) => {
+                        self.broker
+                            .leave_group(filter.clone(), group, &self.outgoing_tx);
+                    }
+                }
+            }
+            tracing::warn!(sender = ?envelope.sender, %filter, is_peer, "rejected: not on the configured topic ACL (reloaded mid-subscribe)");
+            if is_peer {
+                self.metrics.record_peer_topic_acl_rejection();
+            } else {
+                self.metrics.record_topic_acl_rejection();
+            }
+            let error = Envelope::new(
+                self.node_id,
+                MessageKind::Error {
+                    in_reply_to: Some(envelope.id),
+                    message: format!("not authorized to subscribe to {filter}"),
+                },
+            );
+            return self.send(error).await;
+        }
+
+        // Incremented here too, not after the ack-send `.await` below
+        // - same reasoning as the recheck just above: this has to be
+        // settled before anything can yield back to a concurrently-
+        // running reload, so a reconciliation sweep that removes this
+        // exact forwarder (because some *later* reload revokes it)
+        // always sees - and correctly undoes - a genuinely-incremented
+        // interest count, never one this Subscribe hasn't gotten
+        // around to incrementing yet.
+        let became_newly_interested = is_new_forwarder && self.interest.subscribe(filter.clone());
+
         // The ack goes out before the interest-propagation echo below
         // (ADR-0011) - both now flow through the same outgoing_tx
         // queue (see ADR-0029), so whichever is sent first is what a
@@ -691,7 +753,7 @@ impl ConnectionContext {
         if !self.send(ack).await {
             return false;
         }
-        if is_new_forwarder && self.interest.subscribe(filter.clone()) {
+        if became_newly_interested {
             propagate_interest(
                 &self.peer_links,
                 self.node_id,
@@ -1010,16 +1072,16 @@ impl ConnectionContext {
         self.send(reply).await
     }
 
-    /// Runs once the read loop ends: unregisters this connection from
-    /// `connections` (ADR-0057) first - nothing external should keep
-    /// reaching for forwarders about to be stopped below anyway - then
-    /// stops every forwarder this connection spawned, propagating the
-    /// resulting interest loss the same way an explicit `Unsubscribe`
-    /// would (ADR-0011); then, if this connection turned out to be a
-    /// peer link, unregisters it from `peer_links` too and marks it
-    /// disconnected.
+    /// Runs once the read loop ends: stops every forwarder this
+    /// connection spawned, propagating the resulting interest loss the
+    /// same way an explicit `Unsubscribe` would (ADR-0011); then, if
+    /// this connection turned out to be a peer link, unregisters it
+    /// from `peer_links` too and marks it disconnected. Unregistering
+    /// from `connections` (ADR-0057) isn't this method's job anymore,
+    /// since `_registration`'s own `Drop` handles that unconditionally,
+    /// including on this whole task being aborted rather than ever
+    /// reaching this method at all.
     fn shut_down(&mut self) {
-        self.connections.unregister(self.connection_id);
         for (filter, subscription) in self.forwarders.lock().unwrap().drain() {
             tracing::debug!(%filter, "stopping forwarder");
             match subscription {
@@ -1425,6 +1487,25 @@ pub(crate) struct ConnectionRegistry {
     next_id: Arc<AtomicU64>,
 }
 
+/// Unregisters one [`ConnectionRegistry`] entry the moment it's
+/// dropped. `ConnectionContext` holds this - not a bare
+/// `ConnectionId` - specifically so an aborted connection task still
+/// cleans up its entry: `ctx` itself still gets dropped on abort
+/// (running every field's own destructor), even though none of its
+/// methods (including `shut_down`'s own, otherwise-only, explicit
+/// `unregister` call) ever get to run. See ADR-0057.
+#[derive(Debug)]
+struct ConnectionRegistration {
+    connections: ConnectionRegistry,
+    id: ConnectionId,
+}
+
+impl Drop for ConnectionRegistration {
+    fn drop(&mut self) {
+        self.connections.unregister(self.id);
+    }
+}
+
 impl std::fmt::Debug for ConnectionEntry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ConnectionEntry")
@@ -1445,12 +1526,21 @@ impl ConnectionRegistry {
     /// life - the *same* `Arc`s stored in this registry's own entry,
     /// so a mutation through either side is immediately visible to
     /// the other: the shared forwarders map, and the is-a-peer-link
-    /// flag (flipped once, by `admit_initial_peer`/`handle_hello`).
+    /// flag (flipped once, by `admit_initial_peer`/`handle_hello`), and
+    /// a [`ConnectionRegistration`] guard that unregisters this exact
+    /// entry when dropped - whether that's `shut_down`'s own explicit
+    /// `unregister` call (a safe no-op the second time) or, if this
+    /// connection's whole task is ever aborted externally instead
+    /// (ADR-0028's chaos tests, via `Node::accepted_connections`),
+    /// just this guard's own `Drop` once `ConnectionContext` itself
+    /// is - abort skips every line of code after the point it was
+    /// cancelled at, but still runs the destructors of whatever was
+    /// already constructed.
     fn register(
         &self,
         principal: Principal,
         outgoing_tx: mpsc::Sender<Arc<Envelope>>,
-    ) -> (ConnectionId, Forwarders, Arc<AtomicBool>) {
+    ) -> (ConnectionRegistration, Forwarders, Arc<AtomicBool>) {
         let id = ConnectionId(self.next_id.fetch_add(1, Ordering::Relaxed));
         let forwarders = Arc::new(Mutex::new(HashMap::new()));
         let is_peer = Arc::new(AtomicBool::new(false));
@@ -1463,7 +1553,11 @@ impl ConnectionRegistry {
                 outgoing_tx,
             },
         );
-        (id, forwarders, is_peer)
+        let registration = ConnectionRegistration {
+            connections: self.clone(),
+            id,
+        };
+        (registration, forwarders, is_peer)
     }
 
     fn unregister(&self, id: ConnectionId) {
