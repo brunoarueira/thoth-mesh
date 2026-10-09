@@ -220,7 +220,10 @@ impl PeerLinks {
     /// subscriber count for that filter happens to drop to zero).
     /// Closing it completely would mean serializing every local
     /// transition's own propagate-interest send against this whole
-    /// sweep, which isn't attempted here.
+    /// sweep, which isn't attempted here - tracked as a known,
+    /// deliberately deferred limitation in issue #197, the same
+    /// treatment the `PeerLinks` register-supersede race got in part
+    /// 1 of this ADR (issue #194).
     pub fn reconcile_interest(
         &self,
         interest: &Interest,
