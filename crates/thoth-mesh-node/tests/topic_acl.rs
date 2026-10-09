@@ -11,10 +11,12 @@ use std::time::Duration;
 
 use thoth_mesh_core::async_framing;
 use thoth_mesh_core::{Envelope, MessageKind, PeerId, Topic, TopicFilter};
-use thoth_mesh_node::{NodeOptions, TopicAcl};
+use thoth_mesh_node::{NodeOptions, ReloadableAcls, TopicAcl};
+use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{mpsc, watch};
 use tokio::time::timeout;
-use tokio_util::compat::{Compat, TokioAsyncReadCompatExt};
+use tokio_util::compat::{Compat, TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -31,6 +33,29 @@ async fn spawn_test_node_with_topic_acl(entries: &[&str]) -> SocketAddr {
         },
     ));
     addr
+}
+
+/// Like [`spawn_test_node_with_topic_acl`], but also wires a reload
+/// channel (ADR-0057) a test can push a fresh ACL through directly,
+/// no real config file or `SIGHUP` involved - see `tests/reload.rs`'s
+/// own use of the same pattern.
+async fn spawn_test_node_with_reloadable_topic_acl(
+    entries: &[&str],
+) -> (SocketAddr, watch::Sender<ReloadableAcls>) {
+    let acl = TopicAcl::parse(entries.iter().copied()).unwrap();
+    let (reload_tx, reload_rx) = watch::channel(ReloadableAcls::default());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(thoth_mesh_node::serve_with_tls(
+        listener,
+        Vec::new(),
+        NodeOptions {
+            topic_acl: Some(acl),
+            reload: Some(reload_rx),
+            ..Default::default()
+        },
+    ));
+    (addr, reload_tx)
 }
 
 /// Like [`spawn_test_node_with_topic_acl`], but for `--peer-topic-acl`
@@ -74,6 +99,57 @@ async fn recv_times_out(stream: &mut Compat<TcpStream>) -> bool {
     )
     .await
     .is_err()
+}
+
+/// Like [`connect`], but splits the connection and spawns a
+/// background task continuously reading frames into the returned
+/// channel, so polling for "has anything arrived yet" is a
+/// cancel-safe `mpsc::Receiver::recv` under a timeout - never a
+/// `timeout` wrapped directly around `async_framing::read_frame`
+/// itself, which can desync framing if cancelled mid-frame (see
+/// ADR-0029, and `tests/reload.rs`'s identical helper). Needed here,
+/// specifically, for a test that polls the *same* connection
+/// repeatedly rather than reading it once.
+async fn connect_with_reader(
+    addr: SocketAddr,
+) -> (Compat<OwnedWriteHalf>, mpsc::UnboundedReceiver<Envelope>) {
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (read_half, write_half) = stream.into_split();
+    let mut reader = read_half.compat();
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Ok(bytes) = async_framing::read_frame(&mut reader).await {
+            if tx.send(Envelope::from_bytes(&bytes).unwrap()).is_err() {
+                break;
+            }
+        }
+    });
+    (write_half.compat_write(), rx)
+}
+
+async fn send_split(stream: &mut Compat<OwnedWriteHalf>, envelope: &Envelope) {
+    let bytes = envelope.to_bytes().unwrap();
+    async_framing::write_frame(stream, &bytes).await.unwrap();
+}
+
+/// Like [`recv`], but reading from [`connect_with_reader`]'s channel.
+async fn recv_split(incoming: &mut mpsc::UnboundedReceiver<Envelope>) -> Envelope {
+    timeout(TEST_TIMEOUT, incoming.recv())
+        .await
+        .expect("timed out waiting for a frame")
+        .expect("the background reader task ended before a reply arrived")
+}
+
+/// `None` if nothing arrives within a short window - cancel-safe,
+/// unlike [`recv_times_out`]: used by a test that polls the *same*
+/// connection in a loop, where that matters (see
+/// [`connect_with_reader`]'s own doc comment).
+async fn try_recv_or_none(incoming: &mut mpsc::UnboundedReceiver<Envelope>) -> Option<Envelope> {
+    match timeout(Duration::from_millis(200), incoming.recv()).await {
+        Ok(Some(envelope)) => Some(envelope),
+        Ok(None) => panic!("the background reader task ended before a reply arrived"),
+        Err(_) => None,
+    }
 }
 
 fn topic(s: &str) -> Topic {
@@ -544,4 +620,132 @@ async fn a_peer_topic_acl_does_not_restrict_an_ordinary_client() {
 
     let delivered = recv(&mut subscriber).await;
     assert_eq!(delivered.id, publish.id);
+}
+
+/// ADR-0057: a reload tightening `--topic-acl` doesn't just change
+/// what a *new* `Subscribe`/`Publish` sees - it stops a forwarder a
+/// connection already has running for a topic that's no longer
+/// permitted, propagating the resulting interest loss, without
+/// disconnecting the connection itself (unlike an `--allow-peer`
+/// revocation, which does end the whole connection - this is a
+/// narrower, per-forwarder stop).
+#[tokio::test]
+async fn a_reload_stops_an_existing_forwarder_the_tightened_acl_no_longer_permits() {
+    let (addr, reload_tx) =
+        spawn_test_node_with_reloadable_topic_acl(&["anonymous|pubsub|weather.updates"]).await;
+
+    let (mut subscriber, mut incoming) = connect_with_reader(addr).await;
+    let sub = Envelope::new(
+        PeerId::new(),
+        MessageKind::Subscribe {
+            filter: topic("weather.updates").into(),
+            ack: false,
+            group: None,
+            durable: false,
+        },
+    );
+    send_split(&mut subscriber, &sub).await;
+    assert_eq!(
+        recv_split(&mut incoming).await.kind,
+        MessageKind::Ack {
+            in_reply_to: sub.id
+        }
+    );
+
+    // Confirms delivery actually works before the reload - not
+    // strictly needed for the assertions below, but makes this test
+    // fail for the right reason if it ever doesn't.
+    let before = Envelope::new(
+        PeerId::new(),
+        MessageKind::Publish {
+            topic: topic("weather.updates"),
+            payload: b"sunny".to_vec(),
+            retain: false,
+            content_type: None,
+            reply_to: None,
+            in_reply_to: None,
+        },
+    );
+    send(&mut connect(addr).await, &before).await;
+    assert_eq!(recv_split(&mut incoming).await.id, before.id);
+
+    // Tightens the ACL to publish-only for weather.updates - anonymous
+    // can no longer subscribe to it, which should stop the forwarder
+    // this connection already has running for it.
+    reload_tx
+        .send(ReloadableAcls {
+            topic_acl: Some(
+                TopicAcl::parse(["anonymous|pub|weather.updates"].into_iter()).unwrap(),
+            ),
+            ..ReloadableAcls::default()
+        })
+        .unwrap();
+
+    // The reload applier runs concurrently - poll by publishing until
+    // a publish genuinely stops reaching the subscriber, rather than
+    // a fixed sleep racing its own scheduling. One reused publisher
+    // connection, not a fresh one per attempt: publishing never gets
+    // a direct reply either way, so there's nothing to gain from
+    // reconnecting, and a reload that (incorrectly) never took effect
+    // would otherwise spin this loop until it exhausts ephemeral
+    // ports rather than failing on its own TEST_TIMEOUT as intended.
+    //
+    // A quiet interval alone isn't proof of anything by itself - it
+    // could just be network/scheduling delay, not the forwarder
+    // actually having stopped. Once one is seen, confirm definitively
+    // instead: a fresh Subscribe to this exact filter, on the same
+    // connection, must now be rejected with an Error. If it's still
+    // accepted, the ACL genuinely hasn't taken effect yet (and this
+    // fresh Subscribe is itself a no-op against the filter it's
+    // already subscribed to either way) - go back to polling rather
+    // than declaring success on a false signal.
+    let mut publisher = connect(addr).await;
+    timeout(TEST_TIMEOUT, async {
+        loop {
+            let attempt = Envelope::new(
+                PeerId::new(),
+                MessageKind::Publish {
+                    topic: topic("weather.updates"),
+                    payload: b"cloudy".to_vec(),
+                    retain: false,
+                    content_type: None,
+                    reply_to: None,
+                    in_reply_to: None,
+                },
+            );
+            send(&mut publisher, &attempt).await;
+            if try_recv_or_none(&mut incoming).await.is_some() {
+                continue;
+            }
+            let resub = Envelope::new(
+                PeerId::new(),
+                MessageKind::Subscribe {
+                    filter: topic("weather.updates").into(),
+                    ack: false,
+                    group: None,
+                    durable: false,
+                },
+            );
+            send_split(&mut subscriber, &resub).await;
+            if let MessageKind::Error { in_reply_to, .. } = recv_split(&mut incoming).await.kind
+                && in_reply_to == Some(resub.id)
+            {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the existing forwarder was never stopped by the reload");
+
+    // The connection itself stays open and functional throughout -
+    // the reload stops the one forwarder/subscribe-permission it no
+    // longer permits, not the whole connection (StatusRequest isn't
+    // topic-ACL-gated at all, so this is purely a "is this connection
+    // still alive and responsive" check, not a topic-ACL one).
+    let status = Envelope::new(PeerId::new(), MessageKind::StatusRequest);
+    send_split(&mut subscriber, &status).await;
+    match recv_split(&mut incoming).await.kind {
+        MessageKind::StatusReply { in_reply_to, .. } => assert_eq!(in_reply_to, status.id),
+        other => panic!("expected a StatusReply, got {other:?}"),
+    }
 }

@@ -12,6 +12,7 @@ use thoth_mesh_core::{PeerId, Topic};
 use thoth_mesh_tls::{TlsAcceptor, TlsConnector};
 use tokio::sync::{Semaphore, mpsc};
 
+use crate::connection::ConnectionRegistry;
 use crate::health::Readiness;
 use crate::metrics::Metrics;
 use crate::peer_links::PeerLinks;
@@ -34,6 +35,12 @@ pub struct Shared {
     pub membership: Membership,
     pub interest: Interest,
     pub peer_links: PeerLinks,
+    /// Every currently active connection's live forwarder state,
+    /// client and peer link alike - unlike `peer_links`, which only
+    /// ever tracks peer links. So a `--topic-acl`/`--peer-topic-acl`
+    /// reload can revalidate and stop whatever's no longer permitted,
+    /// from outside the connection task that owns it. See ADR-0057.
+    pub(crate) connections: ConnectionRegistry,
     pub node_id: PeerId,
     pub my_listen_addr: Option<String>,
     pub metrics: Metrics,
@@ -128,6 +135,7 @@ impl std::fmt::Debug for Shared {
             .field("membership", &self.membership)
             .field("interest", &self.interest)
             .field("peer_links", &self.peer_links)
+            .field("connections", &self.connections.len())
             .field("node_id", &self.node_id)
             .field("my_listen_addr", &self.my_listen_addr)
             .field("metrics", &self.metrics)
@@ -176,6 +184,7 @@ impl Shared {
             membership: Membership::new(),
             interest: Interest::new(),
             peer_links: PeerLinks::new(),
+            connections: ConnectionRegistry::new(),
             node_id,
             my_listen_addr,
             metrics: Metrics::new(),
