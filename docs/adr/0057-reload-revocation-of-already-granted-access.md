@@ -170,6 +170,24 @@ connection's own task keeps reading frames throughout, completely
 unaware anything happened unless its *next* `Subscribe`/`Publish`
 hits the (now-updated) ACL on its own.
 
+Every connection registers into `ConnectionRegistry` unconditionally,
+*before* `admit_initial_peer` ever runs - a plain client needs to be
+reachable too, and a dial-side connection doesn't know yet whether
+its own identity will even be admitted. This surfaced a real bug
+while building it, not just a theoretical one: `run_connection`'s
+early-rejection path (a dial-side peer whose certificate
+`admit_initial_peer` itself refuses) used to skip `shut_down()`
+entirely - there was nothing for it to clean up yet, before this ADR.
+Now there is: that connection's `ConnectionRegistry` entry, holding
+its own clone of `outgoing_tx`. Skipping `shut_down()` left that
+clone registered forever, which `write_loop`'s own `while let
+Some(envelope) = outgoing_rx.recv().await` never sees as fully closed
+- the socket would never actually close. Caught by a pre-existing
+integration test (`dial_side_rejects_an_unlisted_seed_peer_certificate`)
+timing out instead of passing. Fixed by calling `shut_down()` on that
+path too - a no-op for `peer_identity`/`forwarders` cleanup this
+early, but now also the one thing that unregisters the connection.
+
 ### `--peer-topic-filter`: no connection-level mechanism needed at all
 
 Unlike the other two, this doesn't require reaching into any

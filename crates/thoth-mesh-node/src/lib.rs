@@ -227,6 +227,13 @@ fn spawn_reload_applier(reload: Option<watch::Receiver<ReloadableAcls>>, shared:
             let acls = reload.borrow_and_update().clone();
             shared.topic_acl.set(acls.topic_acl);
             shared.peer_topic_acl.set(acls.peer_topic_acl);
+            // Stops any forwarder the fresh topic_acl/peer_topic_acl
+            // no longer permits, on every currently active connection
+            // (ADR-0057) - reads whatever was just installed above, so
+            // this call has to come after both `.set()`s, not before
+            // (unlike the allow_peer disconnect below, which uses the
+            // not-yet-installed value directly).
+            connection::reconcile_topic_acls(&shared);
             // Disconnects any peer link the fresh allow_peer no longer
             // permits (ADR-0057), using the just-reloaded value itself
             // - not yet installed into shared.allowed_peers below -
