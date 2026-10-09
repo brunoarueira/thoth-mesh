@@ -247,17 +247,32 @@ fn spawn_reload_applier(reload: Option<watch::Receiver<ReloadableAcls>>, shared:
                 connection::allowlist_permits(allow_peer, principal)
             });
             shared.allowed_peers.set(acls.allow_peer);
+            // Only reconciles peer interest when peer_topic_filter
+            // itself actually changed this reload - unlike
+            // reconcile_topic_acls above (bounded by live connection
+            // count), reconcile_interest bursts a message per peer
+            // link per currently-interesting filter, so running it on
+            // a reload that only touched an unrelated field (e.g.
+            // --allow-peer) would be pure waste. Read before the
+            // `.set()` below installs the new value, same "compare
+            // before overwrite" shape `Reloadable::set` itself uses
+            // internally.
+            let previous_peer_topic_filter = shared.peer_topic_filter.get();
+            let peer_topic_filter_changed =
+                previous_peer_topic_filter.as_deref() != acls.peer_topic_filter.as_ref();
             shared.peer_topic_filter.set(acls.peer_topic_filter);
-            // Re-announces/withdraws this node's own aggregate
-            // interest to every active peer link under whatever
-            // peer_topic_filter is now live (ADR-0057/ADR-0049) -
-            // reads the just-installed value above, same ordering as
-            // reconcile_topic_acls, for the same reason.
-            shared.peer_links.reconcile_interest(
-                &shared.interest,
-                shared.node_id,
-                shared.peer_topic_filter.get().as_deref(),
-            );
+            if peer_topic_filter_changed {
+                // Re-announces/withdraws this node's own aggregate
+                // interest to every active peer link under whatever
+                // peer_topic_filter is now live (ADR-0057/ADR-0049) -
+                // reads the just-installed value above, same ordering
+                // as reconcile_topic_acls, for the same reason.
+                shared.peer_links.reconcile_interest(
+                    &shared.interest,
+                    shared.node_id,
+                    shared.peer_topic_filter.get().as_deref(),
+                );
+            }
             tracing::info!("applied a config reload");
         }
     });
