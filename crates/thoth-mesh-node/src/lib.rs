@@ -248,6 +248,16 @@ fn spawn_reload_applier(reload: Option<watch::Receiver<ReloadableAcls>>, shared:
             });
             shared.allowed_peers.set(acls.allow_peer);
             shared.peer_topic_filter.set(acls.peer_topic_filter);
+            // Re-announces/withdraws this node's own aggregate
+            // interest to every active peer link under whatever
+            // peer_topic_filter is now live (ADR-0057/ADR-0049) -
+            // reads the just-installed value above, same ordering as
+            // reconcile_topic_acls, for the same reason.
+            shared.peer_links.reconcile_interest(
+                &shared.interest,
+                shared.node_id,
+                shared.peer_topic_filter.get().as_deref(),
+            );
             tracing::info!("applied a config reload");
         }
     });

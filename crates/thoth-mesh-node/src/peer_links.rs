@@ -7,7 +7,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use thoth_mesh_core::{Envelope, PeerId, Topic, TopicFilter};
+use thoth_mesh::Interest;
+use thoth_mesh_core::{Envelope, MessageKind, PeerId, Topic, TopicFilter};
 use tokio::sync::{Notify, mpsc};
 
 use crate::peer_topic_filter::PeerTopicFilter;
@@ -160,6 +161,72 @@ impl PeerLinks {
             .collect();
         for notify in notifies {
             notify.notify_one();
+        }
+    }
+
+    /// Reconciles every currently registered peer link's own view of
+    /// this node's aggregate interest against a freshly reloaded
+    /// `--peer-topic-filter` (ADR-0057/ADR-0049) - no connection-level
+    /// signal needed at all, unlike `disconnect_unless` above, since
+    /// this only ever re-runs the *push* side of interest propagation
+    /// (ADR-0011), which already lives entirely here.
+    ///
+    /// For each link, under the *new* `peer_topic_filter`, partitions
+    /// the current `interest` snapshot into what that link's own
+    /// `Principal` is still permitted to hear about (announced via a
+    /// `Subscribe`-shaped interest-announce, same shape
+    /// `register_peer_link`'s own catch-up uses) and what it no
+    /// longer is (withdrawn via an `Unsubscribe`-shaped one).
+    ///
+    /// No history of what was previously told to any link needs
+    /// tracking, and this runs unconditionally on every reload, not
+    /// just one that actually changed `peer_topic_filter` - both
+    /// kinds are idempotent from the receiving peer's own
+    /// perspective (duplicate interest propagation is already
+    /// possible by design, in the gossip-and-mesh reality
+    /// `thoth-mesh` discovers peers in; a peer told to unsubscribe
+    /// from something it was never told to subscribe to is a no-op),
+    /// so recomputing the whole set fresh every time is simpler than
+    /// diffing against a remembered history, and correctly re-grants
+    /// whatever a *removed* filter should newly permit again -
+    /// something a "only reconcile if the filter is Some" short
+    /// circuit would otherwise miss entirely.
+    pub fn reconcile_interest(
+        &self,
+        interest: &Interest,
+        node_id: PeerId,
+        peer_topic_filter: Option<&PeerTopicFilter>,
+    ) {
+        let snapshot = interest.snapshot();
+        let links: Vec<(Principal, mpsc::Sender<Arc<Envelope>>)> = self
+            .links
+            .lock()
+            .unwrap()
+            .values()
+            .map(|link| (link.principal, link.sender.clone()))
+            .collect();
+        for (principal, sender) in links {
+            for filter in &snapshot {
+                let permitted = match peer_topic_filter {
+                    None => true,
+                    Some(peer_topic_filter) => filter
+                        .as_topic()
+                        .is_some_and(|topic| peer_topic_filter.permits(principal, &topic)),
+                };
+                let kind = if permitted {
+                    MessageKind::Subscribe {
+                        filter: filter.clone(),
+                        ack: false,
+                        group: None,
+                        durable: false,
+                    }
+                } else {
+                    MessageKind::Unsubscribe {
+                        filter: filter.clone(),
+                    }
+                };
+                let _ = sender.try_send(Arc::new(Envelope::new(node_id, kind)));
+            }
         }
     }
 }

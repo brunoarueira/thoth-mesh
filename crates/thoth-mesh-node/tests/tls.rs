@@ -15,10 +15,11 @@ use thoth_mesh_core::{Envelope, MessageKind, Topic, async_framing};
 use thoth_mesh_node::test_support::eventually;
 use thoth_mesh_node::{NodeOptions, ReloadableAcls, TlsConfig};
 use thoth_mesh_tls::MaybeTlsStream;
+use tokio::io::{WriteHalf, split};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio::time::timeout;
-use tokio_util::compat::{Compat, TokioAsyncReadCompatExt};
+use tokio_util::compat::{Compat, TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -144,6 +145,66 @@ async fn recv(stream: &mut Compat<MaybeTlsStream>) -> Envelope {
         .expect("timed out waiting for a frame")
         .unwrap();
     Envelope::from_bytes(&bytes).unwrap()
+}
+
+/// Like [`connect_tls`], but splits the connection and spawns a
+/// background task continuously reading frames into the returned
+/// channel, so polling for "has anything arrived yet" is a
+/// cancel-safe `mpsc::Receiver::recv` under a timeout - never a
+/// `timeout` wrapped directly around `async_framing::read_frame`
+/// itself, which can desync framing if cancelled mid-frame (see
+/// ADR-0029, and `tests/reload.rs`/`tests/topic_acl.rs`'s identical
+/// helpers). Needed here, specifically, for a test that polls the
+/// *same* connection repeatedly rather than reading it once.
+async fn connect_tls_with_reader(
+    addr: SocketAddr,
+    ca: &TlsConfig,
+) -> (
+    Compat<WriteHalf<MaybeTlsStream>>,
+    mpsc::UnboundedReceiver<Envelope>,
+) {
+    // Mirrors connection.rs's own split-before-compat ordering
+    // exactly (`tokio::io::split` only ever produces halves
+    // implementing *tokio*'s AsyncRead/AsyncWrite; async_framing
+    // needs futures-io's, which `.compat()`/`.compat_write()` add
+    // back per half) - splitting `connect_tls`'s own already-compat
+    // return value doesn't work, since `tokio::io::split`'s halves
+    // don't inherit `Compat`'s dual tokio/futures-io trait coverage.
+    let connector = thoth_mesh_tls::TlsConnector::from(std::sync::Arc::new(
+        thoth_mesh_tls::client_config(thoth_mesh_tls::load_certs(&ca.ca).unwrap(), None).unwrap(),
+    ));
+    let tcp = TcpStream::connect(addr).await.unwrap();
+    let stream = MaybeTlsStream::connect(&connector, tcp, &addr.to_string())
+        .await
+        .unwrap();
+    let (reader, writer) = split(stream);
+    let mut reader = reader.compat();
+    let writer = writer.compat_write();
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Ok(bytes) = async_framing::read_frame(&mut reader).await {
+            if tx.send(Envelope::from_bytes(&bytes).unwrap()).is_err() {
+                break;
+            }
+        }
+    });
+    (writer, rx)
+}
+
+async fn send_split(stream: &mut Compat<WriteHalf<MaybeTlsStream>>, envelope: &Envelope) {
+    let bytes = envelope.to_bytes().unwrap();
+    async_framing::write_frame(stream, &bytes).await.unwrap();
+}
+
+/// `None` if nothing arrives within a short window - cancel-safe,
+/// unlike racing a `timeout` directly against `async_framing::
+/// read_frame` (see [`connect_tls_with_reader`]'s own doc comment).
+async fn try_recv_or_none(incoming: &mut mpsc::UnboundedReceiver<Envelope>) -> Option<Envelope> {
+    match timeout(Duration::from_millis(200), incoming.recv()).await {
+        Ok(Some(envelope)) => Some(envelope),
+        Ok(None) => panic!("the background reader task ended before a reply arrived"),
+        Err(_) => None,
+    }
 }
 
 fn topic(s: &str) -> Topic {
@@ -1291,4 +1352,161 @@ async fn peer_topic_filter_does_not_restrict_an_explicit_subscribe_from_that_pee
             }
         }
     }
+}
+
+/// ADR-0057: a `--peer-topic-filter` reload doesn't just change what
+/// a *future* local-interest transition tells a peer link about - it
+/// retroactively backfills whatever interest already existed locally
+/// and is newly permitted, with no restart and no fresh local
+/// `Subscribe`/`Unsubscribe` needed to trigger it.
+///
+/// The reverse direction (a reload that *tightens* a filter) uses the
+/// exact same mechanism, but isn't covered by its own reload test
+/// here: unlike an ACL rejection (which always gets an `Error` reply
+/// to check against), interest *withdrawal* is one-way and gets no
+/// reply at all - there's no secondary, unambiguous signal available
+/// to distinguish "the peer link genuinely stopped hearing about
+/// this" from "this one publish attempt happened to race a delay,"
+/// the same proof problem `tests/topic_acl.rs`'s own reload test
+/// solved differently (a fresh *Subscribe* gets a direct Ack/Error
+/// reply; a local topic's own interest transition has nothing
+/// equivalent). The *end state* tightening produces is still fully
+/// covered by the static-filter tests above - just not a timed
+/// transition via reload specifically.
+#[tokio::test]
+async fn a_reload_loosening_the_peer_topic_filter_backfills_already_existing_local_interest() {
+    let ca = TestCa::new();
+    let identity_a = ca.issue();
+    let identity_b = ca.issue();
+    let fingerprint_b = fingerprint_of(&identity_b)
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<String>();
+
+    let (reload_tx, reload_rx) = watch::channel(ReloadableAcls::default());
+
+    let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_a = listener_a.local_addr().unwrap();
+    let node_a = thoth_mesh_node::spawn_with_tls(
+        listener_a,
+        Vec::new(),
+        NodeOptions {
+            tls: Some(identity_a),
+            // Only weather.updates, to start - traffic.updates is
+            // deliberately excluded from what A tells B.
+            peer_topic_filter: Some(
+                thoth_mesh_node::PeerTopicFilter::parse([format!(
+                    "{fingerprint_b}|weather.updates"
+                )
+                .as_str()])
+                .unwrap(),
+            ),
+            reload: Some(reload_rx),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let listener_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_b = listener_b.local_addr().unwrap();
+    let node_b = thoth_mesh_node::spawn_with_tls(
+        listener_b,
+        vec![addr_a.to_string()],
+        NodeOptions {
+            tls: Some(identity_b),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    eventually(|| node_b.membership.is_reachable(node_a.id)).await;
+    eventually(|| node_a.membership.is_reachable(node_b.id)).await;
+
+    // A client subscribes on A to the topic that's *not* in the
+    // initial filter - A genuinely has local interest in it, but B
+    // was never told, since A's peer_topic_filter never permitted
+    // announcing it to B's identity.
+    let client_identity = ca.issue();
+    let (mut subscriber, mut incoming) = connect_tls_with_reader(addr_a, &client_identity).await;
+    let sub = Envelope::new(
+        thoth_mesh_core::PeerId::new(),
+        MessageKind::Subscribe {
+            filter: topic("traffic.updates").into(),
+            ack: false,
+            group: None,
+            durable: false,
+        },
+    );
+    send_split(&mut subscriber, &sub).await;
+    assert_eq!(
+        try_recv_or_none(&mut incoming).await.map(|e| e.kind),
+        Some(MessageKind::Ack {
+            in_reply_to: sub.id
+        })
+    );
+
+    // Confirms the baseline - not strictly needed for the assertion
+    // below, but makes this test fail for the right reason if it
+    // ever doesn't: B genuinely doesn't know A wants this yet.
+    let mut publisher = connect_tls(addr_b, &client_identity).await;
+    let before = Envelope::new(
+        thoth_mesh_core::PeerId::new(),
+        MessageKind::Publish {
+            topic: topic("traffic.updates"),
+            payload: b"jam".to_vec(),
+            retain: false,
+            content_type: None,
+            reply_to: None,
+            in_reply_to: None,
+        },
+    );
+    send(&mut publisher, &before).await;
+    assert!(
+        try_recv_or_none(&mut incoming).await.is_none(),
+        "traffic.updates shouldn't have crossed the filtered peer link yet"
+    );
+
+    // Loosens A's filter to also permit B's identity to hear about
+    // traffic.updates - A already has local interest in it from
+    // before this reload, so the backfill has to come from the
+    // reload itself, not from some *new* local Subscribe/Unsubscribe
+    // transition (there isn't one here).
+    reload_tx
+        .send(ReloadableAcls {
+            peer_topic_filter: Some(
+                thoth_mesh_node::PeerTopicFilter::parse([
+                    format!("{fingerprint_b}|weather.updates").as_str(),
+                    format!("{fingerprint_b}|traffic.updates").as_str(),
+                ])
+                .unwrap(),
+            ),
+            ..ReloadableAcls::default()
+        })
+        .unwrap();
+
+    // The reload applier runs concurrently - poll by publishing until
+    // one genuinely reaches the subscriber, bounded by TEST_TIMEOUT.
+    timeout(TEST_TIMEOUT, async {
+        loop {
+            let attempt = Envelope::new(
+                thoth_mesh_core::PeerId::new(),
+                MessageKind::Publish {
+                    topic: topic("traffic.updates"),
+                    payload: b"jam".to_vec(),
+                    retain: false,
+                    content_type: None,
+                    reply_to: None,
+                    in_reply_to: None,
+                },
+            );
+            send(&mut publisher, &attempt).await;
+            if let Some(envelope) = try_recv_or_none(&mut incoming).await
+                && matches!(envelope.kind, MessageKind::Publish { .. })
+            {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the backfilled interest never reached the now-permitted peer link");
 }
