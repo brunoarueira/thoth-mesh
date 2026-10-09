@@ -7,11 +7,24 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use thoth_mesh_core::{Envelope, PeerId, Topic, TopicFilter};
+use thoth_mesh::Interest;
+use thoth_mesh_core::{Envelope, MessageKind, PeerId, Topic, TopicFilter};
 use tokio::sync::{Notify, mpsc};
 
 use crate::peer_topic_filter::PeerTopicFilter;
 use crate::topic_acl::Principal;
+
+/// The `Subscribe` shape every interest-announce uses - never a real
+/// consumer wanting delivery guarantees or group membership, just a
+/// routing signal between peers. See ADR-0041's Scope and ADR-0042.
+fn subscribe(filter: TopicFilter) -> MessageKind {
+    MessageKind::Subscribe {
+        filter,
+        ack: false,
+        group: None,
+        durable: false,
+    }
+}
 
 /// One registered peer link: its outgoing channel, alongside its own
 /// authenticated [`Principal`] - the same fingerprint-or-anonymous
@@ -160,6 +173,99 @@ impl PeerLinks {
             .collect();
         for notify in notifies {
             notify.notify_one();
+        }
+    }
+
+    /// Reconciles every currently registered peer link's own view of
+    /// this node's aggregate interest against a freshly reloaded
+    /// `--peer-topic-filter` (ADR-0057/ADR-0049) - no connection-level
+    /// signal needed at all, unlike `disconnect_unless` above, since
+    /// this only ever re-runs the *push* side of interest propagation
+    /// (ADR-0011), which already lives entirely here. The caller
+    /// (`spawn_reload_applier`) only invokes this when
+    /// `peer_topic_filter` actually changed this reload - this
+    /// bursts a message per link per currently-interesting filter, so
+    /// running it on a reload that only touched an unrelated field
+    /// (`--allow-peer`, say) would be pure waste.
+    ///
+    /// For each link, under the *new* `peer_topic_filter`, partitions
+    /// the current `interest` snapshot into what that link's own
+    /// `Principal` is still permitted to hear about (announced via a
+    /// `Subscribe`-shaped interest-announce, same shape
+    /// `register_peer_link`'s own catch-up uses) and what it no
+    /// longer is (withdrawn via an `Unsubscribe`-shaped one). A
+    /// wildcard filter (no single `Topic` behind it) is skipped
+    /// entirely, never sent either way - the same conservative stance
+    /// `broadcast_interest` already takes wherever a
+    /// `--peer-topic-filter` meets a wildcard, since it could never
+    /// have been announced to a link that one applies to in the first
+    /// place.
+    ///
+    /// No history of what was previously told to any link needs
+    /// tracking - both kinds are idempotent from the receiving peer's
+    /// own perspective (duplicate interest propagation is already
+    /// possible by design, in the gossip-and-mesh reality
+    /// `thoth-mesh` discovers peers in; a peer told to unsubscribe
+    /// from something it was never told to subscribe to is a no-op),
+    /// so recomputing the whole set fresh every time is simpler than
+    /// diffing against a remembered history, and correctly re-grants
+    /// whatever a *removed* filter should newly permit again.
+    ///
+    /// Immediately before sending, re-checks `interest.is_interested`
+    /// for that exact filter rather than trusting the snapshot taken
+    /// up front - narrows, but doesn't fully close, the gap against a
+    /// concurrent real-time local transition for the same filter
+    /// landing between the snapshot and this call reaching it (a
+    /// `--peer-topic-filter` reload racing the *exact* moment a local
+    /// subscriber count for that filter happens to drop to zero).
+    /// Closing it completely would mean serializing every local
+    /// transition's own propagate-interest send against this whole
+    /// sweep, which isn't attempted here - tracked as a known,
+    /// deliberately deferred limitation in issue #197, the same
+    /// treatment the `PeerLinks` register-supersede race got in part
+    /// 1 of this ADR (issue #194).
+    pub fn reconcile_interest(
+        &self,
+        interest: &Interest,
+        node_id: PeerId,
+        peer_topic_filter: Option<&PeerTopicFilter>,
+    ) {
+        let snapshot = interest.snapshot();
+        let links: Vec<(Principal, mpsc::Sender<Arc<Envelope>>)> = self
+            .links
+            .lock()
+            .unwrap()
+            .values()
+            .map(|link| (link.principal, link.sender.clone()))
+            .collect();
+        for (principal, sender) in links {
+            for filter in &snapshot {
+                if !interest.is_interested(filter) {
+                    continue;
+                }
+                // `None` (no filter at all) falls straight through to
+                // "permitted", wildcard included - matching
+                // `broadcast_interest`'s own unfiltered-broadcast
+                // fallback. `Some` skips a wildcard filter entirely
+                // (never sent either way), matching
+                // `broadcast_interest`'s own conservative stance
+                // there.
+                let kind = match peer_topic_filter {
+                    None => Some(subscribe(filter.clone())),
+                    Some(peer_topic_filter) => filter.as_topic().map(|topic| {
+                        if peer_topic_filter.permits(principal, &topic) {
+                            subscribe(filter.clone())
+                        } else {
+                            MessageKind::Unsubscribe {
+                                filter: filter.clone(),
+                            }
+                        }
+                    }),
+                };
+                if let Some(kind) = kind {
+                    let _ = sender.try_send(Arc::new(Envelope::new(node_id, kind)));
+                }
+            }
         }
     }
 }
@@ -445,5 +551,120 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn reconcile_interest_sends_a_permitted_literal_filter_as_subscribe() {
+        let links = PeerLinks::new();
+        let (tx, mut rx) = mpsc::channel(4);
+        let fp = [1; 32];
+        links.register(
+            PeerId::new(),
+            tx,
+            Principal::Fingerprint(fp),
+            Arc::new(Notify::new()),
+        );
+        let interest = Interest::new();
+        let filter = TopicFilter::from_str("weather.updates").unwrap();
+        interest.subscribe(filter.clone());
+        let peer_topic_filter =
+            PeerTopicFilter::parse([format!("{}|weather.updates", hex(fp)).as_str()]).unwrap();
+
+        links.reconcile_interest(&interest, PeerId::new(), Some(&peer_topic_filter));
+
+        assert_eq!(
+            rx.try_recv().unwrap().kind,
+            MessageKind::Subscribe {
+                filter,
+                ack: false,
+                group: None,
+                durable: false,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_interest_sends_a_rejected_literal_filter_as_unsubscribe() {
+        let links = PeerLinks::new();
+        let (tx, mut rx) = mpsc::channel(4);
+        links.register(
+            PeerId::new(),
+            tx,
+            Principal::Fingerprint([1; 32]),
+            Arc::new(Notify::new()),
+        );
+        let interest = Interest::new();
+        let filter = TopicFilter::from_str("weather.updates").unwrap();
+        interest.subscribe(filter.clone());
+        // A filter configured for a *different* fingerprint only -
+        // this link's own identity is permitted nothing.
+        let peer_topic_filter =
+            PeerTopicFilter::parse([format!("{}|weather.updates", hex([2; 32])).as_str()]).unwrap();
+
+        links.reconcile_interest(&interest, PeerId::new(), Some(&peer_topic_filter));
+
+        assert_eq!(
+            rx.try_recv().unwrap().kind,
+            MessageKind::Unsubscribe { filter }
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_interest_skips_a_wildcard_filter_under_a_configured_peer_topic_filter() {
+        let links = PeerLinks::new();
+        let (tx, mut rx) = mpsc::channel(4);
+        links.register(
+            PeerId::new(),
+            tx,
+            Principal::Fingerprint([1; 32]),
+            Arc::new(Notify::new()),
+        );
+        let interest = Interest::new();
+        interest.subscribe(TopicFilter::from_str("weather.+").unwrap());
+        let peer_topic_filter =
+            PeerTopicFilter::parse([format!("{}|weather.updates", hex([1; 32])).as_str()]).unwrap();
+
+        links.reconcile_interest(&interest, PeerId::new(), Some(&peer_topic_filter));
+
+        // Neither a Subscribe nor an Unsubscribe - a wildcard could
+        // never have been announced to this link in the first place
+        // (broadcast_interest's own stance), so reconciling it is a
+        // no-op, not an Unsubscribe for something never sent.
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn reconcile_interest_still_sends_a_wildcard_filter_with_no_filter_configured() {
+        let links = PeerLinks::new();
+        let (tx, mut rx) = mpsc::channel(4);
+        links.register(
+            PeerId::new(),
+            tx,
+            Principal::Anonymous,
+            Arc::new(Notify::new()),
+        );
+        let interest = Interest::new();
+        let filter = TopicFilter::from_str("weather.+").unwrap();
+        interest.subscribe(filter.clone());
+
+        // peer_topic_filter: None - the "filter just got removed on
+        // this reload" case. A wildcard must still be backfilled here
+        // (unlike the Some case above), or a removed filter would
+        // never fully restore what it used to withhold.
+        links.reconcile_interest(&interest, PeerId::new(), None);
+
+        assert_eq!(
+            rx.try_recv().unwrap().kind,
+            MessageKind::Subscribe {
+                filter,
+                ack: false,
+                group: None,
+                durable: false,
+            }
+        );
+    }
+
+    fn hex(fp: [u8; 32]) -> String {
+        fp.iter().map(|byte| format!("{byte:02X}")).collect()
     }
 }

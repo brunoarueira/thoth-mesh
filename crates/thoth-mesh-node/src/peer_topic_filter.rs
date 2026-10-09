@@ -21,7 +21,7 @@ use crate::topic_acl::{Principal, parse_principal};
 /// peer link's proactive relay is restricted to exactly what's listed
 /// for its own identity - a peer link with no entries of its own gets
 /// nothing proactively announced, not silently exempted. See ADR-0049.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct PeerTopicFilter {
     entries: HashSet<(Principal, Topic)>,
 }

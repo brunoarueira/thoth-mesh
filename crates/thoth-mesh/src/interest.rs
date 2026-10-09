@@ -73,6 +73,17 @@ impl Interest {
     pub fn snapshot(&self) -> Vec<TopicFilter> {
         self.counts.lock().unwrap().keys().cloned().collect()
     }
+
+    /// Whether `filter` still has at least one interested connection,
+    /// checked fresh rather than trusting an earlier
+    /// [`snapshot`](Self::snapshot) - for a caller (ADR-0057's
+    /// `--peer-topic-filter` reload reconciliation) re-announcing a
+    /// whole snapshot's worth of filters one at a time, where a
+    /// concurrent real-time transition for one of them can land in
+    /// the gap between taking the snapshot and getting to it.
+    pub fn is_interested(&self, filter: &TopicFilter) -> bool {
+        self.counts.lock().unwrap().contains_key(filter)
+    }
 }
 
 #[cfg(test)]
