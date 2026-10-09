@@ -40,7 +40,7 @@ use tokio_util::compat::{Compat, TokioAsyncReadCompatExt, TokioAsyncWriteCompatE
 use tracing::Instrument;
 
 use crate::metrics::Metrics;
-use crate::peer_links::PeerLinks;
+use crate::peer_links::{PeerLinkRegistration, PeerLinks};
 use crate::peer_topic_filter::PeerTopicFilter;
 use crate::rate_limit::RateLimiter;
 use crate::redelivery::{
@@ -197,6 +197,7 @@ async fn run_connection(socket: MaybeTlsStream, shared: Shared, initial_peer: Op
         peer_identity: None,
         peer_fingerprint,
         principal,
+        peer_link_registration: None,
         disconnect: Arc::clone(&disconnect),
     };
 
@@ -420,6 +421,14 @@ struct ConnectionContext {
     is_peer_flag: Arc<AtomicBool>,
     peer_fingerprint: Option<[u8; 32]>,
     principal: Principal,
+    /// Set once this connection becomes a peer link -
+    /// `register_peer_link` is only ever called once this is known.
+    /// Held only for the unregister its `Drop` runs (ADR-0058),
+    /// including if this whole task is ever aborted rather than
+    /// reaching `shut_down` normally, same reasoning as
+    /// `_registration` above, for `PeerLinks` instead of
+    /// `connections`.
+    peer_link_registration: Option<PeerLinkRegistration>,
     /// This connection's own signal to end itself, raced against the
     /// read loop via `select!` in `run_connection` - see ADR-0057.
     /// Every connection gets one, even a plain client that never
@@ -506,7 +515,7 @@ impl ConnectionContext {
         self.peer_identity = Some(peer_id);
         self.is_peer_flag.store(true, Ordering::Relaxed);
         self.membership.mark_connected(peer_id, listen_addr.clone());
-        register_peer_link(
+        self.peer_link_registration = Some(register_peer_link(
             &self.peer_links,
             &self.interest,
             &self.discover,
@@ -517,7 +526,7 @@ impl ConnectionContext {
             &self.outgoing_tx,
             self.peer_topic_filter.get().as_deref(),
             Arc::clone(&self.disconnect),
-        );
+        ));
         // Closes the gap between the check above and actually
         // registering: a reload's own disconnect_unless scan (ADR-0057)
         // can only ever see a link once it's in the registry, so one
@@ -932,7 +941,7 @@ impl ConnectionContext {
         if !self.send(reply).await {
             return false;
         }
-        register_peer_link(
+        self.peer_link_registration = Some(register_peer_link(
             &self.peer_links,
             &self.interest,
             &self.discover,
@@ -943,7 +952,7 @@ impl ConnectionContext {
             &self.outgoing_tx,
             self.peer_topic_filter.get().as_deref(),
             Arc::clone(&self.disconnect),
-        );
+        ));
         // See admit_initial_peer's identical recheck for why - closes
         // the gap between the check above and actually registering.
         if !allowlist_permits(self.allowed_peers.get().as_deref(), self.principal) {
@@ -1075,12 +1084,12 @@ impl ConnectionContext {
     /// Runs once the read loop ends: stops every forwarder this
     /// connection spawned, propagating the resulting interest loss the
     /// same way an explicit `Unsubscribe` would (ADR-0011); then, if
-    /// this connection turned out to be a peer link, unregisters it
-    /// from `peer_links` too and marks it disconnected. Unregistering
-    /// from `connections` (ADR-0057) isn't this method's job anymore,
-    /// since `_registration`'s own `Drop` handles that unconditionally,
-    /// including on this whole task being aborted rather than ever
-    /// reaching this method at all.
+    /// this connection turned out to be a peer link, marks it
+    /// disconnected. Unregistering from `peer_links` (ADR-0058) or
+    /// `connections` (ADR-0057) isn't this method's job at all
+    /// anymore - `peer_link_registration`/`_registration`'s own
+    /// `Drop` impls handle both unconditionally, including on this
+    /// whole task being aborted rather than ever reaching this method.
     fn shut_down(&mut self) {
         for (filter, subscription) in self.forwarders.lock().unwrap().drain() {
             tracing::debug!(%filter, "stopping forwarder");
@@ -1102,7 +1111,6 @@ impl ConnectionContext {
             }
         }
         if let Some(peer_id) = self.peer_identity {
-            self.peer_links.unregister(peer_id, &self.outgoing_tx);
             self.membership.mark_disconnected(peer_id);
         }
     }
@@ -1126,6 +1134,11 @@ impl ConnectionContext {
 /// a wildcard filter is never included once any `--peer-topic-filter`
 /// applies, the same conservative stance
 /// [`PeerLinks::broadcast_interest`] takes for every later transition.
+///
+/// Returns the [`PeerLinkRegistration`] guard `peer_links.register`
+/// produces - the caller must hold onto it for as long as this
+/// connection is meant to stay registered (ADR-0058); dropping it
+/// unregisters immediately.
 #[allow(clippy::too_many_arguments)]
 fn register_peer_link(
     peer_links: &PeerLinks,
@@ -1138,8 +1151,8 @@ fn register_peer_link(
     outgoing_tx: &mpsc::Sender<Arc<Envelope>>,
     peer_topic_filter: Option<&PeerTopicFilter>,
     disconnect: Arc<Notify>,
-) {
-    peer_links.register(peer_id, outgoing_tx.clone(), principal, disconnect);
+) -> PeerLinkRegistration {
+    let registration = peer_links.register(peer_id, outgoing_tx.clone(), principal, disconnect);
     for filter in interest.snapshot() {
         if let Some(peer_topic_filter) = peer_topic_filter {
             let permitted = filter
@@ -1195,6 +1208,8 @@ fn register_peer_link(
             tracing::warn!("outgoing queue full, dropping peer catch-up announce");
         }
     }
+
+    registration
 }
 
 /// Records every peer in `peers` this node didn't already know about,
@@ -1206,9 +1221,12 @@ fn register_peer_link(
 /// than `node_id`'s: both sides of a pair independently learning
 /// about each other at close to the same time would otherwise each
 /// dial the other, racing two concurrent connections for the same
-/// peer against `Membership`/`PeerLinks`' single-connection-per-peer
-/// assumption. Comparing `PeerId`s deterministically picks exactly one
-/// side to dial, with no coordination needed.
+/// peer against `Membership`'s own single-connection-per-peer
+/// assumption (`PeerLinks` itself tolerates an overlap fine as of
+/// ADR-0058; `Membership::mark_disconnected` flipping a peer straight
+/// to unreachable the moment either one ends does not - see that
+/// ADR's own Consequences). Comparing `PeerId`s deterministically
+/// picks exactly one side to dial, with no coordination needed.
 fn learn_peers(
     peer_links: &PeerLinks,
     discover: &PeerDirectory,
@@ -2449,7 +2467,7 @@ mod tests {
         let discover = PeerDirectory::new();
         let (discovered_tx, mut discovered_rx) = mpsc::unbounded_channel();
         let (link_tx, mut link_rx) = mpsc::channel(8);
-        peer_links.register(
+        let _registration = peer_links.register(
             PeerId::new(),
             link_tx,
             Principal::Anonymous,
@@ -2502,7 +2520,7 @@ mod tests {
         let discover = PeerDirectory::new();
         let (discovered_tx, _discovered_rx) = mpsc::unbounded_channel();
         let (link_tx, mut link_rx) = mpsc::channel(8);
-        peer_links.register(
+        let _registration = peer_links.register(
             PeerId::new(),
             link_tx,
             Principal::Anonymous,
@@ -2538,7 +2556,7 @@ mod tests {
         let new_peer = PeerId::new();
         let (outgoing_tx, mut outgoing_rx) = mpsc::channel(8);
 
-        register_peer_link(
+        let _registration = register_peer_link(
             &peer_links,
             &interest,
             &discover,
@@ -2590,7 +2608,7 @@ mod tests {
         let new_peer = PeerId::new();
         let (outgoing_tx, mut outgoing_rx) = mpsc::channel(8);
 
-        register_peer_link(
+        let _registration = register_peer_link(
             &peer_links,
             &interest,
             &discover,

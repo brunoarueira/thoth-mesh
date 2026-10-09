@@ -40,11 +40,43 @@ struct Link {
     disconnect: Arc<Notify>,
 }
 
-/// A thread-safe, cheaply-cloneable registry mapping a currently
-/// connected peer's ID to its [`Link`].
+/// A thread-safe, cheaply-cloneable registry mapping each currently
+/// connected peer's ID to every one of its live [`Link`]s - almost
+/// always exactly one, but briefly two when both sides of a pair dial
+/// each other at the same moment, and potentially more under repeated
+/// such races; nothing converges this back down to one on its own
+/// (see ADR-0058). Each entry is removed independently, by its own
+/// connection's own [`PeerLinkRegistration`] guard, once *that*
+/// connection ends - never because some other connection to the same
+/// identity registered.
 #[derive(Debug, Default, Clone)]
 pub struct PeerLinks {
-    links: Arc<Mutex<HashMap<PeerId, Link>>>,
+    links: Arc<Mutex<HashMap<PeerId, Vec<Link>>>>,
+}
+
+/// Unregisters this connection's own entry from [`PeerLinks`] on
+/// drop - guarantees [`PeerLinks::unregister`] runs even if the
+/// connection's whole task is aborted outright (ADR-0028's chaos
+/// tests, via `Node::accepted_connections`), which skips everything
+/// after the abort point, `connection.rs`'s own explicit teardown
+/// included, but still runs whatever's already constructed. Without
+/// this, an aborted connection's entry would never be removed, and -
+/// because `register` now appends rather than overwrites (ADR-0058) -
+/// would accumulate, one leaked entry per abort, rather than being
+/// silently discarded by the next reconnect's overwrite the way it
+/// used to be.
+#[must_use = "dropping this immediately unregisters the peer link - hold it for as long as the connection stays registered"]
+#[derive(Debug)]
+pub(crate) struct PeerLinkRegistration {
+    peer_links: PeerLinks,
+    peer_id: PeerId,
+    sender: mpsc::Sender<Arc<Envelope>>,
+}
+
+impl Drop for PeerLinkRegistration {
+    fn drop(&mut self) {
+        self.peer_links.unregister(self.peer_id, &self.sender);
+    }
 }
 
 impl PeerLinks {
@@ -54,36 +86,51 @@ impl PeerLinks {
     }
 
     /// Registers `peer_id`'s outgoing channel, authenticated identity,
-    /// and its connection's own disconnect signal (ADR-0057),
-    /// replacing any previous entry for the same ID (e.g. a
-    /// reconnect).
-    pub fn register(
+    /// and its connection's own disconnect signal (ADR-0057) as one
+    /// more live connection for that identity, alongside any other
+    /// already registered for it - never replacing one (ADR-0058).
+    /// Returns a [`PeerLinkRegistration`] guard the caller must hold
+    /// for as long as this connection stays registered; dropping it
+    /// unregisters immediately.
+    pub(crate) fn register(
         &self,
         peer_id: PeerId,
         sender: mpsc::Sender<Arc<Envelope>>,
         principal: Principal,
         disconnect: Arc<Notify>,
-    ) {
-        self.links.lock().unwrap().insert(
-            peer_id,
-            Link {
-                sender,
+    ) -> PeerLinkRegistration {
+        self.links
+            .lock()
+            .unwrap()
+            .entry(peer_id)
+            .or_default()
+            .push(Link {
+                sender: sender.clone(),
                 principal,
                 disconnect,
-            },
-        );
+            });
+        PeerLinkRegistration {
+            peer_links: self.clone(),
+            peer_id,
+            sender,
+        }
     }
 
-    /// Removes `peer_id`'s entry, but only if it still points at
-    /// `sender` - guards against a stale disconnect clobbering a
-    /// newer reconnect's entry for the same peer.
+    /// Removes the one entry among `peer_id`'s currently registered
+    /// connections that still points at `sender`, leaving any other
+    /// connection registered for the same identity untouched
+    /// (ADR-0058) - and drops `peer_id`'s own entry from the outer map
+    /// entirely once its last connection is gone, so a peer with
+    /// nothing live leaves no trace, same as before. A `sender` that
+    /// doesn't match anything currently registered (a stale call
+    /// racing an already-completed unregister) is a no-op.
     pub fn unregister(&self, peer_id: PeerId, sender: &mpsc::Sender<Arc<Envelope>>) {
         let mut links = self.links.lock().unwrap();
-        if links
-            .get(&peer_id)
-            .is_some_and(|link| link.sender.same_channel(sender))
-        {
-            links.remove(&peer_id);
+        if let Some(entries) = links.get_mut(&peer_id) {
+            entries.retain(|link| !link.sender.same_channel(sender));
+            if entries.is_empty() {
+                links.remove(&peer_id);
+            }
         }
     }
 
@@ -104,6 +151,7 @@ impl PeerLinks {
             .lock()
             .unwrap()
             .values()
+            .flatten()
             .map(|link| link.sender.clone())
             .collect();
         for sender in senders {
@@ -137,6 +185,7 @@ impl PeerLinks {
             .lock()
             .unwrap()
             .values()
+            .flatten()
             .filter(|link| {
                 topic
                     .as_ref()
@@ -168,6 +217,7 @@ impl PeerLinks {
             .lock()
             .unwrap()
             .values()
+            .flatten()
             .filter(|link| !still_allowed(link.principal))
             .map(|link| Arc::clone(&link.disconnect))
             .collect();
@@ -221,9 +271,13 @@ impl PeerLinks {
     /// Closing it completely would mean serializing every local
     /// transition's own propagate-interest send against this whole
     /// sweep, which isn't attempted here - tracked as a known,
-    /// deliberately deferred limitation in issue #197, the same
-    /// treatment the `PeerLinks` register-supersede race got in part
-    /// 1 of this ADR (issue #194).
+    /// deliberately deferred limitation in issue #197. Unlike the
+    /// register-supersede race from part 1 of this ADR, which got the
+    /// same "deliberately deferred" treatment at first but was fully
+    /// fixed afterward (ADR-0058, issue #194) - #197 doesn't have an
+    /// equally clean fix available, since there's no `PeerId`-style
+    /// comparison here to converge on, just two concurrent senders
+    /// racing the same link.
     pub fn reconcile_interest(
         &self,
         interest: &Interest,
@@ -236,6 +290,7 @@ impl PeerLinks {
             .lock()
             .unwrap()
             .values()
+            .flatten()
             .map(|link| (link.principal, link.sender.clone()))
             .collect();
         for (principal, sender) in links {
@@ -300,13 +355,13 @@ mod tests {
         let links = PeerLinks::new();
         let (tx_a, mut rx_a) = mpsc::channel(4);
         let (tx_b, mut rx_b) = mpsc::channel(4);
-        links.register(
+        let _registration_a = links.register(
             PeerId::new(),
             tx_a,
             Principal::Anonymous,
             Arc::new(Notify::new()),
         );
-        links.register(
+        let _registration_b = links.register(
             PeerId::new(),
             tx_b,
             Principal::Anonymous,
@@ -326,23 +381,23 @@ mod tests {
         let peer_id = PeerId::new();
         let (tx_old, _rx_old) = mpsc::channel(4);
         let (tx_new, mut rx_new) = mpsc::channel(4);
-        links.register(
+        let _registration_old = links.register(
             peer_id,
             tx_old.clone(),
             Principal::Anonymous,
             Arc::new(Notify::new()),
         );
-        // Simulate a reconnect racing with the old connection's
-        // teardown: the new link replaces the old one in the
-        // registry...
-        links.register(
+        // Two connections for the same peer now coexist (ADR-0058) -
+        // the new one doesn't replace the old one in the registry...
+        let _registration_new = links.register(
             peer_id,
             tx_new,
             Principal::Anonymous,
             Arc::new(Notify::new()),
         );
         // ...so the old connection's own teardown, unregistering with
-        // its own (now-stale) sender, must not remove the new entry.
+        // its own sender, must remove only its own entry, leaving the
+        // new one untouched.
         links.unregister(peer_id, &tx_old);
 
         let sent = envelope();
@@ -355,7 +410,7 @@ mod tests {
         let links = PeerLinks::new();
         let peer_id = PeerId::new();
         let (tx, mut rx) = mpsc::channel(4);
-        links.register(
+        let _registration = links.register(
             peer_id,
             tx.clone(),
             Principal::Anonymous,
@@ -372,7 +427,7 @@ mod tests {
         let links = PeerLinks::new();
         let (tx, rx) = mpsc::channel(1);
         drop(rx);
-        links.register(
+        let _registration = links.register(
             PeerId::new(),
             tx,
             Principal::Anonymous,
@@ -386,7 +441,7 @@ mod tests {
     async fn broadcast_interest_with_no_filter_configured_reaches_everyone() {
         let links = PeerLinks::new();
         let (tx, mut rx) = mpsc::channel(4);
-        links.register(
+        let _registration = links.register(
             PeerId::new(),
             tx,
             Principal::Fingerprint([1; 32]),
@@ -404,7 +459,7 @@ mod tests {
     async fn broadcast_interest_skips_a_link_the_filter_does_not_permit() {
         let links = PeerLinks::new();
         let (tx, mut rx) = mpsc::channel(4);
-        links.register(
+        let _registration = links.register(
             PeerId::new(),
             tx,
             Principal::Fingerprint([1; 32]),
@@ -435,7 +490,7 @@ mod tests {
         let links = PeerLinks::new();
         let (tx, mut rx) = mpsc::channel(4);
         let fingerprint = [1; 32];
-        links.register(
+        let _registration = links.register(
             PeerId::new(),
             tx,
             Principal::Fingerprint(fingerprint),
@@ -464,13 +519,13 @@ mod tests {
         let (tx_b, mut rx_b) = mpsc::channel(4);
         let fp_a = [1; 32];
         let fp_b = [2; 32];
-        links.register(
+        let _registration_a = links.register(
             PeerId::new(),
             tx_a,
             Principal::Fingerprint(fp_a),
             Arc::new(Notify::new()),
         );
-        links.register(
+        let _registration_b = links.register(
             PeerId::new(),
             tx_b,
             Principal::Fingerprint(fp_b),
@@ -497,13 +552,13 @@ mod tests {
         let fp_b = [2; 32];
         let disconnect_a = Arc::new(Notify::new());
         let disconnect_b = Arc::new(Notify::new());
-        links.register(
+        let _registration_a = links.register(
             PeerId::new(),
             tx_a,
             Principal::Fingerprint(fp_a),
             Arc::clone(&disconnect_a),
         );
-        links.register(
+        let _registration_b = links.register(
             PeerId::new(),
             tx_b,
             Principal::Fingerprint(fp_b),
@@ -535,7 +590,7 @@ mod tests {
         let links = PeerLinks::new();
         let (tx, _rx) = mpsc::channel(4);
         let disconnect = Arc::new(Notify::new());
-        links.register(
+        let _registration = links.register(
             PeerId::new(),
             tx,
             Principal::Fingerprint([1; 32]),
@@ -554,11 +609,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn two_connections_for_the_same_peer_coexist_until_each_unregisters() {
+        let links = PeerLinks::new();
+        let peer_id = PeerId::new();
+        let (tx_a, mut rx_a) = mpsc::channel(4);
+        let (tx_b, mut rx_b) = mpsc::channel(4);
+        let _registration_a = links.register(
+            peer_id,
+            tx_a.clone(),
+            Principal::Anonymous,
+            Arc::new(Notify::new()),
+        );
+        let _registration_b =
+            links.register(peer_id, tx_b, Principal::Anonymous, Arc::new(Notify::new()));
+
+        let first = envelope();
+        links.broadcast(first.clone());
+        assert_eq!(rx_a.try_recv().unwrap().id, first.id);
+        assert_eq!(rx_b.try_recv().unwrap().id, first.id);
+
+        // Ending one doesn't affect the other (ADR-0058) - unlike the
+        // old overwrite-based registry, where a second register() for
+        // the same peer_id made this moot by construction.
+        links.unregister(peer_id, &tx_a);
+        let second = envelope();
+        links.broadcast(second.clone());
+        assert!(rx_a.try_recv().is_err());
+        assert_eq!(rx_b.try_recv().unwrap().id, second.id);
+    }
+
+    #[tokio::test]
+    async fn disconnect_unless_reaches_every_connection_for_the_same_peer() {
+        // The exact scenario issue #194 was filed against: two
+        // connections registered for the same peer_id (e.g. both
+        // sides of a pair dialing each other at the same moment) -
+        // disconnect_unless must still reach *both*, not just
+        // whichever happened to register most recently.
+        let links = PeerLinks::new();
+        let peer_id = PeerId::new();
+        let (tx_a, _rx_a) = mpsc::channel(4);
+        let (tx_b, _rx_b) = mpsc::channel(4);
+        let fp = [1; 32];
+        let disconnect_a = Arc::new(Notify::new());
+        let disconnect_b = Arc::new(Notify::new());
+        let _registration_a = links.register(
+            peer_id,
+            tx_a,
+            Principal::Fingerprint(fp),
+            Arc::clone(&disconnect_a),
+        );
+        let _registration_b = links.register(
+            peer_id,
+            tx_b,
+            Principal::Fingerprint(fp),
+            Arc::clone(&disconnect_b),
+        );
+
+        links.disconnect_unless(|_principal| false);
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            disconnect_a.notified(),
+        )
+        .await
+        .expect("the first connection's disconnect signal should have fired");
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            disconnect_b.notified(),
+        )
+        .await
+        .expect("the second connection's disconnect signal should have fired");
+    }
+
+    #[tokio::test]
+    async fn dropping_the_registration_guard_unregisters_without_an_explicit_call() {
+        // The memory-consumption concern ADR-0058 raises: register()
+        // now appends rather than overwrites, so cleanup has to
+        // actually happen - via this guard's own Drop, not just an
+        // explicit unregister() call - or a leaked entry would
+        // accumulate forever instead of being silently discarded by
+        // the next reconnect's overwrite the way it used to be.
+        let links = PeerLinks::new();
+        let peer_id = PeerId::new();
+        let (tx, mut rx) = mpsc::channel(4);
+        let registration =
+            links.register(peer_id, tx, Principal::Anonymous, Arc::new(Notify::new()));
+
+        drop(registration);
+
+        links.broadcast(envelope());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
     async fn reconcile_interest_sends_a_permitted_literal_filter_as_subscribe() {
         let links = PeerLinks::new();
         let (tx, mut rx) = mpsc::channel(4);
         let fp = [1; 32];
-        links.register(
+        let _registration = links.register(
             PeerId::new(),
             tx,
             Principal::Fingerprint(fp),
@@ -587,7 +735,7 @@ mod tests {
     async fn reconcile_interest_sends_a_rejected_literal_filter_as_unsubscribe() {
         let links = PeerLinks::new();
         let (tx, mut rx) = mpsc::channel(4);
-        links.register(
+        let _registration = links.register(
             PeerId::new(),
             tx,
             Principal::Fingerprint([1; 32]),
@@ -613,7 +761,7 @@ mod tests {
     async fn reconcile_interest_skips_a_wildcard_filter_under_a_configured_peer_topic_filter() {
         let links = PeerLinks::new();
         let (tx, mut rx) = mpsc::channel(4);
-        links.register(
+        let _registration = links.register(
             PeerId::new(),
             tx,
             Principal::Fingerprint([1; 32]),
@@ -637,7 +785,7 @@ mod tests {
     async fn reconcile_interest_still_sends_a_wildcard_filter_with_no_filter_configured() {
         let links = PeerLinks::new();
         let (tx, mut rx) = mpsc::channel(4);
-        links.register(
+        let _registration = links.register(
             PeerId::new(),
             tx,
             Principal::Anonymous,
