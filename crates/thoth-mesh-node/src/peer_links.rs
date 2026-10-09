@@ -49,6 +49,15 @@ struct Link {
 /// connection's own [`PeerLinkRegistration`] guard, once *that*
 /// connection ends - never because some other connection to the same
 /// identity registered.
+///
+/// [`broadcast_interest`](PeerLinks::broadcast_interest)/
+/// [`reconcile_interest`](PeerLinks::reconcile_interest) iterate
+/// every link here, not one per identity - a peer with two
+/// connections gets the same interest announcement twice, which can
+/// in turn mean the same published message gets forwarded to it
+/// twice too, bounded in practice but not eliminated by the
+/// receiving side's own cross-peer dedup (ADR-0011). See ADR-0058's
+/// Consequences and issue #200.
 #[derive(Debug, Default, Clone)]
 pub struct PeerLinks {
     links: Arc<Mutex<HashMap<PeerId, Vec<Link>>>>,
@@ -124,10 +133,31 @@ impl PeerLinks {
     /// nothing live leaves no trace, same as before. A `sender` that
     /// doesn't match anything currently registered (a stale call
     /// racing an already-completed unregister) is a no-op.
+    ///
+    /// Removes at most *one* matching entry, deliberately - not every
+    /// one `retain` would strip. A repeated `Hello` on one already-
+    /// registered connection (`handle_hello` has no guard against
+    /// this) calls `register` again with that same connection's own
+    /// `outgoing_tx`, pushing a second entry that shares its channel
+    /// with the first; the fresh `PeerLinkRegistration` then replaces
+    /// `ConnectionContext`'s field, dropping the old one and calling
+    /// this. Both entries' senders are clones of the same channel, so
+    /// `same_channel` can't tell them apart - removing every match
+    /// would wipe out the connection's *new* entry too, the moment it
+    /// registers a second time, long before the connection itself
+    /// ever ends. Two genuinely distinct connections to the same peer
+    /// never share a channel, so removing only one match is exactly
+    /// equivalent for that case - and correctly leaves one behind for
+    /// the repeated-registration case instead.
     pub fn unregister(&self, peer_id: PeerId, sender: &mpsc::Sender<Arc<Envelope>>) {
         let mut links = self.links.lock().unwrap();
         if let Some(entries) = links.get_mut(&peer_id) {
-            entries.retain(|link| !link.sender.same_channel(sender));
+            if let Some(index) = entries
+                .iter()
+                .position(|link| link.sender.same_channel(sender))
+            {
+                entries.remove(index);
+            }
             if entries.is_empty() {
                 links.remove(&peer_id);
             }
@@ -403,6 +433,35 @@ mod tests {
         let sent = envelope();
         links.broadcast(sent.clone());
         assert_eq!(rx_new.try_recv().unwrap().id, sent.id);
+    }
+
+    #[tokio::test]
+    async fn dropping_a_registration_guard_only_removes_its_own_entry_even_with_a_shared_channel() {
+        // Simulates a repeated Hello on an already-registered
+        // connection (handle_hello has no guard against this):
+        // register() runs again with that same connection's own
+        // outgoing_tx, so the two entries share a channel - dropping
+        // one guard (what happens when ConnectionContext's own field
+        // gets overwritten by the second call) must still remove
+        // only its own entry, not every entry sharing that channel,
+        // or the connection's live entry would vanish the moment it
+        // registers a second time.
+        let links = PeerLinks::new();
+        let peer_id = PeerId::new();
+        let (tx, mut rx) = mpsc::channel(4);
+        let first = links.register(
+            peer_id,
+            tx.clone(),
+            Principal::Anonymous,
+            Arc::new(Notify::new()),
+        );
+        let _second = links.register(peer_id, tx, Principal::Anonymous, Arc::new(Notify::new()));
+
+        drop(first);
+
+        let sent = envelope();
+        links.broadcast(sent.clone());
+        assert_eq!(rx.try_recv().unwrap().id, sent.id);
     }
 
     #[tokio::test]

@@ -147,17 +147,34 @@ to fix #194.
   the guard's job now, on every path, not just the ones that reach
   that explicit call.
 - A peer with two simultaneous connections gets interest-propagation
-  and gossip messages twice, once per connection - already tolerated,
-  not new: both are idempotent from the receiving side (ADR-0011,
+  and gossip messages twice, once per connection - tolerated, not
+  new: both are idempotent from the receiving side (ADR-0011,
   ADR-0057), and `PeerDirectory::record`'s own idempotency gate
   already denies crediting a redundant connection as a reason to
   gossip-dial again.
-- Actual message delivery doesn't duplicate: a forwarder is set up
-  per explicit `Subscribe` request on the specific connection it
-  arrived on, not per registered identity - two connections to the
-  same peer only ever deliver a topic twice if that peer itself
-  explicitly subscribed on both, which is its own choice to make, not
-  this node's.
+- Actual message delivery *can* duplicate, corrected from an earlier
+  draft of this section that claimed it couldn't: a peer's own
+  interest propagation (above) reaching this node twice means its
+  `handle_subscribe` runs twice too, independently, on two different
+  connections - two independent forwarders for the same topic result,
+  each relaying the same published envelope (same `MessageId`, never
+  reconstructed per hop) over a different connection to the same
+  peer. The receiving side's own cross-peer dedup (`Broker::seen`,
+  ADR-0011, a global, bounded `MessageId` cache) catches the second
+  copy *if* it's still within that cache's window by the time it
+  arrives - true in the common case, since both copies originate from
+  the same local broadcast at nearly the same instant, but not
+  guaranteed: if one of the two connections' own outgoing queue
+  (64 deep, `OUTGOING_CHANNEL_CAPACITY`) is more backed up than the
+  other, its copy can arrive late enough that enough *other* messages
+  (more than the dedup cache's own capacity, shared across every
+  topic) have already evicted that `MessageId` by the time it does -
+  a genuine, if narrow and throughput-dependent, late-redelivery risk.
+  Deduplicating interest propagation itself (one announcement per
+  identity, not per connection) would close this at the root, but
+  needs real design work of its own - which connection speaks for the
+  identity, and what happens when that one drops - not attempted here.
+  Filed as issue #200.
 - `Membership` itself still assumes one connection per peer -
   `mark_disconnected(peer_id)` flips a peer straight to unreachable
   the moment *any* one of its connections ends, even if another is
