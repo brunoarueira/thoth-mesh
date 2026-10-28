@@ -34,7 +34,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Cache cargo registry and build artifacts
-        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # main, post-v2.9.2 (untagged upstream commit, see PR #67)
+        uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # main, post-v2.9.2 (untagged upstream commit, see PR #67)
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -73,7 +73,7 @@ jobs:
           toolchain: "1.88"
 
       - name: Cache cargo registry and build artifacts
-        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # main, post-v2.9.2 (untagged upstream commit, see PR #67)
+        uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # main, post-v2.9.2 (untagged upstream commit, see PR #67)
 
       - name: Build (all features)
         run: cargo build --workspace --all-targets --all-features --locked
