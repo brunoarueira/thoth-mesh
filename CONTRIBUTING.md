@@ -8,11 +8,11 @@ This document is where those conventions are written down.
 ## Where the work comes from
 
 Work is planned in [`docs/ROADMAP.md`](docs/ROADMAP.md): the project is
-broken into phases, each tracked as a GitHub Milestone with a
-`[Tracking]` issue describing its goal and known shape. Concrete,
+broken into phases, each tracked as a GitHub Milestone. Concrete,
 ready-to-implement work is its own issue, either filed under a phase's
 milestone or - for work that doesn't depend on any particular phase -
-left unmilestoned.
+left unmilestoned. No separate `[Tracking]` issue per phase - the
+milestone's own progress view already shows that.
 
 One issue becomes one branch becomes one PR. Work doesn't start on the
 next issue until the current one is merged.
