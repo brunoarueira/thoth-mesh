@@ -5,10 +5,13 @@ just a single node that brokers messages, but a set of nodes that find
 each other and route messages between them. This document lays out the
 phases between where the project stands today and that goal.
 
-Each phase groups related work under a GitHub Milestone. Concrete,
-ready-to-implement items become issues right away; later phases start
-as a single tracking issue and get broken down (with an ADR where a
-real design decision is needed) once the phase before it lands.
+Each phase groups related work under a GitHub Milestone, created
+alongside its concrete, ready-to-implement issues (an ADR first,
+where a real design decision is needed) once the phase before it
+lands. No separate `[Tracking]` issue - the milestone's own progress
+view (grouping those issues) already does that job, so a placeholder
+issue that exists only to be closed again once the breakdown happens
+is pure overhead.
 
 ## Phase 0 — Foundations (done)
 
