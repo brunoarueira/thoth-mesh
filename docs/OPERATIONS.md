@@ -1321,6 +1321,23 @@ RUST_LOG=thoth_mesh_node=debug,thoth_mesh=trace cargo run -p thoth-mesh-node --
 The CLI (`thoth-mesh`) doesn't currently expose a log-level flag —
 its output is just what it prints for the command you ran.
 
+### Tracing a message across peer hops
+
+Every `Publish` carries a `trace_id` (see
+[ADR-0059](adr/0059-trace-id-propagated-across-peer-hops.md)),
+unchanged as it's forwarded hop to hop, logged (at `debug`) alongside
+each node's own `publish`/rejection log lines. Debugging a
+routing/federation issue that only shows up in a real multi-node
+topology - "did this message actually reach node C, and if not,
+where did it stop?" - means running every node at
+`--log-level debug` (or `RUST_LOG=thoth_mesh_node=debug`) and grepping
+each node's own log for the same `trace_id` value: it shows up once
+per node the message actually reached, in arrival order, including a
+node that rejected it (ACL, rate limit) rather than forwarding it on.
+There's no dedicated query surface for this yet - across-node
+correlation today means collecting each node's own logs and grepping
+them yourself.
+
 ## Benchmarking
 
 `bench_mesh` (see [ADR-0030](adr/0030-mesh-benchmark-suite.md)) measures

@@ -835,6 +835,7 @@ impl ConnectionContext {
         };
         tracing::debug!(
             sender = ?envelope.sender,
+            trace_id = ?envelope.trace_id,
             %topic,
             len = payload.len(),
             retain,
@@ -851,7 +852,7 @@ impl ConnectionContext {
             &topic,
             Action::Publish,
         ) {
-            tracing::warn!(sender = ?envelope.sender, %topic, is_peer, "rejected: not on the configured topic ACL");
+            tracing::warn!(sender = ?envelope.sender, trace_id = ?envelope.trace_id, %topic, is_peer, "rejected: not on the configured topic ACL");
             if is_peer {
                 self.metrics.record_peer_topic_acl_rejection();
             } else {
@@ -877,7 +878,7 @@ impl ConnectionContext {
             // unbounded warn-level log volume for as long as it keeps
             // publishing. The counter below still records every
             // rejection regardless of log level.
-            tracing::debug!(sender = ?envelope.sender, %topic, "rejected: publish rate limit exceeded");
+            tracing::debug!(sender = ?envelope.sender, trace_id = ?envelope.trace_id, %topic, "rejected: publish rate limit exceeded");
             self.metrics.record_publish_rate_limit_rejection();
             let error = Envelope::new(
                 self.node_id,

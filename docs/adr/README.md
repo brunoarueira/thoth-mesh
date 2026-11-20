@@ -65,6 +65,7 @@ thoth-mesh, using the format described in
 | [0057](0057-reload-revocation-of-already-granted-access.md) | Reload revocation of already-granted access |
 | [0058](0058-peer-links-tracks-every-live-connection-per-identity.md) | `PeerLinks` tracks every live connection per identity, not just one |
 | [0059](0059-trace-id-propagated-across-peer-hops.md) | A `trace_id` propagated unchanged across peer hops |
+| [0060](0060-log-trace-id-at-each-hop-defer-opentelemetry.md) | Log `trace_id` at each hop; defer OpenTelemetry |
 
 To add a new one, copy the format of an existing ADR, number it
 sequentially, and set its status to `Accepted` once the decision is
