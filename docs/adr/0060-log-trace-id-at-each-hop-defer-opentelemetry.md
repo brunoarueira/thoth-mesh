@@ -92,6 +92,20 @@ node processes* still means collecting their logs yourself first
 more than one node) - unchanged by this ADR, and not a regression it
 introduces.
 
+The grep procedure only works end to end across a mesh where every
+hop is running a build that knows about ADR-0059 - an older node in
+the path forwards without the field at all (it has none), so the
+message's `trace_id` restarts at the next upgraded hop rather than
+surviving the older segment, splitting one journey into two unrelated
+IDs. A single node can also log the same `trace_id` more than once:
+the unconditional `publish` record is written before `Broker::publish`
+runs its own de-duplication (ADR-0011), so a rejected `Publish` logs
+twice at that node (the record, then the rejection), and a peer
+reachable over more than one overlapping connection (ADR-0058) can
+independently log the same `trace_id` once per connection. Neither is
+a defect this ADR introduces, but both are worth knowing before
+treating a count of matching log lines as a hop count.
+
 This deliberately leaves the roadmap's "likely mechanism" (the
 OpenTelemetry bridge) and its own "dedicated query/export surface"
 both undone. Picking either up later is a new ADR's decision to make,
