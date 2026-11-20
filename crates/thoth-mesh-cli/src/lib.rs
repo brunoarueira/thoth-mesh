@@ -58,12 +58,13 @@ pub struct Cli {
     /// still the `anonymous` principal for any `--topic-acl` on the
     /// node it's talking to (see ADR-0018), which may or may not be
     /// enough depending on how that node's configured. Requires
-    /// --tls-key.
-    #[arg(long, global = true, requires = "tls_key")]
+    /// --tls-key too (from either this flag or the config file - see
+    /// ConnectionOptions::merge, ADR-0034).
+    #[arg(long, global = true)]
     pub tls_cert: Option<PathBuf>,
 
     /// This client's own TLS private key (PEM). See --tls-cert.
-    #[arg(long, global = true, requires = "tls_cert")]
+    #[arg(long, global = true)]
     pub tls_key: Option<PathBuf>,
 
     #[command(subcommand)]
@@ -821,11 +822,14 @@ struct ConnectionOptions {
 }
 
 impl ConnectionOptions {
-    /// Merges `cli`'s flags over `config`'s fields. clap's `requires`
-    /// already enforces `--tls-cert`/`--tls-key` are both-or-neither
-    /// for a pure-CLI invocation, but can't see across a CLI flag
-    /// paired with the other half from the config file - so that same
-    /// constraint is re-checked here, on the merged, effective values.
+    /// Merges `cli`'s flags over `config`'s fields. `--tls-cert`/
+    /// `--tls-key` must be both-or-neither - checked here, on the
+    /// merged, effective values, rather than via clap's own `requires`
+    /// attribute: that only ever looks at what was actually typed on
+    /// the command line, so it can't see a flag from one source paired
+    /// with the other half from the config file (issue #182) - this is
+    /// the sole place that constraint is enforced, covering a pure-CLI
+    /// invocation and a split-source one uniformly.
     fn merge(cli: &Cli, config: config::Config) -> std::io::Result<Self> {
         let tls_cert = cli.tls_cert.clone().or(config.tls_cert);
         let tls_key = cli.tls_key.clone().or(config.tls_key);
@@ -1749,6 +1753,28 @@ mod tests {
         cli.tls_cert = Some(PathBuf::from("client.pem"));
         let err = ConnectionOptions::merge(&cli, config::Config::default()).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    /// The actual layer issue #182's bug lived in: `Cli::parse` itself,
+    /// not `merge`. Every test above constructs `Cli` directly, which
+    /// can't see a clap-level `requires` rejecting the invocation
+    /// before `merge` ever runs - this is the one that would have
+    /// caught it. `--tls-cert` alone (no `--tls-key` flag at all) must
+    /// parse cleanly now; whether it's actually a *valid* combination
+    /// once the config file's own `tls_key` is merged in is `merge`'s
+    /// job, covered above.
+    #[test]
+    fn cli_parsing_no_longer_rejects_a_tls_flag_whose_pair_might_come_from_the_file() {
+        let cli = Cli::try_parse_from([
+            "thoth-mesh",
+            "--tls-cert",
+            "client.pem",
+            "publish",
+            "weather.updates",
+            "sunny",
+        ])
+        .unwrap();
+        assert_eq!(cli.tls_cert, Some(PathBuf::from("client.pem")));
     }
 
     #[test]
