@@ -49,6 +49,46 @@ impl Default for MessageId {
     }
 }
 
+/// Identifies a message's *journey* across peer hops, distinct from
+/// [`MessageId`] (which identifies the message itself, and is what
+/// loop-prevention/de-duplication keys on - see ADR-0011). Carried on
+/// every [`Envelope`](crate::Envelope), set once by
+/// [`Envelope::new`](crate::Envelope::new) and never touched again as
+/// the envelope is forwarded hop to hop, the same way `id` already
+/// isn't. See ADR-0059.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TraceId(Uuid);
+
+impl TraceId {
+    /// Generates a new trace ID, timestamped at the current time.
+    pub fn new() -> Self {
+        Self(Uuid::now_v7())
+    }
+
+    /// The ID's raw 16 bytes - see [`MessageId::as_bytes`].
+    pub fn as_bytes(&self) -> [u8; 16] {
+        *self.0.as_bytes()
+    }
+
+    /// Reconstructs a `TraceId` from bytes previously returned by
+    /// [`as_bytes`](Self::as_bytes).
+    pub fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(Uuid::from_bytes(bytes))
+    }
+}
+
+/// An older sender's envelope omitting `trace_id` entirely (see
+/// [`Envelope`](crate::Envelope)'s own `#[serde(default)]`) decodes as
+/// a freshly minted one, not an error or an empty sentinel - there's
+/// no "no trace" value that means anything here, so decoding just
+/// means tracing starts at the first hop that understands the field.
+impl Default for TraceId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// One peer a [`MessageKind::PeerAnnounce`] advertises: a `PeerId`
 /// and the address other peers can dial it back at. Only peers with a
 /// known listen address are worth advertising - see ADR-0015.
@@ -303,6 +343,19 @@ mod tests {
         let b = MessageId::new();
         assert!(a <= b);
         assert!(a.as_bytes() <= b.as_bytes());
+    }
+
+    #[test]
+    fn new_trace_ids_are_distinct() {
+        let a = TraceId::new();
+        let b = TraceId::new();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn trace_id_as_bytes_then_from_bytes_round_trips() {
+        let id = TraceId::new();
+        assert_eq!(TraceId::from_bytes(id.as_bytes()), id);
     }
 
     #[test]

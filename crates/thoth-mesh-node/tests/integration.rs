@@ -1327,6 +1327,70 @@ async fn multi_hop_interest_propagates_across_a_chain_of_peers() {
 }
 
 #[tokio::test]
+async fn trace_id_survives_two_hops_unchanged() {
+    // Same A - B - C chain as above: proves ADR-0059's whole point -
+    // a `trace_id` set at the publishing hop is still readable,
+    // unchanged, two hops later. Unlike `id` (also unchanged, but
+    // that's ADR-0011's job to prove), nothing in `connection.rs`
+    // ever touches `trace_id` - this is the one new field riding
+    // along on the existing forwarding path for free.
+    let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_a = listener_a.local_addr().unwrap();
+    let node_a = thoth_mesh_node::spawn(listener_a, Vec::new());
+
+    let listener_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_b = listener_b.local_addr().unwrap();
+    let node_b = thoth_mesh_node::spawn(listener_b, vec![addr_a.to_string()]);
+
+    let listener_c = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_c = listener_c.local_addr().unwrap();
+    let node_c = thoth_mesh_node::spawn(listener_c, vec![addr_b.to_string()]);
+
+    eventually(|| node_a.membership.is_reachable(node_b.id)).await;
+    eventually(|| node_b.membership.is_reachable(node_c.id)).await;
+
+    let mut subscriber = connect(addr_c).await;
+    let sub = Envelope::new(
+        PeerId::new(),
+        MessageKind::Subscribe {
+            filter: topic("weather.updates").into(),
+            ack: false,
+            group: None,
+            durable: false,
+        },
+    );
+    send(&mut subscriber, &sub).await;
+    recv(&mut subscriber).await; // subscribe ack
+
+    // Settle interest propagation first (same reasoning as the test
+    // above), then drain any straggler before the real assertion.
+    publish_until_delivered(addr_a, &mut subscriber, topic("weather.updates"), b"settle").await;
+    while timeout(
+        Duration::from_millis(50),
+        async_framing::read_frame(&mut subscriber),
+    )
+    .await
+    .is_ok()
+    {}
+
+    let publish = Envelope::new(
+        PeerId::new(),
+        MessageKind::Publish {
+            topic: topic("weather.updates"),
+            payload: b"traced".to_vec(),
+            retain: false,
+            content_type: None,
+            reply_to: None,
+            in_reply_to: None,
+        },
+    );
+    send(&mut connect(addr_a).await, &publish).await;
+
+    let delivered = recv(&mut subscriber).await;
+    assert_eq!(delivered.trace_id, publish.trace_id);
+}
+
+#[tokio::test]
 async fn loop_prevention_stops_a_publish_from_bouncing_forever() {
     // Two nodes with a single peer link between them already forms a
     // cycle: once both ends are interested, A forwards its publish to
