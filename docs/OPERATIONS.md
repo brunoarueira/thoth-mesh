@@ -1340,12 +1340,14 @@ each node's own log for the same `trace_id` value: it shows up at
 least once per node the message actually reached, in arrival order,
 including a node that rejected it (ACL, rate limit) rather than
 forwarding it on - and can show up more than once at a single node,
-since the unconditional `publish` record logs before the broker's own
-de-duplication runs (ADR-0011), so a rejected message logs twice there
-(the record, then the rejection), and a peer reachable over more than
-one overlapping connection (ADR-0058) can independently log the same
-`trace_id` once per connection it arrives on. Repeated results at one
-node aren't extra hops. There's no dedicated query surface for this
+since the unconditional `publish` record logs before the ACL/rate-limit
+checks run, so a rejected message logs twice there (the record, then
+the rejection) - unrelated to `Broker::publish`'s own de-duplication
+(ADR-0011), which drops a genuine duplicate silently, no log of its
+own. A peer reachable over more than one overlapping connection
+(ADR-0058) can also independently log the same `trace_id` once per
+connection it arrives on. Repeated results at one node aren't extra
+hops. There's no dedicated query surface for this
 yet - across-node correlation today means collecting each node's own
 logs and grepping them yourself.
 
