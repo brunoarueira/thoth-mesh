@@ -147,11 +147,15 @@ debugging/observability (see [ADR-0059](docs/adr/0059-trace-id-propagated-across
 Every envelope gets a freshly generated `trace_id`, independent of
 whatever caused it (a reply gets its own, unrelated to the request
 it's replying to — that correlation is `in_reply_to`'s job, not
-this field's). A forwarded/re-published envelope crossing the mesh
-keeps the original `trace_id` it was created with, the same way it
-keeps its `id` — so a `trace_id` observed at one hop and a `trace_id`
-observed at another, further hop, are the same value if and only if
-they're the same message's journey. An envelope received without
+this field's). A forwarded envelope crossing the mesh keeps the
+original `trace_id` it was created with, the same way it keeps its
+`id` — so a `trace_id` observed at one hop and a `trace_id` observed
+at another, further hop, are the same value if and only if they're
+the same message's journey. A dead-letter republish
+([ADR-0047](docs/adr/0047-message-ttl-and-dead-lettering.md))
+is a new message, not a forward, and mints its own fresh `trace_id`
+(and `id`) the same way `Envelope::new` always does. An envelope
+received without
 this field at all (from a build older than ADR-0059) decodes with a
 freshly minted `trace_id` rather than failing — there was never a
 "no trace" value for this field to default to, so decoding one just

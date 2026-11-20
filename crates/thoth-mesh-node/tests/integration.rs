@@ -1363,15 +1363,8 @@ async fn trace_id_survives_two_hops_unchanged() {
     recv(&mut subscriber).await; // subscribe ack
 
     // Settle interest propagation first (same reasoning as the test
-    // above), then drain any straggler before the real assertion.
+    // above).
     publish_until_delivered(addr_a, &mut subscriber, topic("weather.updates"), b"settle").await;
-    while timeout(
-        Duration::from_millis(50),
-        async_framing::read_frame(&mut subscriber),
-    )
-    .await
-    .is_ok()
-    {}
 
     let publish = Envelope::new(
         PeerId::new(),
@@ -1386,7 +1379,18 @@ async fn trace_id_survives_two_hops_unchanged() {
     );
     send(&mut connect(addr_a).await, &publish).await;
 
-    let delivered = recv(&mut subscriber).await;
+    // A retry from the settle step above can also land late - keep
+    // reading past any such straggler (identified by `id`, same as
+    // `publish_until_delivered`'s own filtering) rather than assuming
+    // the very next frame is the one this test cares about. Each
+    // `recv` still carries its own generous timeout, so this can't
+    // spin forever if the real delivery never arrives.
+    let delivered = loop {
+        let candidate = recv(&mut subscriber).await;
+        if candidate.id == publish.id {
+            break candidate;
+        }
+    };
     assert_eq!(delivered.trace_id, publish.trace_id);
 }
 

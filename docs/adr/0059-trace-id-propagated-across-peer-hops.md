@@ -24,8 +24,10 @@ fit for purpose:
 - **`MessageId` (`envelope.id`)** does stay unchanged hop to hop for a
   forwarded `Publish` - every hop's `Broker::publish` round-trips it
   verbatim, and that stability is exactly what loop-prevention/dedup
-  (ADR-0011) keys on. But it identifies the *message's content*, not
-  its journey - overloading it as the tracing key as well would
+  (ADR-0011) keys on. But it identifies *this one message instance*,
+  not its journey - two publishes with byte-identical payloads still
+  get two different, unrelated `MessageId`s - and overloading it as
+  the tracing key as well would
   couple a debugging concern to a correctness mechanism for no
   reason, and doesn't generalize to anything that mints a *new*
   `MessageId` per hop by design (the interest-propagation `Subscribe`/
@@ -33,16 +35,21 @@ fit for purpose:
   envelope, and fresh `id`, at every hop).
 - **`sender` (`envelope.sender`)** looks, at first glance, like it
   might at least tell you who originally published a message. It
-  doesn't: `ConnectionContext::authenticated_sender` (ADR-0039) runs
-  unconditionally on *every* decoded frame on *every* connection, and
-  silently overwrites `sender` to the TLS-fingerprint identity of
-  whoever is actually on the other end of that specific connection,
-  whenever it disagrees with the envelope's claimed value - which, for
-  a forwarded `Publish` past the first hop, it always does (hop 2's
-  connection to hop 1 is authenticated as hop 1, not as the original
-  publisher several hops back). Confirmed live with a real 3-node
-  mTLS chain (A - B - C, A and C never directly peered): by the time
-  C receives A's publish via B, `sender` reads B, not A - and the
+  doesn't, for any connection with a known TLS client-certificate
+  fingerprint: `ConnectionContext::authenticated_sender` (ADR-0039)
+  runs unconditionally on *every* decoded frame on *every* such
+  connection, and silently overwrites `sender` to the fingerprint's
+  identity whenever it disagrees with the envelope's claimed value -
+  which, for a forwarded `Publish` past the first hop over a
+  certificate-backed connection, it always does (hop 2's connection to
+  hop 1 is authenticated as hop 1, not as the original publisher
+  several hops back). A connection with no client certificate at all
+  (plaintext, or TLS with none configured) has no fingerprint to
+  correct against, so `claimed` passes through unchanged there -
+  `sender` is unreliable specifically wherever ADR-0039's correction
+  is actually active, not universally. Confirmed live with a real
+  3-node mTLS chain (A - B - C, A and C never directly peered): by the
+  time C receives A's publish via B, `sender` reads B, not A - and the
   correction fires, and warns, on every such hop, for every message,
   as the normal shape of relaying rather than anything exceptional.
   Filed as #221 (not fixed here - a `sender` correction that assumes
@@ -58,11 +65,17 @@ correlation key, this needs a field of its own.
 ### A new `TraceId`, distinct from `MessageId`, on every `Envelope`
 
 `thoth-mesh-core` gains a `TraceId` type (`message.rs`, next to
-`MessageId`, same shape: a UUIDv7 wrapper, `#[serde(transparent)]`,
-`new()`/`as_bytes()`/`from_bytes()`/`Default` mirroring it exactly -
-reusing the "v7" `uuid` feature already enabled rather than pulling in
-a "v4" one for no real benefit here). `Envelope` gains a `trace_id:
-TraceId` field, set by `Envelope::new()` the same way `id` already is
+`MessageId`): the same wire shape (a UUIDv7 wrapper,
+`#[serde(transparent)]`, encoded as raw 16 bytes) and the same
+`new()`/`as_bytes()`/`from_bytes()`/`Default` surface, reusing the
+"v7" `uuid` feature already enabled rather than pulling in a "v4" one
+for no real benefit here. It's deliberately a smaller type than
+`MessageId`, though: no `timestamp()` accessor and no `PartialOrd`/
+`Ord` - nothing here needs a trace to be sortable or to expose when it
+started, and ADR-0046's reason for `MessageId` needing that (an
+indexed range query) doesn't apply to a field nothing persists.
+`Envelope` gains a `trace_id: TraceId` field, set by `Envelope::new()`
+the same way `id` already is
 - every freshly constructed envelope mints its own fresh `TraceId`, no
 exceptions and no cross-linking to whatever caused its creation (an
 `Ack`/`Error` replying to a `Publish` gets its own new `TraceId`, same
@@ -120,12 +133,17 @@ additive fields did.
 A traced message re-entering an already-visited node is exactly what
 loop prevention exists for, and needs no new handling here: a
 duplicate (by `MessageId`) is dropped at the top of `Broker::publish`,
-*before* it ever reaches a forwarder - so a cyclic mesh bounding how
-many times a given `trace_id` can be observed, once per directed
-connection-leg that actually delivers, falls out of the existing
-mechanism for free, the same way it already bounds `MessageId`
-circulation. There's nothing for this ADR to add here beyond stating
-it explicitly, which issue #146 itself called out as worth doing.
+*before* it ever reaches a forwarder - so within the dedup cache's own
+window (`SeenIds`, capacity `DEFAULT_DEDUP_CAPACITY`, oldest-evicted -
+see ADR-0011), a cyclic mesh can't make a given `trace_id` bounce
+around forever. That's a cache-window guarantee, not an absolute one:
+the same eviction that already means a sufficiently delayed genuine
+duplicate can be re-accepted after enough *other* messages have cycled
+through (ADR-0011's own trade-off, not new here) applies equally to a
+looped copy of a traced message - just at whatever low probability
+that already implies today. There's nothing for this ADR to add here
+beyond stating it explicitly, which issue #146 itself called out as
+worth doing.
 
 ## Consequences
 
