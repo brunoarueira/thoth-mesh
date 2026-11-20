@@ -1321,6 +1321,36 @@ RUST_LOG=thoth_mesh_node=debug,thoth_mesh=trace cargo run -p thoth-mesh-node --
 The CLI (`thoth-mesh`) doesn't currently expose a log-level flag —
 its output is just what it prints for the command you ran.
 
+### Tracing a message across peer hops
+
+Every `Publish` carries a `trace_id` (see
+[ADR-0059](adr/0059-trace-id-propagated-across-peer-hops.md)),
+unchanged across current-version forwarding - an older, pre-ADR-0059
+node in the path drops the field entirely when it re-forwards (it has
+no such field to carry), so the next current-version hop sees none and
+mints a fresh one, splitting one message's trace into two unrelated
+IDs either side of that older node. Logged alongside each node's own
+`publish`/rejection log lines: the unconditional `publish` record and
+the rate-limit rejection are `debug`, the topic-ACL rejection is
+`warn`. Debugging a routing/federation issue that only shows up in a
+real multi-node topology - "did this message actually reach node C,
+and if not, where did it stop?" - means running every node at
+`--log-level debug` (or `RUST_LOG=thoth_mesh_node=debug`) and grepping
+each node's own log for the same `trace_id` value: it shows up at
+least once per node the message actually reached, in arrival order,
+including a node that rejected it (ACL, rate limit) rather than
+forwarding it on - and can show up more than once at a single node,
+since the unconditional `publish` record logs before the ACL/rate-limit
+checks run, so a rejected message logs twice there (the record, then
+the rejection) - unrelated to `Broker::publish`'s own de-duplication
+(ADR-0011), which drops a genuine duplicate silently, no log of its
+own. A peer reachable over more than one overlapping connection
+(ADR-0058) can also independently log the same `trace_id` once per
+connection it arrives on. Repeated results at one node aren't extra
+hops. There's no dedicated query surface for this
+yet - across-node correlation today means collecting each node's own
+logs and grepping them yourself.
+
 ## Benchmarking
 
 `bench_mesh` (see [ADR-0030](adr/0030-mesh-benchmark-suite.md)) measures
