@@ -115,12 +115,13 @@ Every message on the wire is a single length-prefixed frame:
 ## Envelope
 
 Every message is wrapped in an `Envelope`, CBOR-encoded as a map with
-exactly these four keys, in this order:
+exactly these five keys, in this order:
 
 | Key | CBOR type | Meaning |
 | --- | --- | --- |
 | `version` | unsigned integer | Protocol version. Always `1` today. **Not currently validated on receipt** by this implementation — an envelope claiming a different version is still processed. Reserved for future version negotiation. |
 | `id` | byte string (16 bytes) | This message's [`MessageId`](#messageid). |
+| `trace_id` | byte string (16 bytes) | This message's [`TraceId`](#traceid). |
 | `sender` | byte string (16 bytes) | The sending node/client's [`PeerId`](#peerid). |
 | `kind` | map | The message payload — see [Message kinds](#message-kinds). |
 
@@ -136,6 +137,29 @@ forwarded/re-published envelope crossing the mesh, which **keeps the
 original `MessageId`** it was created with (this is what loop
 prevention and de-duplication key on — see
 [Delivery semantics](#delivery-semantics)).
+
+### `TraceId`
+
+Also a UUIDv7, encoded the same way as `MessageId`, but distinct from
+it: `id` identifies the message itself (and is what de-duplication
+keys on); `trace_id` identifies its *journey* across peer hops, for
+debugging/observability (see [ADR-0059](docs/adr/0059-trace-id-propagated-across-peer-hops.md)).
+Every envelope gets a freshly generated `trace_id`, independent of
+whatever caused it (a reply gets its own, unrelated to the request
+it's replying to — that correlation is `in_reply_to`'s job, not
+this field's). A forwarded envelope crossing the mesh keeps the
+original `trace_id` it was created with, the same way it keeps its
+`id` — so a `trace_id` observed at one hop and a `trace_id` observed
+at another, further hop, are the same value if and only if they're
+the same message's journey. A dead-letter republish
+([ADR-0047](docs/adr/0047-message-ttl-and-dead-lettering.md))
+is a new message, not a forward, and mints its own fresh `trace_id`
+(and `id`) the same way `Envelope::new` always does. An envelope
+received without
+this field at all (from a build older than ADR-0059) decodes with a
+freshly minted `trace_id` rather than failing — there was never a
+"no trace" value for this field to default to, so decoding one just
+means tracing starts there, at the oldest hop that understands it.
 
 ### `PeerId`
 

@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::{DecodeError, EncodeError};
-use crate::message::{MessageId, MessageKind};
+use crate::message::{MessageId, MessageKind, TraceId};
 use crate::peer::PeerId;
 
 /// The current wire protocol version.
@@ -12,17 +12,25 @@ pub const PROTOCOL_VERSION: u8 = 1;
 pub struct Envelope {
     pub version: u8,
     pub id: MessageId,
+    /// This message's journey, not its identity - see [`TraceId`] and
+    /// ADR-0059. `#[serde(default)]` so an older sender omitting this
+    /// field entirely decodes as a freshly minted `TraceId`, rather
+    /// than an error - tracing just starts at the first hop that
+    /// understands the field.
+    #[serde(default)]
+    pub trace_id: TraceId,
     pub sender: PeerId,
     pub kind: MessageKind,
 }
 
 impl Envelope {
     /// Wraps a `MessageKind` in a new envelope, stamped with the current
-    /// protocol version and a fresh message ID.
+    /// protocol version, a fresh message ID, and a fresh trace ID.
     pub fn new(sender: PeerId, kind: MessageKind) -> Self {
         Self {
             version: PROTOCOL_VERSION,
             id: MessageId::new(),
+            trace_id: TraceId::new(),
             sender,
             kind,
         }
@@ -93,5 +101,37 @@ mod tests {
     #[test]
     fn from_bytes_rejects_garbage() {
         assert!(Envelope::from_bytes(&[0xff, 0x00, 0x01]).is_err());
+    }
+
+    #[test]
+    fn decodes_an_envelope_missing_trace_id_as_a_freshly_minted_one() {
+        // Stands in for an older build's `Envelope`, from before
+        // ADR-0059 added `trace_id` - the exact shape every envelope
+        // on the wire had before this field existed.
+        #[derive(Serialize)]
+        struct PreAdr0059Envelope {
+            version: u8,
+            id: MessageId,
+            sender: PeerId,
+            kind: MessageKind,
+        }
+
+        let old = PreAdr0059Envelope {
+            version: PROTOCOL_VERSION,
+            id: MessageId::new(),
+            sender: PeerId::new(),
+            kind: MessageKind::Hello { listen_addr: None },
+        };
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&old, &mut bytes).unwrap();
+
+        let decoded = Envelope::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.id, old.id);
+        assert_eq!(decoded.sender, old.sender);
+
+        // No "no trace" sentinel - a missing field mints a fresh
+        // TraceId on every decode, rather than some fixed default.
+        let decoded_again = Envelope::from_bytes(&bytes).unwrap();
+        assert_ne!(decoded.trace_id, decoded_again.trace_id);
     }
 }
