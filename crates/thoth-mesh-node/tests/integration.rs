@@ -4,9 +4,11 @@ use std::time::Duration;
 use thoth_mesh_core::async_framing;
 use thoth_mesh_core::{Envelope, MessageKind, PeerId, Topic, TopicFilter};
 use thoth_mesh_node::test_support::eventually;
+use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc;
 use tokio::time::timeout;
-use tokio_util::compat::{Compat, TokioAsyncReadCompatExt};
+use tokio_util::compat::{Compat, TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 // Generous enough to absorb CI scheduling jitter - the multi-node
 // tests spin up several real nodes' worth of background tasks and
@@ -23,30 +25,65 @@ async fn spawn_test_node() -> SocketAddr {
     addr
 }
 
-async fn connect(addr: SocketAddr) -> Compat<TcpStream> {
-    TcpStream::connect(addr).await.unwrap().compat()
+/// A test connection: `send` writes to the socket directly, but
+/// every read goes through `frames`, fed by a background task that
+/// owns the actual read half and is the only thing that ever calls
+/// `read_frame` on it. `read_frame` isn't cancellation-safe across
+/// its two `read_exact` calls (length prefix, then payload) - a
+/// `tokio::time::timeout` wrapped directly around it can cancel
+/// mid-payload-read and permanently desync the connection. Wrapping
+/// a channel receive instead can't: cancelling that only ever drops
+/// an already-complete frame sitting in the channel, never the
+/// background task's own read in progress. See issue #223.
+struct TestConn {
+    write: Compat<OwnedWriteHalf>,
+    frames: mpsc::UnboundedReceiver<Vec<u8>>,
 }
 
-async fn send(stream: &mut Compat<TcpStream>, envelope: &Envelope) {
+/// Wraps an already-connected or already-accepted `TcpStream` as a
+/// [`TestConn`] - the one place a background reader task is spawned,
+/// shared by [`connect`] (the dialing side) and every hand-rolled
+/// "fake peer" test that instead accepts the socket itself.
+fn wrap(stream: TcpStream) -> TestConn {
+    let (read_half, write_half) = stream.into_split();
+    let mut read_half = read_half.compat();
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Ok(bytes) = async_framing::read_frame(&mut read_half).await {
+            if tx.send(bytes).is_err() {
+                break; // test dropped its TestConn; stop reading
+            }
+        }
+    });
+    TestConn {
+        write: write_half.compat_write(),
+        frames: rx,
+    }
+}
+
+async fn connect(addr: SocketAddr) -> TestConn {
+    wrap(TcpStream::connect(addr).await.unwrap())
+}
+
+async fn send(stream: &mut TestConn, envelope: &Envelope) {
     let bytes = envelope.to_bytes().unwrap();
-    async_framing::write_frame(stream, &bytes).await.unwrap();
+    async_framing::write_frame(&mut stream.write, &bytes)
+        .await
+        .unwrap();
 }
 
-async fn recv(stream: &mut Compat<TcpStream>) -> Envelope {
-    let bytes = timeout(TEST_TIMEOUT, async_framing::read_frame(stream))
+async fn recv(stream: &mut TestConn) -> Envelope {
+    let bytes = timeout(TEST_TIMEOUT, stream.frames.recv())
         .await
         .expect("timed out waiting for a frame")
-        .unwrap();
+        .expect("connection closed before a frame arrived");
     Envelope::from_bytes(&bytes).unwrap()
 }
 
-async fn recv_times_out(stream: &mut Compat<TcpStream>) -> bool {
-    timeout(
-        Duration::from_millis(200),
-        async_framing::read_frame(stream),
-    )
-    .await
-    .is_err()
+async fn recv_times_out(stream: &mut TestConn) -> bool {
+    timeout(Duration::from_millis(200), stream.frames.recv())
+        .await
+        .is_err()
 }
 
 fn topic(s: &str) -> Topic {
@@ -68,7 +105,7 @@ fn filter(s: &str) -> TopicFilter {
 /// membership updates.
 async fn publish_until_delivered(
     publish_addr: SocketAddr,
-    subscriber: &mut Compat<TcpStream>,
+    subscriber: &mut TestConn,
     topic: Topic,
     payload: &[u8],
 ) -> Envelope {
@@ -90,13 +127,8 @@ async fn publish_until_delivered(
         // late rather than lost - drain and ignore duplicates of the
         // envelope we're after rather than treating one as fatal.
         loop {
-            match timeout(
-                Duration::from_millis(100),
-                async_framing::read_frame(subscriber),
-            )
-            .await
-            {
-                Ok(Ok(bytes)) => {
+            match timeout(Duration::from_millis(100), subscriber.frames.recv()).await {
+                Ok(Some(bytes)) => {
                     let delivered = Envelope::from_bytes(&bytes).unwrap();
                     if delivered.kind == expected_kind {
                         return delivered;
@@ -1154,13 +1186,13 @@ async fn dial_side_peer_link_forwards_local_publishes_once_subscribed() {
         .await
         .expect("timed out waiting for node A to dial")
         .unwrap();
-    let mut peer = socket.compat();
+    let mut peer = wrap(socket);
 
     // Complete the handshake node A initiates.
-    timeout(TEST_TIMEOUT, async_framing::read_frame(&mut peer))
+    timeout(TEST_TIMEOUT, peer.frames.recv())
         .await
         .expect("timed out waiting for node A's Hello")
-        .unwrap();
+        .expect("connection closed before node A's Hello arrived");
     let peer_id = PeerId::new();
     let hello_reply = Envelope::new(peer_id, MessageKind::Hello { listen_addr: None });
     send(&mut peer, &hello_reply).await;
@@ -1235,12 +1267,12 @@ async fn a_peer_links_wildcard_interest_propagates_and_receives_a_matching_publi
         .await
         .expect("timed out waiting for node A to dial")
         .unwrap();
-    let mut peer = socket.compat();
+    let mut peer = wrap(socket);
 
-    timeout(TEST_TIMEOUT, async_framing::read_frame(&mut peer))
+    timeout(TEST_TIMEOUT, peer.frames.recv())
         .await
         .expect("timed out waiting for node A's Hello")
-        .unwrap();
+        .expect("connection closed before node A's Hello arrived");
     let peer_id = PeerId::new();
     let hello_reply = Envelope::new(peer_id, MessageKind::Hello { listen_addr: None });
     send(&mut peer, &hello_reply).await;
@@ -1442,9 +1474,9 @@ async fn loop_prevention_stops_a_publish_from_bouncing_forever() {
     // drain any such stragglers so they can't be mistaken for the
     // real assertion below.
     for client in [&mut sub_a, &mut sub_b] {
-        while timeout(Duration::from_millis(50), async_framing::read_frame(client))
+        while timeout(Duration::from_millis(50), client.frames.recv())
             .await
-            .is_ok()
+            .is_ok_and(|frame| frame.is_some())
         {}
     }
 
@@ -1559,15 +1591,17 @@ async fn malformed_frame_closes_connection() {
 
     // A well-formed frame whose payload isn't a valid CBOR-encoded
     // Envelope at all.
-    async_framing::write_frame(&mut client, b"not an envelope")
+    async_framing::write_frame(&mut client.write, b"not an envelope")
         .await
         .unwrap();
 
     // The server should close its side rather than hang or crash;
-    // the next read surfaces an error (EOF) instead of timing out.
-    let result = timeout(TEST_TIMEOUT, async_framing::read_frame(&mut client)).await;
+    // the background reader task's own read_frame call then ends in
+    // an error (EOF) and closes the channel without ever sending a
+    // frame - surfaced here as `None` rather than a timeout.
+    let result = timeout(TEST_TIMEOUT, client.frames.recv()).await;
     assert!(
-        matches!(result, Ok(Err(_))),
+        matches!(result, Ok(None)),
         "expected the server to close the connection, got {result:?}"
     );
 }
