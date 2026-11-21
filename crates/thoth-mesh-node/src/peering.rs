@@ -119,20 +119,24 @@ enum DialOutcome {
 /// delay used for the attempt that just ended, how long its
 /// connection stayed up, and how that attempt ended.
 ///
-/// A connection that stayed up for at least [`MIN_HEALTHY_DURATION`]
-/// is treated as proof the peer is reachable, resetting back to
-/// [`INITIAL_BACKOFF`] rather than compounding a delay that no longer
-/// reflects reality. An explicit rejection always waits
-/// [`REJECTED_BACKOFF`], regardless of `previous` - see that
-/// constant's own doc comment. Anything else that fell short of
-/// [`MIN_HEALTHY_DURATION`] - including a connect or TLS failure,
-/// which returns near-instantly - doubles the previous delay, capped
-/// at [`MAX_BACKOFF`].
+/// An explicit rejection always waits [`REJECTED_BACKOFF`], regardless
+/// of `previous` *or* `connection_uptime` - checked before the
+/// uptime-based reset below, not after, since a rejection can take a
+/// while to arrive (a slow TLS handshake over a laggy network, still
+/// well within [`DIAL_TIMEOUT`]) without ever being a healthy
+/// connection; `connection_uptime >= MIN_HEALTHY_DURATION` alone can't
+/// tell the two apart. A connection that stayed up for at least
+/// [`MIN_HEALTHY_DURATION`] - and wasn't a rejection - is treated as
+/// proof the peer is reachable, resetting back to [`INITIAL_BACKOFF`]
+/// rather than compounding a delay that no longer reflects reality.
+/// Anything else that fell short of [`MIN_HEALTHY_DURATION`] -
+/// including a connect or TLS failure, which returns near-instantly -
+/// doubles the previous delay, capped at [`MAX_BACKOFF`].
 fn next_backoff(previous: Duration, connection_uptime: Duration, outcome: DialOutcome) -> Duration {
-    if connection_uptime >= MIN_HEALTHY_DURATION {
-        INITIAL_BACKOFF
-    } else if outcome == DialOutcome::Rejected {
+    if outcome == DialOutcome::Rejected {
         REJECTED_BACKOFF
+    } else if connection_uptime >= MIN_HEALTHY_DURATION {
+        INITIAL_BACKOFF
     } else {
         (previous * 2).min(MAX_BACKOFF)
     }
@@ -652,6 +656,22 @@ mod tests {
         );
         assert_eq!(
             next_backoff(MAX_BACKOFF, Duration::ZERO, DialOutcome::Rejected),
+            REJECTED_BACKOFF
+        );
+    }
+
+    #[test]
+    fn next_backoff_uses_the_rejection_delay_even_if_the_rejection_took_a_while_to_arrive() {
+        // A rejection can take a while to arrive (a slow TLS handshake
+        // over a laggy network, still well within DIAL_TIMEOUT)
+        // without ever being a healthy connection - connection_uptime
+        // alone can't distinguish that from a genuinely healthy one,
+        // so the Rejected check must win regardless of how long the
+        // attempt took. Caught by cubic review on PR #227: the
+        // original ordering checked connection_uptime first, letting
+        // this case fall through to INITIAL_BACKOFF instead.
+        assert_eq!(
+            next_backoff(INITIAL_BACKOFF, MIN_HEALTHY_DURATION, DialOutcome::Rejected),
             REJECTED_BACKOFF
         );
     }
