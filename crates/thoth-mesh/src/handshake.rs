@@ -39,6 +39,13 @@ pub enum HandshakeError {
     // inline would inflate every one of those Results' stack size for
     // the sake of this one rarely-taken error variant.
     UnexpectedMessage(Box<MessageKind>),
+    /// The peer understood our `Hello` perfectly well and explicitly
+    /// refused it - an `Error` reply, not just an unexpected one.
+    /// Distinct from `UnexpectedMessage` so a caller can tell "this is
+    /// a deliberate decision" (today, ADR-0017's allowlist; see
+    /// ADR-0061) from "this is confusing," and react differently.
+    #[error("rejected by peer: {0}")]
+    Rejected(String),
 }
 
 /// Builds this node's `Hello` envelope.
@@ -67,6 +74,7 @@ async fn recv_hello<S: AsyncRead + Unpin>(stream: &mut S) -> Result<PeerInfo, Ha
             listen_addr,
             hello_id: envelope.id,
         }),
+        MessageKind::Error { message, .. } => Err(HandshakeError::Rejected(message)),
         other => Err(HandshakeError::UnexpectedMessage(Box::new(other))),
     }
 }
@@ -198,6 +206,40 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(matches!(err, HandshakeError::UnexpectedMessage(_)));
+        });
+    }
+
+    #[test]
+    fn dial_handshake_distinguishes_an_explicit_rejection_from_any_other_reply() {
+        // An Error reply (ADR-0017's allowlist rejection, today) means
+        // the peer understood our Hello and deliberately refused it -
+        // distinct from the merely-confusing Subscribe reply above.
+        // See ADR-0061.
+        block_on(async {
+            let hello_id = MessageId::new();
+            let envelope = Envelope::new(
+                PeerId::new(),
+                MessageKind::Error {
+                    in_reply_to: Some(hello_id),
+                    message: "peer certificate not on the --allow-peer allowlist".to_owned(),
+                },
+            );
+            let mut preloaded = Vec::new();
+            async_framing::write_frame(&mut preloaded, &envelope.to_bytes().unwrap())
+                .await
+                .unwrap();
+            let mut stream = MockStream {
+                read: Cursor::new(preloaded),
+                written: Vec::new(),
+            };
+
+            let err = dial_handshake(&mut stream, PeerId::new(), None)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "rejected by peer: peer certificate not on the --allow-peer allowlist"
+            );
         });
     }
 }

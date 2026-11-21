@@ -7,7 +7,7 @@
 
 use std::time::Duration;
 
-use thoth_mesh::{PeerInfo, dial_handshake};
+use thoth_mesh::{HandshakeError, PeerInfo, dial_handshake};
 use thoth_mesh_tls::MaybeTlsStream;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -38,6 +38,17 @@ const MIN_HEALTHY_DURATION: Duration = Duration::from_secs(5);
 /// [`crate::shared::DEFAULT_MAX_CONCURRENT_DIALS`]'s dial slots - see
 /// ADR-0027.
 const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The fixed delay before retrying a dial attempt the peer explicitly
+/// rejected (an `Error` reply to our `Hello`, see [`DialOutcome`]) -
+/// used instead of the normal exponential ramp, every consecutive
+/// rejection, never doubling further or resetting based on timing. A
+/// rejection is a *known* state, not "maybe still flaky": only an
+/// operator fixing the far end's policy and reloading it can change
+/// the outcome, a timescale of minutes at the least, so there's
+/// nothing to gain from still ramping through sub-second and
+/// single-digit-second delays on the way here. See ADR-0061.
+const REJECTED_BACKOFF: Duration = Duration::from_secs(120);
 
 /// Spawns one background task per entry in `seed_peers`, each dialing
 /// that address, handshaking, routing messages over the connection
@@ -78,33 +89,56 @@ async fn dial_peer_with_reconnect(peer_addr: String, shared: Shared) {
     let mut backoff = INITIAL_BACKOFF;
     loop {
         let attempt_start = Instant::now();
-        dial_peer(peer_addr.clone(), shared.clone()).await;
+        let outcome = dial_peer(peer_addr.clone(), shared.clone()).await;
 
-        backoff = next_backoff(backoff, attempt_start.elapsed());
+        backoff = next_backoff(backoff, attempt_start.elapsed(), outcome);
         tracing::info!(addr = %peer_addr, delay = ?backoff, "seed peer link down, will retry");
         tokio::time::sleep(backoff).await;
     }
 }
 
+/// What one [`dial_peer`] attempt ended on - orthogonal to how long it
+/// took (that's `attempt_start.elapsed()`, timed by the caller per
+/// ADR-0012): whether a *failed* attempt was an explicit policy
+/// rejection or anything else. See ADR-0061.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DialOutcome {
+    /// A connection was established - by the time this is returned,
+    /// it has already ended too, since `handle_connection` doesn't
+    /// return until it does.
+    Established,
+    /// The peer explicitly rejected us - an `Error` reply to our
+    /// `Hello`, a deliberate decision, not a transient problem.
+    Rejected,
+    /// Anything else: refused, TLS failed, timed out, a confusing
+    /// non-`Error` reply. Already logged at the point it happened.
+    Other,
+}
+
 /// The backoff delay to use for the *next* dial attempt, given the
-/// delay used for the attempt that just ended and how long its
-/// connection stayed up.
+/// delay used for the attempt that just ended, how long its
+/// connection stayed up, and how that attempt ended.
 ///
 /// A connection that stayed up for at least [`MIN_HEALTHY_DURATION`]
 /// is treated as proof the peer is reachable, resetting back to
 /// [`INITIAL_BACKOFF`] rather than compounding a delay that no longer
-/// reflects reality. Anything shorter - including a connect or
-/// handshake failure, which returns near-instantly - doubles the
-/// previous delay, capped at [`MAX_BACKOFF`].
-fn next_backoff(previous: Duration, connection_uptime: Duration) -> Duration {
+/// reflects reality. An explicit rejection always waits
+/// [`REJECTED_BACKOFF`], regardless of `previous` - see that
+/// constant's own doc comment. Anything else that fell short of
+/// [`MIN_HEALTHY_DURATION`] - including a connect or TLS failure,
+/// which returns near-instantly - doubles the previous delay, capped
+/// at [`MAX_BACKOFF`].
+fn next_backoff(previous: Duration, connection_uptime: Duration, outcome: DialOutcome) -> Duration {
     if connection_uptime >= MIN_HEALTHY_DURATION {
         INITIAL_BACKOFF
+    } else if outcome == DialOutcome::Rejected {
+        REJECTED_BACKOFF
     } else {
         (previous * 2).min(MAX_BACKOFF)
     }
 }
 
-async fn dial_peer(peer_addr: String, shared: Shared) {
+async fn dial_peer(peer_addr: String, shared: Shared) -> DialOutcome {
     dial_peer_with_timeout(peer_addr, shared, DIAL_TIMEOUT).await
 }
 
@@ -116,7 +150,11 @@ async fn dial_peer(peer_addr: String, shared: Shared) {
 /// deadlocks (see the timeout test below - discovered while adding
 /// it, not a hypothetical). `dial_peer` itself always uses the real
 /// constant; this is never reachable from anything other than a test.
-async fn dial_peer_with_timeout(peer_addr: String, shared: Shared, dial_timeout: Duration) {
+async fn dial_peer_with_timeout(
+    peer_addr: String,
+    shared: Shared,
+    dial_timeout: Duration,
+) -> DialOutcome {
     let span = tracing::info_span!("peer", addr = %peer_addr);
     async move {
         // Bounds how many connect+handshake attempts run at once,
@@ -139,11 +177,13 @@ async fn dial_peer_with_timeout(peer_addr: String, shared: Shared, dial_timeout:
             match tokio::time::timeout(dial_timeout, connect_and_handshake(&peer_addr, &shared))
                 .await
             {
-                Ok(Some(established)) => established,
-                Ok(None) => return, // connect/TLS/handshake failed; already logged below
+                Ok(Ok(established)) => established,
+                // connect/TLS/handshake failed; already logged below.
+                Ok(Err(DialFailure::Rejected)) => return DialOutcome::Rejected,
+                Ok(Err(DialFailure::Other)) => return DialOutcome::Other,
                 Err(_) => {
                     tracing::warn!(timeout = ?dial_timeout, "dial to seed peer timed out");
-                    return;
+                    return DialOutcome::Other;
                 }
             };
         tracing::info!(
@@ -162,6 +202,7 @@ async fn dial_peer_with_timeout(peer_addr: String, shared: Shared, dial_timeout:
         // its link together, right as the dispatch loop starts (see
         // ADR-0011) - not here, so the two can't race apart.
         connection::handle_connection(established.stream, shared, Some(established.info)).await;
+        DialOutcome::Established
     }
     .instrument(span)
     .await
@@ -176,19 +217,30 @@ struct EstablishedDial {
     info: PeerInfo,
 }
 
+/// Why [`connect_and_handshake`] failed - [`DialOutcome`]'s own
+/// precursor, before a timeout (handled one layer up, in
+/// [`dial_peer_with_timeout`]) gets folded into the same enum.
+enum DialFailure {
+    Rejected,
+    Other,
+}
+
 /// The connect+TLS+handshake phase of a dial attempt, factored out of
 /// [`dial_peer`] so it can be wrapped in a single timeout (ADR-0027)
-/// rather than one per step. Returns `None` on any failure - already
+/// rather than one per step. Returns `Err` on any failure - already
 /// logged via `tracing::warn!` at the point it happened, so the caller
-/// doesn't need to log again, just decide what to do next (nothing,
-/// today - `dial_peer_with_reconnect`'s backoff loop handles it the
-/// same as any other failed attempt).
-async fn connect_and_handshake(peer_addr: &str, shared: &Shared) -> Option<EstablishedDial> {
+/// doesn't need to log again, just decide what to do next based on
+/// which kind it was (`dial_peer_with_reconnect`'s backoff loop, see
+/// ADR-0061).
+async fn connect_and_handshake(
+    peer_addr: &str,
+    shared: &Shared,
+) -> Result<EstablishedDial, DialFailure> {
     let tcp = match TcpStream::connect(peer_addr).await {
         Ok(stream) => stream,
         Err(err) => {
             tracing::warn!(%err, "failed to connect to seed peer");
-            return None;
+            return Err(DialFailure::Other);
         }
     };
     // A peer dialing another peer always identifies itself - the
@@ -199,7 +251,7 @@ async fn connect_and_handshake(peer_addr: &str, shared: &Shared) -> Option<Estab
             Ok(stream) => stream,
             Err(err) => {
                 tracing::warn!(%err, "TLS handshake with seed peer failed");
-                return None;
+                return Err(DialFailure::Other);
             }
         },
         None => MaybeTlsStream::Plain(tcp),
@@ -209,15 +261,19 @@ async fn connect_and_handshake(peer_addr: &str, shared: &Shared) -> Option<Estab
     let info = match dial_handshake(&mut conn, shared.node_id, shared.my_listen_addr.clone()).await
     {
         Ok(info) => info,
+        Err(HandshakeError::Rejected(message)) => {
+            tracing::warn!("seed peer explicitly rejected this connection: {message}");
+            return Err(DialFailure::Rejected);
+        }
         Err(err) => {
             tracing::warn!(%err, "handshake with seed peer failed");
-            return None;
+            return Err(DialFailure::Other);
         }
     };
 
     // Recover the raw stream - no data loss, Compat adds no buffering
     // of its own.
-    Some(EstablishedDial {
+    Ok(EstablishedDial {
         stream: conn.into_inner(),
         info,
     })
@@ -387,9 +443,10 @@ mod tests {
         drop(unused_listener);
 
         let shared = Shared::new(PeerId::new(), None);
-        timeout(TEST_TIMEOUT, dial_peer(addr.to_string(), shared))
+        let outcome = timeout(TEST_TIMEOUT, dial_peer(addr.to_string(), shared))
             .await
             .expect("dial_peer should return promptly on connection refused");
+        assert_eq!(outcome, DialOutcome::Other);
     }
 
     #[tokio::test]
@@ -433,10 +490,52 @@ mod tests {
 
         // Never reply - dial_peer_with_timeout's own timeout should
         // give up on its own well within TEST_TIMEOUT.
-        timeout(TEST_TIMEOUT, dial_task)
+        let outcome = timeout(TEST_TIMEOUT, dial_task)
             .await
             .expect("dial_peer_with_timeout should return once its timeout elapses")
             .expect("dial_peer_with_timeout task should not panic");
+        assert_eq!(outcome, DialOutcome::Other);
+    }
+
+    #[tokio::test]
+    async fn dial_peer_is_rejected_when_the_far_end_replies_with_an_error() {
+        // The accepting side already does this for an --allow-peer
+        // rejection (ADR-0017); this test stands in for it without a
+        // real allowlist, to isolate dial_peer's own classification
+        // of the reply. See ADR-0061.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shared = Shared::new(PeerId::new(), None);
+
+        let dial_task = tokio::spawn(dial_peer(addr.to_string(), shared));
+
+        let (socket, _) = timeout(TEST_TIMEOUT, listener.accept())
+            .await
+            .expect("timed out waiting for the dial")
+            .unwrap();
+        let mut conn = socket.compat();
+        let hello = timeout(TEST_TIMEOUT, async_framing::read_frame(&mut conn))
+            .await
+            .expect("timed out waiting for the Hello")
+            .unwrap();
+        let hello_id = Envelope::from_bytes(&hello).unwrap().id;
+
+        let rejection = Envelope::new(
+            PeerId::new(),
+            MessageKind::Error {
+                in_reply_to: Some(hello_id),
+                message: "not on the allowlist".to_owned(),
+            },
+        );
+        async_framing::write_frame(&mut conn, &rejection.to_bytes().unwrap())
+            .await
+            .unwrap();
+
+        let outcome = timeout(TEST_TIMEOUT, dial_task)
+            .await
+            .expect("dial_peer should return promptly once rejected")
+            .expect("dial_peer task should not panic");
+        assert_eq!(outcome, DialOutcome::Rejected);
     }
 
     #[tokio::test]
@@ -488,11 +587,19 @@ mod tests {
     #[test]
     fn next_backoff_doubles_after_a_connection_that_dropped_quickly() {
         assert_eq!(
-            next_backoff(Duration::from_millis(500), Duration::ZERO),
+            next_backoff(
+                Duration::from_millis(500),
+                Duration::ZERO,
+                DialOutcome::Other
+            ),
             Duration::from_secs(1)
         );
         assert_eq!(
-            next_backoff(Duration::from_secs(1), Duration::from_millis(100)),
+            next_backoff(
+                Duration::from_secs(1),
+                Duration::from_millis(100),
+                DialOutcome::Other
+            ),
             Duration::from_secs(2)
         );
     }
@@ -500,10 +607,13 @@ mod tests {
     #[test]
     fn next_backoff_caps_at_the_maximum() {
         assert_eq!(
-            next_backoff(Duration::from_secs(20), Duration::ZERO),
+            next_backoff(Duration::from_secs(20), Duration::ZERO, DialOutcome::Other),
             MAX_BACKOFF
         );
-        assert_eq!(next_backoff(MAX_BACKOFF, Duration::ZERO), MAX_BACKOFF);
+        assert_eq!(
+            next_backoff(MAX_BACKOFF, Duration::ZERO, DialOutcome::Other),
+            MAX_BACKOFF
+        );
     }
 
     #[test]
@@ -514,12 +624,35 @@ mod tests {
         // drop (ADR-0012) - the next delay should start over from
         // INITIAL_BACKOFF rather than keep compounding.
         assert_eq!(
-            next_backoff(Duration::from_secs(16), MIN_HEALTHY_DURATION),
+            next_backoff(
+                Duration::from_secs(16),
+                MIN_HEALTHY_DURATION,
+                DialOutcome::Established
+            ),
             INITIAL_BACKOFF
         );
         assert_eq!(
-            next_backoff(MAX_BACKOFF, MIN_HEALTHY_DURATION + Duration::from_secs(1)),
+            next_backoff(
+                MAX_BACKOFF,
+                MIN_HEALTHY_DURATION + Duration::from_secs(1),
+                DialOutcome::Established
+            ),
             INITIAL_BACKOFF
+        );
+    }
+
+    #[test]
+    fn next_backoff_uses_a_long_fixed_delay_after_an_explicit_rejection() {
+        // Unlike the exponential-doubling cases above, a rejection
+        // always waits REJECTED_BACKOFF regardless of `previous` - no
+        // ramping toward it, no cap computation (ADR-0061).
+        assert_eq!(
+            next_backoff(INITIAL_BACKOFF, Duration::ZERO, DialOutcome::Rejected),
+            REJECTED_BACKOFF
+        );
+        assert_eq!(
+            next_backoff(MAX_BACKOFF, Duration::ZERO, DialOutcome::Rejected),
+            REJECTED_BACKOFF
         );
     }
 
